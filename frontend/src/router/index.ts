@@ -1,4 +1,6 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
+import { platformEnabled } from '@/lib/supabase'
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -128,12 +130,54 @@ const router = createRouter({
       meta: { title: 'Terms of Service' },
     },
     {
+      path: '/auth/login',
+      name: 'auth-login',
+      component: () => import('@/views/platform/LoginView.vue'),
+      meta: { title: 'Sign in', guestOnly: true },
+    },
+    {
+      path: '/auth/register',
+      name: 'auth-register',
+      component: () => import('@/views/platform/RegisterView.vue'),
+      meta: { title: 'Register', guestOnly: true },
+    },
+    {
+      path: '/auth/pending',
+      name: 'auth-pending',
+      component: () => import('@/views/platform/PendingView.vue'),
+      meta: { title: 'Account status', requiresAuth: true },
+    },
+    {
+      path: '/platform',
+      name: 'platform-home',
+      component: () => import('@/views/platform/PlatformHomeView.vue'),
+      meta: { title: 'Platform', requiresAuth: true, requiresActive: true },
+    },
+    {
       path: '/admin',
       name: 'admin',
       component: () => import('@/views/AdminView.vue'),
       meta: { title: 'Admin' },
     },
   ],
+})
+
+// Platform accounts are optional: only routes that opt in via meta are guarded,
+// so every existing (public) feature keeps working without an account.
+router.beforeEach(async (to) => {
+  const needsAuth = to.meta.requiresAuth || to.meta.guestOnly
+  if (!needsAuth) return true
+  if (!platformEnabled) return '/mine'
+
+  const auth = useAuthStore()
+  await auth.init()
+
+  if (to.meta.guestOnly) return auth.isLoggedIn ? '/platform' : true
+  if (!auth.isLoggedIn) return { path: '/auth/login', query: { redirect: to.fullPath } }
+  if (to.meta.requiresActive && auth.profile && !auth.isActive) return '/auth/pending'
+  const roles = to.meta.roles as string[] | undefined
+  if (roles && (!auth.role || !roles.includes(auth.role))) return '/platform'
+  return true
 })
 
 export default router

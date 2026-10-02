@@ -17,6 +17,13 @@ Version `1.2.1` (kept in sync across root `package.json`, `src-tauri/Cargo.toml`
 
 **章节功能发布提醒**：`auto_chapter` / `chapter_names` 依赖本次新增的 Rust 生成提示词能力。下次发布此功能时须升级次版本，并将 `ota.json` 的 `minShell` 提高到包含该能力的新壳版本；旧 1.5.0 壳会忽略这些参数，不能仅靠新命令检测覆盖此兼容性变化。
 
+## Learning Platform (accounts & roles, in progress)
+
+Optional layer on top of Exameow (admin / teacher / student), backed by **Supabase** (`supabase/migrations/`, setup in `supabase/README.md`). Enabled only when `VITE_SUPABASE_URL` + `VITE_SUPABASE_ANON_KEY` are set; otherwise the app behaves as before and all existing features stay public (no account needed).
+- Frontend: `lib/supabase.ts`, `stores/auth.ts`, `views/platform/*`, platform strings in `i18n/platform.ts` (ar + en fallback). Routes opt in to guards via `meta.requiresAuth / requiresActive / roles / guestOnly` (see `router/index.ts`).
+- Roles/status are enforced by RLS + triggers in the DB, never trusted from the client. Teachers sign up as `pending` until an admin approves.
+- Phase 0 done (schema, auth, guards). Next: admin dashboard (institutions tree, teacher approval), student browsing, teacher content, exam linkage.
+
 ## Tech Stack
 
 - **Frontend**: Vue 3 + Vite + Pinia + Vue Router + TypeScript, Tailwind CSS 3.4 (custom Material You tonal palette)
