@@ -3,6 +3,8 @@ import { ref, computed, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
+import AssessmentList from '@/components/platform/AssessmentList.vue'
+import { subjectAssessments, type AssessmentInfo } from '@/api/platformExams'
 import ContentLists from '@/components/platform/ContentLists.vue'
 import { subjectContent, type Bundle } from '@/api/platformContent'
 import { getSubject, enroll, unenroll, myTeaching, requestTeaching, type SubjectPage, type Teaching } from '@/api/platformLearning'
@@ -14,6 +16,7 @@ const id = route.params.id as string
 
 const subject = ref<SubjectPage | null>(null)
 const content = ref<Bundle>({ posts: [], courses: [], live: [] })
+const assessments = ref<AssessmentInfo[]>([])
 const mine = ref<Teaching | null>(null)
 const error = ref('')
 
@@ -24,6 +27,7 @@ async function load() {
   try {
     subject.value = await getSubject(id)
     content.value = await subjectContent(id)
+    assessments.value = await subjectAssessments(id)
     if (auth.role === 'teacher') mine.value = (await myTeaching()).find(t => t.subject_id === id) ?? null
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
@@ -70,6 +74,11 @@ onMounted(load)
         </template>
       </template>
     </div>
+
+    <section v-if="assessments.length" class="mb-6">
+      <h3 class="text-title-md font-bold mb-2">{{ pt('assessments') }}</h3>
+      <AssessmentList :items="assessments" />
+    </section>
 
     <ContentLists :bundle="content" class="mb-6" />
 

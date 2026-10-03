@@ -2,6 +2,7 @@ mod platform;
 mod platform_admin;
 mod platform_content;
 mod platform_engage;
+mod platform_exams;
 mod platform_learning;
 mod relay;
 mod routes;
@@ -160,6 +161,20 @@ async fn main() {
         .route("/api/platform/reviews", axum::routing::put(platform_engage::put_review_handler))
         .route("/api/platform/reviews/{target_type}/{id}", get(platform_engage::reviews_handler))
         .route("/api/platform/reviews/{id}", delete(platform_engage::delete_review_handler))
+        .route("/api/platform/assessments", post(platform_exams::create_handler))
+        .route("/api/platform/assessments/mine", get(platform_exams::mine_handler))
+        .route("/api/platform/assessments/available", get(platform_exams::available_handler))
+        .route(
+            "/api/platform/assessments/{id}",
+            get(platform_exams::detail_handler).patch(platform_exams::update_handler).delete(platform_exams::delete_handler),
+        )
+        .route("/api/platform/assessments/{id}/start", post(platform_exams::start_handler))
+        .route("/api/platform/assessments/{id}/results", get(platform_exams::results_handler))
+        .route("/api/platform/subjects/{id}/assessments", get(platform_exams::subject_list_handler))
+        .route("/api/platform/my/attempts", get(platform_exams::my_attempts_handler))
+        .route("/api/platform/attempts/{id}", get(platform_exams::attempt_handler))
+        .route("/api/platform/attempts/{id}/submit", post(platform_exams::submit_handler))
+        .route("/api/platform/attempts/{id}/grade", axum::routing::patch(platform_exams::grade_handler))
         .fallback_service(ServeDir::new(&static_dir))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(state);

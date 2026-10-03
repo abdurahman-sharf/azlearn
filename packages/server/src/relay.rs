@@ -235,7 +235,7 @@ fn is_true_answer(a: &str) -> bool {
     })
 }
 
-fn grade(q: &Question, user: Option<&str>) -> Option<bool> {
+pub fn grade(q: &Question, user: Option<&str>) -> Option<bool> {
     if q.qtype == exameow_core::exam::QuestionType::ShortAnswer {
         return None;
     }

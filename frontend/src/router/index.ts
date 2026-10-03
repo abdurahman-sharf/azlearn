@@ -274,6 +274,42 @@ const router = createRouter({
       meta: { title: 'Notifications', requiresAuth: true, requiresActive: true },
     },
     {
+      path: '/platform/assessments/new',
+      name: 'platform-assessment-new',
+      component: () => import('@/views/platform/AssessmentEditorView.vue'),
+      meta: { title: 'platform-assessment-new', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+    },
+    {
+      path: '/platform/assessments/:id/edit',
+      name: 'platform-assessment-edit',
+      component: () => import('@/views/platform/AssessmentEditorView.vue'),
+      meta: { title: 'platform-assessment-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+    },
+    {
+      path: '/platform/assessments/:id/take',
+      name: 'platform-assessment-take',
+      component: () => import('@/views/platform/TakeAssessmentView.vue'),
+      meta: { title: 'platform-assessment-take', requiresAuth: true, requiresActive: true, roles: ['student'] },
+    },
+    {
+      path: '/platform/assessments/:id/results',
+      name: 'platform-assessment-results',
+      component: () => import('@/views/platform/AssessmentResultsView.vue'),
+      meta: { title: 'platform-assessment-results', requiresAuth: true, requiresActive: true, roles: ['teacher', 'admin'] },
+    },
+    {
+      path: '/platform/assessments/:id',
+      name: 'platform-assessment',
+      component: () => import('@/views/platform/AssessmentView.vue'),
+      meta: { title: 'platform-assessment', requiresAuth: true, requiresActive: true },
+    },
+    {
+      path: '/platform/attempts/:id',
+      name: 'platform-attempt',
+      component: () => import('@/views/platform/AttemptView.vue'),
+      meta: { title: 'platform-attempt', requiresAuth: true, requiresActive: true },
+    },
+    {
       path: '/admin',
       name: 'admin',
       component: () => import('@/views/AdminView.vue'),

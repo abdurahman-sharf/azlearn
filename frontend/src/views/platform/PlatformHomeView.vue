@@ -4,6 +4,8 @@ import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
 import { listInstitutions, type Institution } from '@/api/platformAdmin'
+import AssessmentList from '@/components/platform/AssessmentList.vue'
+import { availableAssessments, type AssessmentInfo } from '@/api/platformExams'
 import ContentLists from '@/components/platform/ContentLists.vue'
 import { feed, type Bundle } from '@/api/platformContent'
 import { notifications, myProgress, type ProgressItem } from '@/api/platformEngage'
@@ -18,6 +20,7 @@ const enrolled = ref<EnrolledSubject[]>([])
 const feedBundle = ref<Bundle>({ posts: [], courses: [], live: [] })
 const error = ref('')
 const unread = ref(0)
+const available = ref<AssessmentInfo[]>([])
 const progress = ref<ProgressItem[]>([])
 
 onMounted(async () => {
@@ -32,6 +35,7 @@ onMounted(async () => {
       enrolled.value = await myEnrollments()
       feedBundle.value = await feed()
       progress.value = await myProgress()
+      available.value = await availableAssessments()
     }
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
@@ -81,13 +85,18 @@ async function logout() {
         <router-link to="/platform/profile" class="btn-outlined">{{ pt('myProfile') }}</router-link>
       </nav>
 
+      <section v-if="available.length" class="mb-6">
+        <h2 class="text-title-md font-bold mb-3">{{ pt('availableAssessments') }}</h2>
+        <AssessmentList :items="available" />
+      </section>
+
       <section v-if="progress.length" class="mb-6">
         <h2 class="text-title-md font-bold mb-3">{{ pt('continueLearning') }}</h2>
         <ul class="space-y-2">
           <li v-for="p in progress" :key="p.course_id">
             <router-link :to="`/platform/courses/${p.course_id}`" class="card-filled block p-3">
               <div class="font-bold">{{ p.title }}</div>
-              <div class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ p.subject_name }} · {{ p.completed }}/{{ p.total }}</div>
+              <div class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ p.subject_name }} · <span dir="ltr" class="inline-block">{{ p.completed }}/{{ p.total }}</span></div>
               <div class="h-1.5 rounded-full overflow-hidden mt-2" style="background-color: rgb(var(--md-surface-container-high))">
                 <div class="h-full" :style="{ width: (p.total ? (p.completed / p.total) * 100 : 0) + '%', backgroundColor: 'rgb(var(--md-primary))' }"></div>
               </div>
