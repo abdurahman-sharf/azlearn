@@ -1,5 +1,6 @@
 mod platform;
 mod platform_admin;
+mod platform_learning;
 mod relay;
 mod routes;
 
@@ -104,6 +105,17 @@ async fn main() {
             "/api/platform/admin/subjects/{id}",
             axum::routing::patch(platform_admin::update_subject_handler).delete(platform_admin::delete_subject_handler),
         )
+        .route("/api/platform/me/profile", axum::routing::patch(platform_learning::update_profile_handler))
+        .route("/api/platform/me/placement", get(platform_learning::get_placement_handler).put(platform_learning::set_placement_handler))
+        .route("/api/platform/teaching", get(platform_learning::my_teaching_handler).post(platform_learning::request_teaching_handler))
+        .route("/api/platform/teaching/{subject_id}", delete(platform_learning::drop_teaching_handler))
+        .route("/api/platform/admin/teaching", get(platform_learning::admin_teaching_handler).patch(platform_learning::admin_decide_teaching_handler))
+        .route("/api/platform/enrollments", get(platform_learning::my_enrollments_handler).post(platform_learning::enroll_handler))
+        .route("/api/platform/enrollments/{subject_id}", delete(platform_learning::unenroll_handler))
+        .route("/api/platform/teachers", get(platform_learning::list_teachers_handler))
+        .route("/api/platform/teachers/{id}", get(platform_learning::teacher_page_handler))
+        .route("/api/platform/teachers/{id}/follow", post(platform_learning::follow_handler).delete(platform_learning::unfollow_handler))
+        .route("/api/platform/subjects/{id}", get(platform_learning::subject_page_handler))
         .fallback_service(ServeDir::new(&static_dir))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(state);

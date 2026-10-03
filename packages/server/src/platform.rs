@@ -95,10 +95,35 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 ";
 
+/// Applies the core schema plus every feature module's schema (all idempotent).
+pub fn apply_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+    for extra in [crate::platform_learning::SCHEMA] {
+        conn.execute_batch(extra).map_err(|e| e.to_string())?;
+    }
+    // Columns added after the first release.
+    add_column_if_missing(conn, "users", "bio", "TEXT")?;
+    Ok(())
+}
+
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<(), String> {
+    let exists: bool = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .and_then(|mut s| s.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|c| c == column);
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 pub fn init_db(path: &str) -> Result<PlatformState, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
-    conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+    apply_schema(&conn)?;
     Ok(PlatformState { conn: Mutex::new(conn) })
 }
 
@@ -305,6 +330,72 @@ pub fn bootstrap_admin(state: &PlatformState, email: &str, password: &str) -> Re
     Ok(true)
 }
 
+
+// ───────── shared helpers for platform modules ─────────
+
+pub type Res<T> = Result<T, Err>;
+
+pub fn db_err<E>(_: E) -> Err {
+    err(StatusCode::INTERNAL_SERVER_ERROR, "db_error")
+}
+
+pub fn bad(code: &str) -> Err {
+    err(StatusCode::BAD_REQUEST, code)
+}
+
+pub fn lock(state: &AppState) -> Res<std::sync::MutexGuard<'_, Connection>> {
+    state.platform.conn.lock().map_err(db_err)
+}
+
+/// Signed-in user whose account is active (not pending/rejected/suspended).
+pub fn require_active(state: &AppState, headers: &HeaderMap) -> Res<User> {
+    let user = authenticate(state, headers)?;
+    if user.status == "active" {
+        Ok(user)
+    } else {
+        Err(err(StatusCode::FORBIDDEN, "forbidden"))
+    }
+}
+
+pub fn require_role(state: &AppState, headers: &HeaderMap, role: &str) -> Res<User> {
+    let user = require_active(state, headers)?;
+    if user.role == role {
+        Ok(user)
+    } else {
+        Err(err(StatusCode::FORBIDDEN, "forbidden"))
+    }
+}
+
+pub fn require_admin(state: &AppState, headers: &HeaderMap) -> Res<User> {
+    require_role(state, headers, "admin")
+}
+
+/// Trimmed, non-empty, at most `max` characters.
+pub fn text(raw: &str, max: usize, code: &str) -> Res<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.chars().count() > max {
+        Err(bad(code))
+    } else {
+        Ok(t.to_string())
+    }
+}
+
+/// Optional text: empty/absent -> None; too long -> error.
+pub fn opt_text(raw: &Option<String>, max: usize, code: &str) -> Res<Option<String>> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(t) if t.chars().count() <= max => Ok(Some(t.to_string())),
+        _ => Err(bad(code)),
+    }
+}
+
+pub fn audit(conn: &Connection, actor: &str, target: &str, action: &str, detail: &str) {
+    let _ = conn.execute(
+        "INSERT INTO audit_log(actor_id, target_id, action, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![actor, target, action, detail, now_ms()],
+    );
+}
+
 // ───────── HTTP handlers ─────────
 
 pub async fn register_handler(
@@ -385,7 +476,7 @@ pub async fn logout_handler(State(state): State<Arc<AppState>>, headers: HeaderM
 #[cfg(test)]
 pub fn create_test_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(SCHEMA).unwrap();
+    apply_schema(&conn).unwrap();
     conn
 }
 
@@ -405,9 +496,7 @@ mod tests {
     use super::*;
 
     fn db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn
+        create_test_db()
     }
 
     fn req(email: &str, role: &str) -> RegisterReq {

@@ -172,6 +172,48 @@ const router = createRouter({
       meta: { title: 'Institution', requiresAuth: true, requiresActive: true, roles: ['admin'] },
     },
     {
+      path: '/platform/institutions/:id',
+      name: 'platform-institution',
+      component: () => import('@/views/platform/InstitutionBrowseView.vue'),
+      meta: { title: 'platform-institution', requiresAuth: true, requiresActive: true },
+    },
+    {
+      path: '/platform/subjects/:id',
+      name: 'platform-subject',
+      component: () => import('@/views/platform/SubjectView.vue'),
+      meta: { title: 'platform-subject', requiresAuth: true, requiresActive: true },
+    },
+    {
+      path: '/platform/teachers',
+      name: 'platform-teachers',
+      component: () => import('@/views/platform/TeachersView.vue'),
+      meta: { title: 'platform-teachers', requiresAuth: true, requiresActive: true },
+    },
+    {
+      path: '/platform/teachers/:id',
+      name: 'platform-teacher',
+      component: () => import('@/views/platform/TeacherView.vue'),
+      meta: { title: 'platform-teacher', requiresAuth: true, requiresActive: true },
+    },
+    {
+      path: '/platform/profile',
+      name: 'platform-profile',
+      component: () => import('@/views/platform/ProfileView.vue'),
+      meta: { title: 'platform-profile', requiresAuth: true, requiresActive: true },
+    },
+    {
+      path: '/platform/teaching',
+      name: 'platform-teaching',
+      component: () => import('@/views/platform/TeachingView.vue'),
+      meta: { title: 'platform-teaching', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+    },
+    {
+      path: '/platform/admin/teaching',
+      name: 'platform-admin-teaching',
+      component: () => import('@/views/platform/AdminTeachingView.vue'),
+      meta: { title: 'platform-admin-teaching', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+    },
+    {
       path: '/admin',
       name: 'admin',
       component: () => import('@/views/AdminView.vue'),

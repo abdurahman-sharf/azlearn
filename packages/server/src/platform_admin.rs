@@ -1,8 +1,8 @@
 //! Platform administration: user approval/editing and the institutions tree.
 //! Every handler authenticates server-side; admin routes require an active `admin`.
 
-use crate::platform::{authenticate, hash_password, new_id, row_to_user, User, USER_COLS};
-use crate::relay::{err, now_ms, Err};
+use crate::platform::{audit, authenticate, bad, db_err, hash_password, lock, new_id, opt_text, require_admin, row_to_user, text, Res, User, USER_COLS};
+use crate::relay::{err, now_ms};
 use crate::routes::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -13,57 +13,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-type Res<T> = Result<T, Err>;
-
 const ROLES: [&str; 5] = ["admin", "institution_admin", "moderator", "teacher", "student"];
 const STATUSES: [&str; 4] = ["active", "pending", "rejected", "suspended"];
 const TYPES: [&str; 3] = ["school", "institute", "university"];
 const MAX_USERS_LISTED: i64 = 200;
-
-fn db_err<E>(_: E) -> Err {
-    err(StatusCode::INTERNAL_SERVER_ERROR, "db_error")
-}
-
-fn bad(code: &str) -> Err {
-    err(StatusCode::BAD_REQUEST, code)
-}
-
-fn require_admin(state: &AppState, headers: &HeaderMap) -> Res<User> {
-    let user = authenticate(state, headers)?;
-    if user.role == "admin" && user.status == "active" {
-        Ok(user)
-    } else {
-        Err(err(StatusCode::FORBIDDEN, "forbidden"))
-    }
-}
-
-fn lock(state: &AppState) -> Res<std::sync::MutexGuard<'_, Connection>> {
-    state.platform.conn.lock().map_err(db_err)
-}
-
-fn name(raw: &str, code: &str) -> Res<String> {
-    let t = raw.trim();
-    if t.is_empty() || t.chars().count() > 200 {
-        Err(bad(code))
-    } else {
-        Ok(t.to_string())
-    }
-}
-
-fn opt_name(raw: &Option<String>) -> Res<Option<String>> {
-    match raw.as_deref().map(str::trim) {
-        None | Some("") => Ok(None),
-        Some(t) if t.chars().count() <= 200 => Ok(Some(t.to_string())),
-        _ => Err(bad("name_too_long")),
-    }
-}
-
-fn audit(conn: &Connection, actor: &str, target: &str, action: &str, detail: &str) {
-    let _ = conn.execute(
-        "INSERT INTO audit_log(actor_id, target_id, action, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![actor, target, action, detail, now_ms()],
-    );
-}
 
 // ───────── users ─────────
 
@@ -373,9 +326,9 @@ fn create_institution(conn: &Connection, actor: &User, req: &InstitutionReq) -> 
     if !TYPES.contains(&t) {
         return Err(bad("invalid_type"));
     }
-    let name_ar = name(req.name_ar.as_deref().unwrap_or(""), "invalid_name")?;
-    let name_en = opt_name(&req.name_en)?;
-    let city = opt_name(&req.city)?;
+    let name_ar = text(req.name_ar.as_deref().unwrap_or(""), 200, "invalid_name")?;
+    let name_en = opt_text(&req.name_en, 200, "name_too_long")?;
+    let city = opt_text(&req.city, 200, "name_too_long")?;
     let id = new_id();
     conn.execute(
         "INSERT INTO institutions(id, type, name_ar, name_en, city, is_active, created_at) VALUES (?1,?2,?3,?4,?5,1,?6)",
@@ -389,11 +342,11 @@ fn create_institution(conn: &Connection, actor: &User, req: &InstitutionReq) -> 
 fn update_institution(conn: &Connection, actor: &User, id: &str, req: &InstitutionReq) -> Res<Institution> {
     let cur = get_institution(conn, id)?;
     let name_ar = match &req.name_ar {
-        Some(n) => name(n, "invalid_name")?,
+        Some(n) => text(n, 200, "invalid_name")?,
         None => cur.name_ar,
     };
-    let name_en = if req.name_en.is_some() { opt_name(&req.name_en)? } else { cur.name_en };
-    let city = if req.city.is_some() { opt_name(&req.city)? } else { cur.city };
+    let name_en = if req.name_en.is_some() { opt_text(&req.name_en, 200, "name_too_long")? } else { cur.name_en };
+    let city = if req.city.is_some() { opt_text(&req.city, 200, "name_too_long")? } else { cur.city };
     let active = req.is_active.unwrap_or(cur.is_active);
     conn.execute(
         "UPDATE institutions SET name_ar=?1, name_en=?2, city=?3, is_active=?4 WHERE id=?5",
@@ -507,8 +460,8 @@ fn create_unit(conn: &Connection, actor: &User, req: &UnitReq) -> Res<Unit> {
             return Err(bad("invalid_kind_under_parent"));
         }
     }
-    let name_ar = name(req.name_ar.as_deref().unwrap_or(""), "invalid_name")?;
-    let name_en = opt_name(&req.name_en)?;
+    let name_ar = text(req.name_ar.as_deref().unwrap_or(""), 200, "invalid_name")?;
+    let name_en = opt_text(&req.name_en, 200, "name_too_long")?;
     let id = new_id();
     conn.execute(
         "INSERT INTO org_units(id, institution_id, parent_id, kind, name_ar, name_en, sort_order, is_active, created_at)
@@ -523,10 +476,10 @@ fn create_unit(conn: &Connection, actor: &User, req: &UnitReq) -> Res<Unit> {
 fn update_unit(conn: &Connection, actor: &User, id: &str, req: &UnitReq) -> Res<Unit> {
     let cur = get_unit(conn, id)?;
     let name_ar = match &req.name_ar {
-        Some(n) => name(n, "invalid_name")?,
+        Some(n) => text(n, 200, "invalid_name")?,
         None => cur.name_ar,
     };
-    let name_en = if req.name_en.is_some() { opt_name(&req.name_en)? } else { cur.name_en };
+    let name_en = if req.name_en.is_some() { opt_text(&req.name_en, 200, "name_too_long")? } else { cur.name_en };
     conn.execute(
         "UPDATE org_units SET name_ar=?1, name_en=?2, sort_order=?3, is_active=?4 WHERE id=?5",
         params![name_ar, name_en, req.sort_order.unwrap_or(cur.sort_order), req.is_active.unwrap_or(cur.is_active), id],
@@ -605,8 +558,8 @@ fn create_subject(conn: &Connection, actor: &User, req: &SubjectReq) -> Res<Subj
             return Err(bad("unit_other_institution"));
         }
     }
-    let name_ar = name(req.name_ar.as_deref().unwrap_or(""), "invalid_name")?;
-    let name_en = opt_name(&req.name_en)?;
+    let name_ar = text(req.name_ar.as_deref().unwrap_or(""), 200, "invalid_name")?;
+    let name_en = opt_text(&req.name_en, 200, "name_too_long")?;
     let id = new_id();
     conn.execute(
         "INSERT INTO subjects(id, institution_id, unit_id, name_ar, name_en, is_active, created_at) VALUES (?1,?2,?3,?4,?5,1,?6)",
@@ -620,10 +573,10 @@ fn create_subject(conn: &Connection, actor: &User, req: &SubjectReq) -> Res<Subj
 fn update_subject(conn: &Connection, actor: &User, id: &str, req: &SubjectReq) -> Res<Subject> {
     let cur = get_subject(conn, id)?;
     let name_ar = match &req.name_ar {
-        Some(n) => name(n, "invalid_name")?,
+        Some(n) => text(n, 200, "invalid_name")?,
         None => cur.name_ar,
     };
-    let name_en = if req.name_en.is_some() { opt_name(&req.name_en)? } else { cur.name_en };
+    let name_en = if req.name_en.is_some() { opt_text(&req.name_en, 200, "name_too_long")? } else { cur.name_en };
     conn.execute(
         "UPDATE subjects SET name_ar=?1, name_en=?2, is_active=?3 WHERE id=?4",
         params![name_ar, name_en, req.is_active.unwrap_or(cur.is_active), id],
