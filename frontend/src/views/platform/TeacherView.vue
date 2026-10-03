@@ -3,6 +3,8 @@ import { ref, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
+import ContentLists from '@/components/platform/ContentLists.vue'
+import { teacherContent, type Bundle } from '@/api/platformContent'
 import { getTeacher, follow, unfollow, type TeacherPage } from '@/api/platformLearning'
 
 const pt = usePt()
@@ -11,11 +13,13 @@ const route = useRoute()
 const id = route.params.id as string
 
 const teacher = ref<TeacherPage | null>(null)
+const content = ref<Bundle>({ posts: [], courses: [], live: [] })
 const error = ref('')
 
 async function load() {
   try {
     teacher.value = await getTeacher(id)
+    content.value = await teacherContent(id)
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
   }
@@ -43,6 +47,8 @@ onMounted(load)
     <button v-if="auth.role === 'student'" :class="teacher.following ? 'btn-outlined' : 'btn-filled'" class="mb-6" @click="toggleFollow">
       {{ teacher.following ? pt('unfollow') : pt('follow') }}
     </button>
+
+    <ContentLists :bundle="content" class="mb-6" />
 
     <h2 class="text-title-md font-bold mb-3">{{ pt('teachesSubjects') }}</h2>
     <p v-if="!teacher.subjects.length" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))">{{ pt('noResults') }}</p>

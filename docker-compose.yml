@@ -14,6 +14,7 @@ services:
       - EXAM_DB_PATH=/app/data/exameow.db
       - ADMIN_TOKEN_FILE=/app/data/admin_token.txt
       - PLATFORM_DB_PATH=/app/data/exameow-platform.db
+      - PLATFORM_FILES_DIR=/app/data/platform-files
       - PLATFORM_ADMIN_EMAIL=${PLATFORM_ADMIN_EMAIL:-}
       - PLATFORM_ADMIN_PASSWORD=${PLATFORM_ADMIN_PASSWORD:-}
     volumes:

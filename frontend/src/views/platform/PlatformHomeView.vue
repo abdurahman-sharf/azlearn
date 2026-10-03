@@ -4,6 +4,8 @@ import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
 import { listInstitutions, type Institution } from '@/api/platformAdmin'
+import ContentLists from '@/components/platform/ContentLists.vue'
+import { feed, type Bundle } from '@/api/platformContent'
 import { myEnrollments, type EnrolledSubject } from '@/api/platformLearning'
 
 const pt = usePt()
@@ -12,6 +14,7 @@ const router = useRouter()
 
 const institutions = ref<Institution[]>([])
 const enrolled = ref<EnrolledSubject[]>([])
+const feedBundle = ref<Bundle>({ posts: [], courses: [], live: [] })
 const error = ref('')
 
 onMounted(async () => {
@@ -19,7 +22,10 @@ onMounted(async () => {
   try {
     // Teachers/students see the institutions of the type they registered with.
     institutions.value = await listInstitutions(auth.profile?.institution_type ?? undefined)
-    if (auth.role === 'student') enrolled.value = await myEnrollments()
+    if (auth.role === 'student') {
+      enrolled.value = await myEnrollments()
+      feedBundle.value = await feed()
+    }
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
   }
@@ -58,8 +64,14 @@ async function logout() {
       <nav class="flex flex-wrap gap-2 mb-6">
         <router-link to="/platform/teachers" class="btn-tonal">{{ pt('browseTeachers') }}</router-link>
         <router-link v-if="auth.role === 'teacher'" to="/platform/teaching" class="btn-tonal">{{ pt('myTeaching') }}</router-link>
+        <router-link v-if="auth.role === 'teacher'" to="/platform/my-content" class="btn-filled">{{ pt('myContent') }}</router-link>
         <router-link to="/platform/profile" class="btn-outlined">{{ pt('myProfile') }}</router-link>
       </nav>
+
+      <section v-if="auth.role === 'student' && (feedBundle.posts.length || feedBundle.courses.length || feedBundle.live.length)" class="mb-6">
+        <h2 class="text-title-md font-bold mb-3">{{ pt('latestContent') }}</h2>
+        <ContentLists :bundle="feedBundle" />
+      </section>
 
       <section v-if="auth.role === 'student'" class="mb-6">
         <h2 class="text-title-md font-bold mb-3">{{ pt('mySubjects') }}</h2>

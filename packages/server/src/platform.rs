@@ -25,6 +25,8 @@ const LOGIN_PER_10MIN_PER_EMAIL: i64 = 10;
 
 pub struct PlatformState {
     pub conn: Mutex<Connection>,
+    /// Directory for uploaded attachments (`PLATFORM_FILES_DIR`).
+    pub files_dir: std::path::PathBuf,
 }
 
 const SCHEMA: &str = "
@@ -98,7 +100,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 /// Applies the core schema plus every feature module's schema (all idempotent).
 pub fn apply_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-    for extra in [crate::platform_learning::SCHEMA] {
+    for extra in [crate::platform_learning::SCHEMA, crate::platform_content::SCHEMA] {
         conn.execute_batch(extra).map_err(|e| e.to_string())?;
     }
     // Columns added after the first release.
@@ -120,11 +122,12 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
     Ok(())
 }
 
-pub fn init_db(path: &str) -> Result<PlatformState, String> {
+pub fn init_db(path: &str, files_dir: &str) -> Result<PlatformState, String> {
+    std::fs::create_dir_all(files_dir).map_err(|e| format!("cannot create {files_dir}: {e}"))?;
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
     apply_schema(&conn)?;
-    Ok(PlatformState { conn: Mutex::new(conn) })
+    Ok(PlatformState { conn: Mutex::new(conn), files_dir: files_dir.into() })
 }
 
 pub fn cleanup_expired(state: &PlatformState) {
@@ -559,9 +562,9 @@ mod tests {
 
     #[test]
     fn bootstrap_creates_admin_once() {
-        let state = PlatformState { conn: Mutex::new(db()) };
+        let state = PlatformState { conn: Mutex::new(db()), files_dir: std::env::temp_dir() };
         assert!(bootstrap_admin(&state, "Root@x.com", "password123").unwrap());
         assert!(!bootstrap_admin(&state, "other@x.com", "password123").unwrap());
-        assert!(bootstrap_admin(&PlatformState { conn: Mutex::new(db()) }, "r@x.com", "short").is_err());
+        assert!(bootstrap_admin(&PlatformState { conn: Mutex::new(db()), files_dir: std::env::temp_dir() }, "r@x.com", "short").is_err());
     }
 }

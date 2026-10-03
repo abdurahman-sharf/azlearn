@@ -24,7 +24,9 @@ Optional layer on top of Exameow (admin / teacher / student), **fully self-hoste
 - First admin: set `PLATFORM_ADMIN_EMAIL` + `PLATFORM_ADMIN_PASSWORD` (created at startup only if no admin exists; no default credentials).
 - Frontend: `lib/platformApi.ts`, `stores/auth.ts`, `views/platform/*`, strings in `i18n/platform.ts` (ar + en fallback). Routes opt in to guards via `meta.requiresAuth / requiresActive / roles / guestOnly` (see `router/index.ts`). Authorization for every future endpoint must call `platform::authenticate` server-side; never trust the client's role.
 - `platform_learning.rs`: teacher↔subject assignments (teacher requests → admin approves in `/platform/admin/teaching`), student placement/enrollment, following teachers, teacher/subject public pages. Shared helpers (`require_active/require_role/require_admin`, `lock`, `text`, `audit`) live in `platform.rs`; each module exposes a `SCHEMA` const applied by `platform::apply_schema` (idempotent; new columns via `add_column_if_missing`).
-- Phases done: 0 accounts, 1 admin, 2 learning graph (assignments/enrollment/follow/browse). Next: 3 teacher content (articles/summaries with files, video courses, live lessons), 4 student engagement (progress, ratings, notifications), 5 exam linkage, 6 moderation & admin stats.
+- `platform_content.rs`: teacher content — posts (article/summary, 1 attachment ≤10MB, ext whitelist + magic-byte check, stored in `PLATFORM_FILES_DIR`), courses with ordered lessons (video URL → server computes `embed_url` for YouTube/Vimeo only; other https links stay external; never iframe user URLs), live sessions (https join link). Content is visible only while `published` AND the teacher is an active teacher with an *approved* assignment for that subject (see `visible()`); admins can only unpublish/cancel/delete (moderation), never rewrite. Text is rendered as plain text in the frontend — never `v-html`.
+- Phases done: 0 accounts, 1 admin, 2 learning graph, 3 teacher content. Next: 4 student engagement (lesson progress, ratings, notifications), 5 exam linkage, 6 moderation & admin stats.
+- E2E note: headless Chromium names blob downloads with Arabic filenames "download"; ASCII names are fine.
 
 ## Tech Stack
 
@@ -129,6 +131,7 @@ Defined in `packages/shared/src/types.ts` (TS) and `packages/core/src/exam/types
 | `EXAM_DB_PATH` | `./exameow.db` | Server | 在线考试 SQLite 路径(docker-compose 挂卷 `/app/data`) |
 | `ADMIN_TOKEN_FILE` | `./admin_token.txt` | Server | 修改后的密钥持久化文件 |
 | `PLATFORM_DB_PATH` | `./exameow-platform.db` | Server | 教学平台账号/机构数据库(docker-compose 挂卷 `/app/data`) |
+| `PLATFORM_FILES_DIR` | `./platform-files` | Server | 教学平台附件目录(docker-compose 挂卷 `/app/data/files`) |
 | `PLATFORM_ADMIN_EMAIL` / `PLATFORM_ADMIN_PASSWORD` | — | Server | 首个平台管理员(仅当尚无管理员时创建) |
 | `VITE_PLATFORM_API` | — | Frontend | 平台服务地址;Tauri/CF 构建需要它才会启用账号功能 |
 | `VITE_EXAM_RELAY` | — | Frontend | 覆盖考试中转地址;默认 Tauri 用 CF 域名,网页/Docker 走同源 |

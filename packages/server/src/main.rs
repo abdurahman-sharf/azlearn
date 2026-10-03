@@ -1,5 +1,6 @@
 mod platform;
 mod platform_admin;
+mod platform_content;
 mod platform_learning;
 mod relay;
 mod routes;
@@ -24,7 +25,9 @@ async fn main() {
     let relay = relay::init_db(&db_path).unwrap_or_else(|e| panic!("failed to init exam db at {db_path}: {e}"));
     let platform_db_path =
         std::env::var("PLATFORM_DB_PATH").unwrap_or_else(|_| "./exameow-platform.db".to_string());
-    let platform = platform::init_db(&platform_db_path)
+    let platform_files_dir =
+        std::env::var("PLATFORM_FILES_DIR").unwrap_or_else(|_| "./platform-files".to_string());
+    let platform = platform::init_db(&platform_db_path, &platform_files_dir)
         .unwrap_or_else(|e| panic!("failed to init platform db at {platform_db_path}: {e}"));
     let non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     match (non_empty("PLATFORM_ADMIN_EMAIL"), non_empty("PLATFORM_ADMIN_PASSWORD")) {
@@ -55,6 +58,7 @@ async fn main() {
                 interval.tick().await;
                 relay::cleanup_expired(&state.relay);
                 platform::cleanup_expired(&state.platform);
+                platform_content::purge_orphan_files(&state.platform);
             }
         });
     }
@@ -116,6 +120,36 @@ async fn main() {
         .route("/api/platform/teachers/{id}", get(platform_learning::teacher_page_handler))
         .route("/api/platform/teachers/{id}/follow", post(platform_learning::follow_handler).delete(platform_learning::unfollow_handler))
         .route("/api/platform/subjects/{id}", get(platform_learning::subject_page_handler))
+        .route("/api/platform/posts", post(platform_content::create_post_handler))
+        .route(
+            "/api/platform/posts/{id}",
+            get(platform_content::get_post_handler).patch(platform_content::update_post_handler).delete(platform_content::delete_post_handler),
+        )
+        .route(
+            "/api/platform/posts/{id}/file",
+            post(platform_content::upload_file_handler).delete(platform_content::remove_file_handler).layer(platform_content::upload_limit()),
+        )
+        .route("/api/platform/files/{id}", get(platform_content::download_file_handler))
+        .route("/api/platform/courses", post(platform_content::create_course_handler))
+        .route(
+            "/api/platform/courses/{id}",
+            get(platform_content::get_course_handler).patch(platform_content::update_course_handler).delete(platform_content::delete_course_handler),
+        )
+        .route("/api/platform/courses/{id}/lessons", post(platform_content::add_lesson_handler))
+        .route(
+            "/api/platform/lessons/{id}",
+            axum::routing::patch(platform_content::update_lesson_handler).delete(platform_content::delete_lesson_handler),
+        )
+        .route("/api/platform/lessons/{id}/move", post(platform_content::move_lesson_handler))
+        .route("/api/platform/live", post(platform_content::create_live_handler))
+        .route(
+            "/api/platform/live/{id}",
+            axum::routing::patch(platform_content::update_live_handler).delete(platform_content::delete_live_handler),
+        )
+        .route("/api/platform/subjects/{id}/content", get(platform_content::subject_content_handler))
+        .route("/api/platform/teachers/{id}/content", get(platform_content::teacher_content_handler))
+        .route("/api/platform/my/content", get(platform_content::my_content_handler))
+        .route("/api/platform/feed", get(platform_content::feed_handler))
         .fallback_service(ServeDir::new(&static_dir))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(state);
