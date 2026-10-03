@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { useRouter } from 'vue-router'
 import { useI18nStore } from '@/stores/i18n'
+import { useAuthStore } from '@/stores/auth'
+import { usePt } from '@/i18n/platform'
+import { platformEnabled } from '@/lib/platformApi'
 import {
   CpuChipIcon,
   PaperAirplaneIcon,
@@ -8,10 +11,13 @@ import {
   ChartBarIcon,
   ChevronRightIcon,
   Cog6ToothIcon,
+  BuildingLibraryIcon,
 } from '@heroicons/vue/24/outline'
 
 const router = useRouter()
 const i18n = useI18nStore()
+const auth = useAuthStore()
+const pt = usePt()
 const version = import.meta.env.VITE_APP_VERSION
 
 const entries = [
@@ -30,6 +36,23 @@ const entries = [
       <span class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold" style="background-color: rgb(var(--md-surface-container-high)); color: rgb(var(--md-on-surface-variant))">v{{ version }}</span>
     </div>
     <p class="text-body-lg mb-6" style="color: rgb(var(--md-on-surface-variant))">{{ i18n.t('mineSubtitle') }}</p>
+
+    <!-- Learning platform account (only when the platform backend is configured) -->
+    <button
+      v-if="platformEnabled"
+      class="card-filled w-full flex items-center gap-4.5 p-4.5 sm:p-5 mb-3.5 text-start cursor-pointer border border-transparent hover:border-[rgb(var(--md-primary)/0.25)]"
+      @click="router.push(auth.isLoggedIn ? '/platform' : '/auth/login')"
+    >
+      <div class="w-12 h-12 rounded-2xl flex items-center justify-center shrink-0" style="background-color: rgb(var(--md-primary-container)); color: rgb(var(--md-on-primary-container))">
+        <BuildingLibraryIcon class="w-6 h-6 stroke-[2]" />
+      </div>
+      <div class="flex-1 min-w-0">
+        <div class="text-title-sm font-bold tracking-tight">{{ pt('accountTitle') }}</div>
+        <div class="text-body-sm mt-0.5" style="color: rgb(var(--md-on-surface-variant))">
+          {{ auth.isLoggedIn ? auth.profile?.full_name : pt('mineAccountDesc') }}
+        </div>
+      </div>
+    </button>
 
     <!-- Menu Entries List -->
     <div class="space-y-3.5">

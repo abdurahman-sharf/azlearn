@@ -17,6 +17,21 @@ Version `1.2.1` (kept in sync across root `package.json`, `src-tauri/Cargo.toml`
 
 **章节功能发布提醒**：`auto_chapter` / `chapter_names` 依赖本次新增的 Rust 生成提示词能力。下次发布此功能时须升级次版本，并将 `ota.json` 的 `minShell` 提高到包含该能力的新壳版本；旧 1.5.0 壳会忽略这些参数，不能仅靠新命令检测覆盖此兼容性变化。
 
+## Learning Platform (accounts & roles, in progress)
+
+Optional layer on top of Exameow (admin / teacher / student), **fully self-hosted in the Axum server** (no external service). Available on web/Docker builds only; Cloudflare and Tauri builds hide it unless `VITE_PLATFORM_API` points to a platform server. All existing features stay public (no account needed).
+- Backend: `packages/server/src/platform.rs` — own SQLite file (`PLATFORM_DB_PATH`, default `./exameow-platform.db`; kept separate because `relay.rs` purges its DB after 7 days). Argon2 passwords, hashed Bearer session tokens (30 days), per-IP/per-email rate limits, server-side role whitelist (clients can only request `student`/`teacher`; teachers start `pending`). Routes: `/api/platform/{register,login,logout,me}`. Admin/tree logic in `platform_admin.rs`: `/api/platform/admin/{users,institutions,units,subjects}` (require active `admin`; admins cannot change their own role/status; role/status change or password reset revokes that user's sessions; every change goes to `audit_log`), plus read routes `/api/platform/institutions[/{id}/structure]` for any active user. Tree rules: `department > level > year > term` (child rank must exceed parent's; schools have no departments).
+- First admin: set `PLATFORM_ADMIN_EMAIL` + `PLATFORM_ADMIN_PASSWORD` (created at startup only if no admin exists; no default credentials).
+- Frontend: `lib/platformApi.ts`, `stores/auth.ts`, `views/platform/*`, strings in `i18n/platform.ts` (ar + en fallback). Routes opt in to guards via `meta.requiresAuth / requiresActive / roles / guestOnly` (see `router/index.ts`). Authorization for every future endpoint must call `platform::authenticate` server-side; never trust the client's role.
+- `platform_learning.rs`: teacher↔subject assignments (teacher requests → admin approves in `/platform/admin/teaching`), student placement/enrollment, following teachers, teacher/subject public pages. Shared helpers (`require_active/require_role/require_admin`, `lock`, `text`, `audit`) live in `platform.rs`; each module exposes a `SCHEMA` const applied by `platform::apply_schema` (idempotent; new columns via `add_column_if_missing`).
+- `platform_content.rs`: teacher content — posts (article/summary, 1 attachment ≤10MB, ext whitelist + magic-byte check, stored in `PLATFORM_FILES_DIR`), courses with ordered lessons (video URL → server computes `embed_url` for YouTube/Vimeo only; other https links stay external; never iframe user URLs), live sessions (https join link). Content is visible only while `published` AND the teacher is an active teacher with an *approved* assignment for that subject (see `visible()`); admins can only unpublish/cancel/delete (moderation), never rewrite. Text is rendered as plain text in the frontend — never `v-html`.
+- `platform_engage.rs`: lesson progress (enrolled students only), reviews (1–5 + plain-text comment; only students enrolled in the course's/teacher's subject may review; shown by first name only; owner/admin can delete), in-app notifications (`notify`, `notify_audience` are called from admin/learning/content modules; stored as `kind`+`data` JSON and rendered client-side via `formatNotification` so they follow the UI language).
+- `platform_exams.rs`: graded assessments. A teacher publishes a local question bank (`QuestionBank.questions`, produced by the generator) for an approved subject; enrolled students take it (`/assessments/{id}/start` returns questions WITHOUT answers/analysis; deadline, attempt limit and open/close window are enforced server-side; in-progress attempts resume). Objective types auto-grade via `relay::grade` + Arabic normalization (`norm_text`, `canon_tf`, `a|b` alternatives for fill-blank); short answers are graded by the teacher (`PATCH /attempts/{id}/grade`). Questions are frozen once attempts exist. Students can turn a reviewed assessment into a local practice bank (existing practice mode). Frontend: `views/platform/{AssessmentEditor,Assessment,TakeAssessment,Attempt,AssessmentResults}View.vue`.
+- Bidi rule for the UI: wrap numbers/labels like `5 / 9` and `A.` in `dir="ltr"` inline-blocks; never put `dir="auto"` on a row that starts with a Latin label.
+- `platform_ops.rs`: content reports (unique open report per user/target, ≥3 distinct reporters auto-hide published content, admin closes all open reports of a target at once), admin stats, audit viewer (cursor pagination), unified search (visible content only, wildcard-escaped), self-service password change (revokes other sessions) and account deletion (cascades; last admin protected). Security headers (`nosniff`, referrer, frame) are set in `main.rs`.
+- All phases (0–6) done and tested. Full user/ops documentation: `docs/PLATFORM_ar.md`. Possible next steps: SMTP (email verification / password reset), PostgreSQL for large deployments, institution-admin role scoping, payments for paid courses.
+- E2E note: headless Chromium names blob downloads with Arabic filenames "download"; ASCII names are fine.
+
 ## Tech Stack
 
 - **Frontend**: Vue 3 + Vite + Pinia + Vue Router + TypeScript, Tailwind CSS 3.4 (custom Material You tonal palette)
@@ -119,6 +134,10 @@ Defined in `packages/shared/src/types.ts` (TS) and `packages/core/src/exam/types
 | `ADMIN_TOKEN` | `pass` | Server | Docker 管理员密钥；`pass` 时管理员页强制修改,改后写入 `ADMIN_TOKEN_FILE` |
 | `EXAM_DB_PATH` | `./exameow.db` | Server | 在线考试 SQLite 路径(docker-compose 挂卷 `/app/data`) |
 | `ADMIN_TOKEN_FILE` | `./admin_token.txt` | Server | 修改后的密钥持久化文件 |
+| `PLATFORM_DB_PATH` | `./exameow-platform.db` | Server | 教学平台账号/机构数据库(docker-compose 挂卷 `/app/data`) |
+| `PLATFORM_FILES_DIR` | `./platform-files` | Server | 教学平台附件目录(docker-compose 挂卷 `/app/data/files`) |
+| `PLATFORM_ADMIN_EMAIL` / `PLATFORM_ADMIN_PASSWORD` | — | Server | 首个平台管理员(仅当尚无管理员时创建) |
+| `VITE_PLATFORM_API` | — | Frontend | 平台服务地址;Tauri/CF 构建需要它才会启用账号功能 |
 | `VITE_EXAM_RELAY` | — | Frontend | 覆盖考试中转地址;默认 Tauri 用 CF 域名,网页/Docker 走同源 |
 | `VITE_CLOUDFLARE` | — | Frontend | Set in deploy-cf.sh to trigger CF routing |
 | `CF_ACCOUNT_ID` / `CF_API_TOKEN` | wrangler.toml | Workers | CF model listing |

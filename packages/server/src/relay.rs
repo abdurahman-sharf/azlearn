@@ -21,9 +21,9 @@ pub struct RelayState {
     pub conn: Mutex<Connection>,
 }
 
-type Err = (StatusCode, String);
+pub type Err = (StatusCode, String);
 
-fn err(status: StatusCode, code: &str) -> Err {
+pub fn err(status: StatusCode, code: &str) -> Err {
     (status, serde_json::json!({ "error": code }).to_string())
 }
 
@@ -35,7 +35,7 @@ fn num(v: f64) -> serde_json::Value {
     }
 }
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -74,7 +74,7 @@ fn gen_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn sha256_hex(text: &str) -> String {
+pub fn sha256_hex(text: &str) -> String {
     let mut h = Sha256::new();
     h.update(text.as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
@@ -235,7 +235,7 @@ fn is_true_answer(a: &str) -> bool {
     })
 }
 
-fn grade(q: &Question, user: Option<&str>) -> Option<bool> {
+pub fn grade(q: &Question, user: Option<&str>) -> Option<bool> {
     if q.qtype == exameow_core::exam::QuestionType::ShortAnswer {
         return None;
     }
@@ -255,7 +255,7 @@ fn grade(q: &Question, user: Option<&str>) -> Option<bool> {
     }
 }
 
-fn client_ip(headers: &HeaderMap) -> String {
+pub fn client_ip(headers: &HeaderMap) -> String {
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
