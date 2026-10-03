@@ -1,3 +1,4 @@
+mod platform;
 mod relay;
 mod routes;
 
@@ -19,6 +20,19 @@ async fn main() {
     });
     let db_path = std::env::var("EXAM_DB_PATH").unwrap_or_else(|_| "./exameow.db".to_string());
     let relay = relay::init_db(&db_path).unwrap_or_else(|e| panic!("failed to init exam db at {db_path}: {e}"));
+    let platform_db_path =
+        std::env::var("PLATFORM_DB_PATH").unwrap_or_else(|_| "./exameow-platform.db".to_string());
+    let platform = platform::init_db(&platform_db_path)
+        .unwrap_or_else(|e| panic!("failed to init platform db at {platform_db_path}: {e}"));
+    let non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    match (non_empty("PLATFORM_ADMIN_EMAIL"), non_empty("PLATFORM_ADMIN_PASSWORD")) {
+        (Some(email), Some(password)) => match platform::bootstrap_admin(&platform, &email, &password) {
+            Ok(true) => println!("Platform: created the first admin account ({email})"),
+            Ok(false) => {}
+            Err(e) => eprintln!("Platform: admin bootstrap skipped: {e}"),
+        },
+        _ => println!("Platform: set PLATFORM_ADMIN_EMAIL and PLATFORM_ADMIN_PASSWORD to create the first admin"),
+    }
     let admin_token = relay::load_admin_token();
     if admin_token == "pass" {
         println!("WARNING: ADMIN_TOKEN is the default \"pass\" — change it at /#/admin before exposing this server");
@@ -27,6 +41,7 @@ async fn main() {
     let state = Arc::new(AppState {
         config_store,
         relay,
+        platform,
         admin_token: Mutex::new(admin_token),
     });
 
@@ -37,6 +52,7 @@ async fn main() {
             loop {
                 interval.tick().await;
                 relay::cleanup_expired(&state.relay);
+                platform::cleanup_expired(&state.platform);
             }
         });
     }
@@ -64,6 +80,10 @@ async fn main() {
         .route("/api/exam/admin/code/{code}", delete(relay::admin_delete_handler))
         .route("/api/exam/admin/code/{code}/restore", post(relay::admin_restore_handler))
         .route("/api/exam/admin/token", post(relay::admin_change_token_handler))
+        .route("/api/platform/register", post(platform::register_handler))
+        .route("/api/platform/login", post(platform::login_handler))
+        .route("/api/platform/logout", post(platform::logout_handler))
+        .route("/api/platform/me", get(platform::me_handler))
         .fallback_service(ServeDir::new(&static_dir))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(state);

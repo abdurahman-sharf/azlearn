@@ -19,10 +19,11 @@ Version `1.2.1` (kept in sync across root `package.json`, `src-tauri/Cargo.toml`
 
 ## Learning Platform (accounts & roles, in progress)
 
-Optional layer on top of Exameow (admin / teacher / student), backed by **Supabase** (`supabase/migrations/`, setup in `supabase/README.md`). Enabled only when `VITE_SUPABASE_URL` + `VITE_SUPABASE_ANON_KEY` are set; otherwise the app behaves as before and all existing features stay public (no account needed).
-- Frontend: `lib/supabase.ts`, `stores/auth.ts`, `views/platform/*`, platform strings in `i18n/platform.ts` (ar + en fallback). Routes opt in to guards via `meta.requiresAuth / requiresActive / roles / guestOnly` (see `router/index.ts`).
-- Roles/status are enforced by RLS + triggers in the DB, never trusted from the client. Teachers sign up as `pending` until an admin approves.
-- Phase 0 done (schema, auth, guards). Next: admin dashboard (institutions tree, teacher approval), student browsing, teacher content, exam linkage.
+Optional layer on top of Exameow (admin / teacher / student), **fully self-hosted in the Axum server** (no external service). Available on web/Docker builds only; Cloudflare and Tauri builds hide it unless `VITE_PLATFORM_API` points to a platform server. All existing features stay public (no account needed).
+- Backend: `packages/server/src/platform.rs` — own SQLite file (`PLATFORM_DB_PATH`, default `./exameow-platform.db`; kept separate because `relay.rs` purges its DB after 7 days). Argon2 passwords, hashed Bearer session tokens (30 days), per-IP/per-email rate limits, server-side role whitelist (clients can only request `student`/`teacher`; teachers start `pending`). Routes: `/api/platform/{register,login,logout,me}`. Tables for institutions / org_units / subjects / audit_log already exist for phase 1.
+- First admin: set `PLATFORM_ADMIN_EMAIL` + `PLATFORM_ADMIN_PASSWORD` (created at startup only if no admin exists; no default credentials).
+- Frontend: `lib/platformApi.ts`, `stores/auth.ts`, `views/platform/*`, strings in `i18n/platform.ts` (ar + en fallback). Routes opt in to guards via `meta.requiresAuth / requiresActive / roles / guestOnly` (see `router/index.ts`). Authorization for every future endpoint must call `platform::authenticate` server-side; never trust the client's role.
+- Phase 0 done (accounts, auth, guards). Next: admin dashboard (institutions tree, teacher approval), student browsing, teacher content, exam linkage.
 
 ## Tech Stack
 
@@ -126,6 +127,9 @@ Defined in `packages/shared/src/types.ts` (TS) and `packages/core/src/exam/types
 | `ADMIN_TOKEN` | `pass` | Server | Docker 管理员密钥；`pass` 时管理员页强制修改,改后写入 `ADMIN_TOKEN_FILE` |
 | `EXAM_DB_PATH` | `./exameow.db` | Server | 在线考试 SQLite 路径(docker-compose 挂卷 `/app/data`) |
 | `ADMIN_TOKEN_FILE` | `./admin_token.txt` | Server | 修改后的密钥持久化文件 |
+| `PLATFORM_DB_PATH` | `./exameow-platform.db` | Server | 教学平台账号/机构数据库(docker-compose 挂卷 `/app/data`) |
+| `PLATFORM_ADMIN_EMAIL` / `PLATFORM_ADMIN_PASSWORD` | — | Server | 首个平台管理员(仅当尚无管理员时创建) |
+| `VITE_PLATFORM_API` | — | Frontend | 平台服务地址;Tauri/CF 构建需要它才会启用账号功能 |
 | `VITE_EXAM_RELAY` | — | Frontend | 覆盖考试中转地址;默认 Tauri 用 CF 域名,网页/Docker 走同源 |
 | `VITE_CLOUDFLARE` | — | Frontend | Set in deploy-cf.sh to trigger CF routing |
 | `CF_ACCOUNT_ID` / `CF_API_TOKEN` | wrangler.toml | Workers | CF model listing |

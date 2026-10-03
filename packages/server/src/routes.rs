@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 pub struct AppState {
     pub config_store: ConfigStore,
     pub relay: crate::relay::RelayState,
+    pub platform: crate::platform::PlatformState,
     pub admin_token: Mutex<String>,
 }
 

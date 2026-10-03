@@ -1,6 +1,6 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
-import { platformEnabled } from '@/lib/supabase'
+import { platformEnabled } from '@/lib/platformApi'
 
 const router = createRouter({
   history: createWebHashHistory(),

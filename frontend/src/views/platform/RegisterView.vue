@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useAuthStore, type InstitutionType } from '@/stores/auth'
-import { usePt } from '@/i18n/platform'
+import { usePt, platformErrorKey } from '@/i18n/platform'
+import { PlatformError } from '@/lib/platformApi'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -12,7 +13,7 @@ const password = ref('')
 const role = ref<'student' | 'teacher'>('student')
 const institutionType = ref<InstitutionType>('school')
 const error = ref('')
-const done = ref(false)
+const done = ref<'active' | 'pending' | null>(null)
 const loading = ref(false)
 
 const types: { value: InstitutionType; key: 'typeSchool' | 'typeInstitute' | 'typeUniversity' }[] = [
@@ -25,16 +26,16 @@ async function submit() {
   error.value = ''
   loading.value = true
   try {
-    await auth.signUp({
+    const status = await auth.signUp({
       email: email.value.trim(),
       password: password.value,
       fullName: fullName.value.trim(),
       role: role.value,
       institutionType: institutionType.value,
     })
-    done.value = true
+    done.value = status === 'pending' ? 'pending' : 'active'
   } catch (e: any) {
-    error.value = e?.message === 'platform-off' ? pt('platformOff') : (e?.message || pt('genericError'))
+    error.value = pt(platformErrorKey(e instanceof PlatformError ? e.code : ''))
   } finally {
     loading.value = false
   }
@@ -46,7 +47,7 @@ async function submit() {
     <h1 class="text-display-sm font-bold tracking-tight mb-6">{{ pt('register') }}</h1>
 
     <div v-if="done" class="card-elevated p-6 space-y-4">
-      <p class="text-body-lg">{{ pt('checkEmail') }}</p>
+      <p class="text-body-lg">{{ done === 'pending' ? pt('registeredTeacher') : pt('registered') }}</p>
       <router-link to="/auth/login" class="btn-filled inline-flex">{{ pt('login') }}</router-link>
     </div>
 

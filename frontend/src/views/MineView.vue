@@ -3,7 +3,7 @@ import { useRouter } from 'vue-router'
 import { useI18nStore } from '@/stores/i18n'
 import { useAuthStore } from '@/stores/auth'
 import { usePt } from '@/i18n/platform'
-import { platformEnabled } from '@/lib/supabase'
+import { platformEnabled } from '@/lib/platformApi'
 import {
   CpuChipIcon,
   PaperAirplaneIcon,

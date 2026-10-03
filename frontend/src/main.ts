@@ -5,7 +5,7 @@ import router from './router'
 import './assets/main.css'
 import './assets/fonts.css'
 import { useAuthStore } from './stores/auth'
-import { platformEnabled } from './lib/supabase'
+import { platformEnabled } from './lib/platformApi'
 
 const app = createApp(App)
 app.use(createPinia())

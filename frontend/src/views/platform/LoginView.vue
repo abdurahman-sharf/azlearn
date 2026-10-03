@@ -2,7 +2,8 @@
 import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
-import { usePt } from '@/i18n/platform'
+import { usePt, platformErrorKey } from '@/i18n/platform'
+import { PlatformError } from '@/lib/platformApi'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -24,7 +25,7 @@ async function submit() {
       : '/platform'
     router.replace(redirect)
   } catch (e: any) {
-    error.value = e?.message === 'platform-off' ? pt('platformOff') : pt('invalidCredentials')
+    error.value = pt(platformErrorKey(e instanceof PlatformError ? e.code : ''))
   } finally {
     loading.value = false
   }
