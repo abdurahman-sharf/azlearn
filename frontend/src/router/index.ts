@@ -310,6 +310,30 @@ const router = createRouter({
       meta: { title: 'platform-attempt', requiresAuth: true, requiresActive: true },
     },
     {
+      path: '/platform/admin/reports',
+      name: 'platform-admin-reports',
+      component: () => import('@/views/platform/AdminReportsView.vue'),
+      meta: { title: 'platform-admin-reports', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+    },
+    {
+      path: '/platform/admin/audit',
+      name: 'platform-admin-audit',
+      component: () => import('@/views/platform/AdminAuditView.vue'),
+      meta: { title: 'platform-admin-audit', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+    },
+    {
+      path: '/platform/search',
+      name: 'platform-search',
+      component: () => import('@/views/platform/SearchView.vue'),
+      meta: { title: 'platform-search', requiresAuth: true, requiresActive: true },
+    },
+    {
+      path: '/platform/account',
+      name: 'platform-account',
+      component: () => import('@/views/platform/AccountView.vue'),
+      meta: { title: 'platform-account', requiresAuth: true, requiresActive: true },
+    },
+    {
       path: '/admin',
       name: 'admin',
       component: () => import('@/views/AdminView.vue'),

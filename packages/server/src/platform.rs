@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 /// Applies the core schema plus every feature module's schema (all idempotent).
 pub fn apply_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-    for extra in [crate::platform_learning::SCHEMA, crate::platform_content::SCHEMA, crate::platform_engage::SCHEMA, crate::platform_exams::SCHEMA] {
+    for extra in [crate::platform_learning::SCHEMA, crate::platform_content::SCHEMA, crate::platform_engage::SCHEMA, crate::platform_exams::SCHEMA, crate::platform_ops::SCHEMA] {
         conn.execute_batch(extra).map_err(|e| e.to_string())?;
     }
     // Columns added after the first release.
@@ -159,7 +159,7 @@ pub fn hash_password(password: &str) -> Result<String, Err> {
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "hash_failed"))
 }
 
-fn verify_password(password: &str, phc: &str) -> bool {
+pub fn verify_password(password: &str, phc: &str) -> bool {
     PasswordHash::new(phc)
         .map(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok())
         .unwrap_or(false)
@@ -194,7 +194,7 @@ fn normalize_email(raw: &str) -> Option<String> {
 }
 
 /// Fixed-window counter. Returns 429 once `max` hits are exceeded in the window.
-fn rate_limit(conn: &Connection, key: &str, window_ms: i64, max: i64) -> Result<(), Err> {
+pub fn rate_limit(conn: &Connection, key: &str, window_ms: i64, max: i64) -> Result<(), Err> {
     let bucket = now_ms() / window_ms;
     let expires = (bucket + 1) * window_ms + window_ms;
     let count: i64 = conn
@@ -281,7 +281,7 @@ fn create_session(conn: &Connection, user_id: &str) -> Result<String, Err> {
     Ok(token)
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())

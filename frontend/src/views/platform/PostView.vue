@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
+import ReportButton from '@/components/platform/ReportButton.vue'
 import { getPost, updatePost, deletePost, downloadFile, type Post } from '@/api/platformContent'
 
 const pt = usePt()
@@ -51,6 +52,7 @@ onMounted(load)
       <button class="btn-tonal" @click="download">{{ pt('download') }}</button>
     </div>
     <div class="flex flex-wrap gap-2">
+      <ReportButton v-if="auth.profile?.id !== post.teacher_id" target-type="post" :target-id="post.id" />
       <router-link v-if="auth.profile?.id === post.teacher_id" :to="`/platform/posts/${post.id}/edit`" class="btn-outlined">{{ pt('edit') }}</router-link>
       <template v-if="auth.role === 'admin'">
         <button v-if="post.status === 'published'" class="btn-outlined" @click="unpublish">{{ pt('unpublish') }}</button>

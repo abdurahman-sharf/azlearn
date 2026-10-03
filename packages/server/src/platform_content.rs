@@ -170,7 +170,7 @@ fn require_assignment(conn: &Connection, teacher_id: &str, subject_id: &str) -> 
 
 /// SQL condition: content `a` is published/scheduled AND its teacher is active and approved for the subject.
 /// Expects aliases `u` (users) and `s` (subjects) in the query.
-fn visible(a: &str, live_status: &str) -> String {
+pub fn visible(a: &str, live_status: &str) -> String {
     format!(
         "{a}.status = '{live_status}' AND u.status = 'active' AND u.role = 'teacher' AND s.is_active = 1
          AND EXISTS(SELECT 1 FROM teacher_subjects ts WHERE ts.teacher_id = {a}.teacher_id AND ts.subject_id = {a}.subject_id AND ts.status = 'approved')"

@@ -3,6 +3,7 @@ mod platform_admin;
 mod platform_content;
 mod platform_engage;
 mod platform_exams;
+mod platform_ops;
 mod platform_learning;
 mod relay;
 mod routes;
@@ -16,6 +17,8 @@ use routes::AppState;
 use exameow_core::config::ConfigStore;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
+use axum::http::{header, HeaderValue};
 
 #[tokio::main]
 async fn main() {
@@ -175,8 +178,20 @@ async fn main() {
         .route("/api/platform/attempts/{id}", get(platform_exams::attempt_handler))
         .route("/api/platform/attempts/{id}/submit", post(platform_exams::submit_handler))
         .route("/api/platform/attempts/{id}/grade", axum::routing::patch(platform_exams::grade_handler))
+        .route("/api/platform/reports", post(platform_ops::report_handler))
+        .route("/api/platform/admin/reports", get(platform_ops::list_reports_handler))
+        .route("/api/platform/admin/reports/{id}", axum::routing::patch(platform_ops::resolve_report_handler))
+        .route("/api/platform/admin/stats", get(platform_ops::stats_handler))
+        .route("/api/platform/admin/audit", get(platform_ops::audit_handler))
+        .route("/api/platform/search", get(platform_ops::search_handler))
+        .route("/api/platform/me/password", post(platform_ops::change_password_handler))
+        .route("/api/platform/me", delete(platform_ops::delete_account_handler))
         .fallback_service(ServeDir::new(&static_dir))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
+        // Baseline hardening that cannot break the SPA (no CSP: the app loads wasm/workers/fonts).
+        .layer(SetResponseHeaderLayer::if_not_present(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")))
+        .layer(SetResponseHeaderLayer::if_not_present(header::REFERRER_POLICY, HeaderValue::from_static("strict-origin-when-cross-origin")))
+        .layer(SetResponseHeaderLayer::if_not_present(header::X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN")))
         .with_state(state);
 
     let port: u16 = std::env::var("PORT")

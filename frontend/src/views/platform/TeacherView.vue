@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
+import ReportButton from '@/components/platform/ReportButton.vue'
 import ReviewsPanel from '@/components/platform/ReviewsPanel.vue'
 import ContentLists from '@/components/platform/ContentLists.vue'
 import { teacherContent, type Bundle } from '@/api/platformContent'
@@ -50,6 +51,8 @@ onMounted(load)
     </button>
 
     <ContentLists :bundle="content" class="mb-6" />
+
+    <div v-if="auth.profile?.id !== teacher.id" class="mb-4"><ReportButton target-type="teacher" :target-id="teacher.id" /></div>
 
     <ReviewsPanel :target-id="id" target-type="teacher" class="mb-6" />
 

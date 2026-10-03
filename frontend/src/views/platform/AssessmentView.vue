@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useI18nStore } from '@/stores/i18n'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
+import ReportButton from '@/components/platform/ReportButton.vue'
 import { getAssessment, updateAssessment, deleteAssessment, type AssessmentDetail } from '@/api/platformExams'
 
 const pt = usePt()
@@ -67,6 +68,8 @@ onMounted(load)
         </li>
       </ul>
     </template>
+
+    <div v-if="!isOwner" class="mt-4"><ReportButton target-type="assessment" :target-id="a.id" /></div>
 
     <div v-if="isOwner || auth.role === 'admin'" class="flex flex-wrap gap-2 mt-4">
       <router-link :to="`/platform/assessments/${a.id}/results`" class="btn-filled">{{ pt('results') }} ({{ a.attempt_count }})</router-link>

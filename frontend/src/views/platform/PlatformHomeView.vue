@@ -8,6 +8,7 @@ import AssessmentList from '@/components/platform/AssessmentList.vue'
 import { availableAssessments, type AssessmentInfo } from '@/api/platformExams'
 import ContentLists from '@/components/platform/ContentLists.vue'
 import { feed, type Bundle } from '@/api/platformContent'
+import { adminStats, type Stats } from '@/api/platformOps'
 import { notifications, myProgress, type ProgressItem } from '@/api/platformEngage'
 import { myEnrollments, type EnrolledSubject } from '@/api/platformLearning'
 
@@ -20,6 +21,8 @@ const enrolled = ref<EnrolledSubject[]>([])
 const feedBundle = ref<Bundle>({ posts: [], courses: [], live: [] })
 const error = ref('')
 const unread = ref(0)
+const stats = ref<Stats | null>(null)
+const searchQ = ref('')
 const available = ref<AssessmentInfo[]>([])
 const progress = ref<ProgressItem[]>([])
 
@@ -27,7 +30,10 @@ onMounted(async () => {
   try {
     unread.value = (await notifications()).unread
   } catch { /* the bell is optional */ }
-  if (auth.role === 'admin') return
+  if (auth.role === 'admin') {
+    try { stats.value = await adminStats() } catch { /* stats are optional */ }
+    return
+  }
   try {
     // Teachers/students see the institutions of the type they registered with.
     institutions.value = await listInstitutions(auth.profile?.institution_type ?? undefined)
@@ -63,6 +69,22 @@ async function logout() {
 
     <section v-if="auth.role === 'admin'" class="space-y-3 mb-6">
       <h2 class="text-title-md font-bold">{{ pt('adminPanel') }}</h2>
+      <div v-if="stats" class="grid grid-cols-2 gap-2" data-testid="stats">
+        <div class="card-filled p-3"><div class="text-body-sm">{{ pt('statUsers') }}</div><div class="text-title-lg font-bold" data-testid="stat-users">{{ Object.values(stats.users).reduce((a, b) => a + b, 0) }}</div></div>
+        <div class="card-filled p-3"><div class="text-body-sm">{{ pt('statPendingTeachers') }}</div><div class="text-title-lg font-bold" data-testid="stat-pending">{{ stats.pending_teachers }}</div></div>
+        <div class="card-filled p-3"><div class="text-body-sm">{{ pt('statOpenReports') }}</div><div class="text-title-lg font-bold" data-testid="stat-reports">{{ stats.open_reports }}</div></div>
+        <div class="card-filled p-3"><div class="text-body-sm">{{ pt('statSignups') }}</div><div class="text-title-lg font-bold">{{ stats.signups_7d }}</div></div>
+        <div class="card-filled p-3"><div class="text-body-sm">{{ pt('statContent') }}</div><div class="text-title-lg font-bold">{{ stats.content.posts + stats.content.courses + stats.content.assessments }}</div></div>
+        <div class="card-filled p-3"><div class="text-body-sm">{{ pt('statAttempts') }}</div><div class="text-title-lg font-bold">{{ stats.attempts_submitted }}</div></div>
+      </div>
+      <router-link to="/platform/admin/reports" class="card-filled block p-4">
+        <div class="font-bold">{{ pt('adminReports') }}</div>
+        <div class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ pt('adminReportsDesc') }}</div>
+      </router-link>
+      <router-link to="/platform/admin/audit" class="card-filled block p-4">
+        <div class="font-bold">{{ pt('adminAudit') }}</div>
+        <div class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ pt('adminAuditDesc') }}</div>
+      </router-link>
       <router-link to="/platform/admin/users" class="card-filled block p-4">
         <div class="font-bold">{{ pt('adminUsers') }}</div>
         <div class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ pt('adminUsersDesc') }}</div>
@@ -78,11 +100,15 @@ async function logout() {
     </section>
 
     <template v-else>
+      <form class="mb-4" @submit.prevent="router.push({ path: '/platform/search', query: { q: searchQ } })">
+        <input v-model="searchQ" type="search" maxlength="60" :placeholder="pt('searchPlaceholder')" class="input-outlined w-full" data-testid="home-search" />
+      </form>
       <nav class="flex flex-wrap gap-2 mb-6">
         <router-link to="/platform/teachers" class="btn-tonal">{{ pt('browseTeachers') }}</router-link>
         <router-link v-if="auth.role === 'teacher'" to="/platform/teaching" class="btn-tonal">{{ pt('myTeaching') }}</router-link>
         <router-link v-if="auth.role === 'teacher'" to="/platform/my-content" class="btn-filled">{{ pt('myContent') }}</router-link>
         <router-link to="/platform/profile" class="btn-outlined">{{ pt('myProfile') }}</router-link>
+        <router-link to="/platform/account" class="btn-outlined">{{ pt('accountSettings') }}</router-link>
       </nav>
 
       <section v-if="available.length" class="mb-6">
@@ -138,6 +164,9 @@ async function logout() {
       </section>
     </template>
 
-    <button class="btn-outlined" @click="logout">{{ pt('logout') }}</button>
+    <div class="flex flex-wrap gap-2">
+      <router-link v-if="auth.role === 'admin'" to="/platform/account" class="btn-outlined">{{ pt('accountSettings') }}</router-link>
+      <button class="btn-outlined" @click="logout">{{ pt('logout') }}</button>
+    </div>
   </div>
 </template>

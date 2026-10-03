@@ -6,6 +6,7 @@ import { usePt, platformErrorMessage } from '@/i18n/platform'
 import ReviewsPanel from '@/components/platform/ReviewsPanel.vue'
 import { courseProgress, setLessonDone } from '@/api/platformEngage'
 import { getSubject } from '@/api/platformLearning'
+import ReportButton from '@/components/platform/ReportButton.vue'
 import { getCourse, updateCourse, deleteCourse, type CourseDetail, type Lesson } from '@/api/platformContent'
 
 const pt = usePt()
@@ -126,6 +127,7 @@ onMounted(load)
     <ReviewsPanel :target-id="id" target-type="course" class="mt-6" />
 
     <div class="flex flex-wrap gap-2 mt-4">
+      <ReportButton v-if="auth.profile?.id !== course.teacher_id" target-type="course" :target-id="course.id" />
       <router-link v-if="auth.profile?.id === course.teacher_id" :to="`/platform/courses/${course.id}/edit`" class="btn-outlined">{{ pt('edit') }}</router-link>
       <template v-if="auth.role === 'admin'">
         <button v-if="course.status === 'published'" class="btn-outlined" @click="unpublish">{{ pt('unpublish') }}</button>
