@@ -233,6 +233,18 @@ fn decide_teaching(conn: &Connection, admin: &User, d: &TeachingDecision) -> Res
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
     audit(conn, &admin.id, &d.teacher_id, "teaching_decided", &format!("{} -> {}", d.subject_id, d.status));
+    if d.status != "pending" {
+        let subject: String = conn
+            .query_row("SELECT name_ar FROM subjects WHERE id = ?1", params![d.subject_id], |r| r.get(0))
+            .unwrap_or_default();
+        crate::platform_engage::notify(
+            conn,
+            &d.teacher_id,
+            &format!("teaching_{}", d.status),
+            serde_json::json!({ "subject": subject }),
+            &format!("/platform/subjects/{}", d.subject_id),
+        );
+    }
     Ok(())
 }
 

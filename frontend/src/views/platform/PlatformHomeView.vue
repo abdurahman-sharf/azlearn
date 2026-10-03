@@ -6,6 +6,7 @@ import { usePt, platformErrorMessage } from '@/i18n/platform'
 import { listInstitutions, type Institution } from '@/api/platformAdmin'
 import ContentLists from '@/components/platform/ContentLists.vue'
 import { feed, type Bundle } from '@/api/platformContent'
+import { notifications, myProgress, type ProgressItem } from '@/api/platformEngage'
 import { myEnrollments, type EnrolledSubject } from '@/api/platformLearning'
 
 const pt = usePt()
@@ -16,8 +17,13 @@ const institutions = ref<Institution[]>([])
 const enrolled = ref<EnrolledSubject[]>([])
 const feedBundle = ref<Bundle>({ posts: [], courses: [], live: [] })
 const error = ref('')
+const unread = ref(0)
+const progress = ref<ProgressItem[]>([])
 
 onMounted(async () => {
+  try {
+    unread.value = (await notifications()).unread
+  } catch { /* the bell is optional */ }
   if (auth.role === 'admin') return
   try {
     // Teachers/students see the institutions of the type they registered with.
@@ -25,6 +31,7 @@ onMounted(async () => {
     if (auth.role === 'student') {
       enrolled.value = await myEnrollments()
       feedBundle.value = await feed()
+      progress.value = await myProgress()
     }
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
@@ -39,7 +46,13 @@ async function logout() {
 
 <template>
   <div class="max-w-3xl mx-auto pb-8">
-    <h1 class="text-display-sm font-bold tracking-tight mb-1">{{ pt('platformHome') }}</h1>
+    <div class="flex items-center gap-3 mb-1">
+      <h1 class="text-display-sm font-bold tracking-tight flex-1">{{ pt('platformHome') }}</h1>
+      <router-link to="/platform/notifications" class="btn-outlined relative" :aria-label="pt('notifications')">
+        {{ pt('notifications') }}
+        <span v-if="unread" data-testid="unread" class="ms-2 px-2 rounded-full text-xs font-bold" style="background-color: rgb(var(--md-primary)); color: rgb(var(--md-on-primary))">{{ unread }}</span>
+      </router-link>
+    </div>
     <p class="text-body-lg mb-6" style="color: rgb(var(--md-on-surface-variant))">
       {{ pt('welcome') }} {{ auth.profile?.full_name }}
     </p>
@@ -67,6 +80,21 @@ async function logout() {
         <router-link v-if="auth.role === 'teacher'" to="/platform/my-content" class="btn-filled">{{ pt('myContent') }}</router-link>
         <router-link to="/platform/profile" class="btn-outlined">{{ pt('myProfile') }}</router-link>
       </nav>
+
+      <section v-if="progress.length" class="mb-6">
+        <h2 class="text-title-md font-bold mb-3">{{ pt('continueLearning') }}</h2>
+        <ul class="space-y-2">
+          <li v-for="p in progress" :key="p.course_id">
+            <router-link :to="`/platform/courses/${p.course_id}`" class="card-filled block p-3">
+              <div class="font-bold">{{ p.title }}</div>
+              <div class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ p.subject_name }} · {{ p.completed }}/{{ p.total }}</div>
+              <div class="h-1.5 rounded-full overflow-hidden mt-2" style="background-color: rgb(var(--md-surface-container-high))">
+                <div class="h-full" :style="{ width: (p.total ? (p.completed / p.total) * 100 : 0) + '%', backgroundColor: 'rgb(var(--md-primary))' }"></div>
+              </div>
+            </router-link>
+          </li>
+        </ul>
+      </section>
 
       <section v-if="auth.role === 'student' && (feedBundle.posts.length || feedBundle.courses.length || feedBundle.live.length)" class="mb-6">
         <h2 class="text-title-md font-bold mb-3">{{ pt('latestContent') }}</h2>

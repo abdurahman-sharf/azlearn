@@ -204,6 +204,23 @@ fn scope_id(scope: Scope) -> &str {
     }
 }
 
+/// Tells followers/enrolled students about new content (only on first publication).
+fn announce(conn: &Connection, teacher: &User, subject_id: &str, kind: &str, title: &str, link: &str) {
+    crate::platform_engage::notify_audience(
+        conn,
+        &teacher.id,
+        subject_id,
+        kind,
+        serde_json::json!({ "title": title, "teacher": teacher.full_name }),
+        link,
+    );
+}
+
+/// Moderation by someone other than the owner: tell the owner.
+fn tell_owner_moderated(conn: &Connection, owner: &str, title: &str, link: &str) {
+    crate::platform_engage::notify(conn, owner, "content_unpublished", serde_json::json!({ "title": title }), link);
+}
+
 fn can_manage(conn: &Connection, table: &str, id: &str, user: &User) -> Res<String> {
     // `table` is always a literal from this module.
     let owner: String = conn
@@ -335,6 +352,9 @@ fn create_post(conn: &Connection, user: &User, r: &PostReq) -> Res<Post> {
         params![id, user.id, subject_id, kind, title, body, status, now],
     )
     .map_err(db_err)?;
+    if status == "published" {
+        announce(conn, user, subject_id, "new_post", &title, &format!("/platform/posts/{id}"));
+    }
     get_post(conn, &id)
 }
 
@@ -363,6 +383,11 @@ fn update_post(conn: &Connection, user: &User, id: &str, r: &PostReq) -> Res<Pos
     .map_err(db_err)?;
     if user.id != owner {
         audit(conn, &user.id, id, "post_moderated", &status);
+        if status == "draft" && cur.status == "published" {
+            tell_owner_moderated(conn, &owner, &title, &format!("/platform/posts/{id}"));
+        }
+    } else if status == "published" && cur.status != "published" {
+        announce(conn, user, &cur.subject_id, "new_post", &title, &format!("/platform/posts/{id}"));
     }
     get_post(conn, id)
 }
@@ -673,6 +698,9 @@ fn create_course(conn: &Connection, user: &User, r: &CourseReq) -> Res<CourseDet
         params![id, user.id, subject_id, title, description, status, now],
     )
     .map_err(db_err)?;
+    if status == "published" {
+        announce(conn, user, subject_id, "new_course", &title, &format!("/platform/courses/{id}"));
+    }
     get_course(conn, &id)
 }
 
@@ -696,6 +724,11 @@ fn update_course(conn: &Connection, user: &User, id: &str, r: &CourseReq) -> Res
     .map_err(db_err)?;
     if user.id != owner {
         audit(conn, &user.id, id, "course_moderated", &status);
+        if status == "draft" && cur.status == "published" {
+            tell_owner_moderated(conn, &owner, &title, &format!("/platform/courses/{id}"));
+        }
+    } else if status == "published" && cur.status != "published" {
+        announce(conn, user, &cur.subject_id, "new_course", &title, &format!("/platform/courses/{id}"));
     }
     get_course(conn, id)
 }
@@ -981,6 +1014,7 @@ fn create_live(conn: &Connection, user: &User, r: &LiveReq) -> Res<Live> {
         params![id, user.id, subject_id, title, description, starts_at, duration, url, now_ms()],
     )
     .map_err(db_err)?;
+    announce(conn, user, subject_id, "live_scheduled", &title, &format!("/platform/subjects/{subject_id}"));
     get_live(conn, &id)
 }
 
@@ -988,6 +1022,7 @@ fn update_live(conn: &Connection, user: &User, id: &str, r: &LiveReq) -> Res<Liv
     let owner = can_manage(conn, "live_sessions", id, user)?;
     admin_only_status(user, &owner, r.title.is_some() || r.description.is_some() || r.starts_at.is_some() || r.duration_min.is_some() || r.join_url.is_some())?;
     let cur = get_live(conn, id)?;
+    let (cur_status, cur_subject, cur_teacher) = (cur.status.clone(), cur.subject_id.clone(), cur.teacher_name.clone());
     let title = match &r.title {
         Some(t) => text(t, 200, "invalid_title")?,
         None => cur.title,
@@ -1010,6 +1045,13 @@ fn update_live(conn: &Connection, user: &User, id: &str, r: &LiveReq) -> Res<Liv
     .map_err(db_err)?;
     if user.id != owner {
         audit(conn, &user.id, id, "live_moderated", &status);
+        if status == "cancelled" && cur_status == "scheduled" {
+            tell_owner_moderated(conn, &owner, &title, &format!("/platform/subjects/{}", cur_subject));
+        }
+    }
+    if status == "cancelled" && cur_status == "scheduled" {
+        let teacher = User { id: owner.clone(), email: String::new(), full_name: cur_teacher, role: "teacher".into(), institution_type: None, status: "active".into(), status_reason: None };
+        announce(conn, &teacher, &cur_subject, "live_cancelled", &title, &format!("/platform/subjects/{cur_subject}"));
     }
     get_live(conn, id)
 }

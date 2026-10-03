@@ -126,6 +126,36 @@ const ar = {
   teacher: 'المعلم',
   subject: 'المادة',
   minutesShort: 'دقيقة',
+  notifications: 'الإشعارات',
+  noNotifications: 'لا توجد إشعارات.',
+  markAllRead: 'تعليم الكل كمقروء',
+  n_account_active: 'تم تفعيل حسابك.',
+  n_account_rejected: 'تم رفض حسابك. السبب: {reason}',
+  n_account_suspended: 'تم إيقاف حسابك. السبب: {reason}',
+  n_teaching_approved: 'اعتُمدت لتدريس مادة «{subject}».',
+  n_teaching_rejected: 'رُفض طلبك لتدريس مادة «{subject}».',
+  n_new_post: '{teacher} نشر: {title}',
+  n_new_course: '{teacher} نشر دورة: {title}',
+  n_live_scheduled: '{teacher} جدول درساً مباشراً: {title}',
+  n_live_cancelled: 'أُلغي الدرس المباشر: {title}',
+  n_new_review: 'تقييم جديد ({rating} من 5).',
+  n_content_unpublished: 'أوقف المدير نشر «{title}».',
+  progress: 'التقدّم',
+  continueLearning: 'تابع التعلم',
+  markDone: 'تعليم الدرس كمكتمل',
+  markUndone: 'إلغاء الإكمال',
+  completedLesson: 'مكتمل',
+  enrollToTrack: 'سجّل في المادة لتتبّع تقدّمك.',
+  reviewsTitle: 'التقييمات',
+  noReviews: 'لا توجد تقييمات بعد.',
+  yourRating: 'تقييمك',
+  yourComment: 'تعليقك (اختياري)',
+  submitReview: 'إرسال التقييم',
+  deleteReview: 'حذف التقييم',
+  reviewsCount: 'تقييم',
+  onlyEnrolledReview: 'يمكن للطلاب المسجّلين في المادة فقط التقييم.',
+  notEnrolled: 'يجب التسجيل في المادة أولاً.',
+  invalidRating: 'التقييم من 1 إلى 5.',
   myContent: 'محتواي',
   myContentDesc: 'مقالات وملخصات ودورات ودروس مباشرة',
   posts: 'المقالات والملخصات',
@@ -307,6 +337,36 @@ const en: typeof ar = {
   teacher: 'Teacher',
   subject: 'Subject',
   minutesShort: 'min',
+  notifications: 'Notifications',
+  noNotifications: 'No notifications.',
+  markAllRead: 'Mark all as read',
+  n_account_active: 'Your account is now active.',
+  n_account_rejected: 'Your account was rejected. Reason: {reason}',
+  n_account_suspended: 'Your account was suspended. Reason: {reason}',
+  n_teaching_approved: 'You were approved to teach “{subject}”.',
+  n_teaching_rejected: 'Your request to teach “{subject}” was rejected.',
+  n_new_post: '{teacher} published: {title}',
+  n_new_course: '{teacher} published a course: {title}',
+  n_live_scheduled: '{teacher} scheduled a live lesson: {title}',
+  n_live_cancelled: 'Live lesson cancelled: {title}',
+  n_new_review: 'New review ({rating} of 5).',
+  n_content_unpublished: 'An admin unpublished “{title}”.',
+  progress: 'Progress',
+  continueLearning: 'Continue learning',
+  markDone: 'Mark lesson complete',
+  markUndone: 'Mark incomplete',
+  completedLesson: 'Done',
+  enrollToTrack: 'Enroll in the subject to track your progress.',
+  reviewsTitle: 'Reviews',
+  noReviews: 'No reviews yet.',
+  yourRating: 'Your rating',
+  yourComment: 'Your comment (optional)',
+  submitReview: 'Submit review',
+  deleteReview: 'Delete review',
+  reviewsCount: 'reviews',
+  onlyEnrolledReview: 'Only students enrolled in the subject can review.',
+  notEnrolled: 'Enroll in the subject first.',
+  invalidRating: 'Rating must be 1–5.',
   myContent: 'My content',
   myContentDesc: 'Articles, summaries, courses and live lessons',
   posts: 'Articles & summaries',
@@ -389,6 +449,8 @@ export function platformErrorKey(code: string): PlatformKey {
     case 'invalid_file_size': return 'invalidFileSize'
     case 'invalid_title': return 'invalidTitle'
     case 'invalid_body': return 'invalidBody'
+    case 'not_enrolled': return 'notEnrolled'
+    case 'invalid_rating': return 'invalidRating'
     case 'forbidden': return 'forbidden'
     case 'not_found': return 'notFound'
     case 'cannot_modify_self': return 'cannotModifySelf'
@@ -402,4 +464,13 @@ export function platformErrorKey(code: string): PlatformKey {
 
 export function platformErrorMessage(pt: (k: PlatformKey) => string, e: unknown): string {
   return pt(platformErrorKey(e instanceof PlatformError ? e.code : ''))
+}
+
+/** Renders a stored notification (`kind` + `data`) in the current language. */
+export function formatNotification(pt: (k: PlatformKey) => string, kind: string, data: Record<string, string | number | null>): string {
+  const key = `n_${kind}` as PlatformKey
+  let text = pt(key)
+  if (!text) return kind
+  for (const [k, v] of Object.entries(data)) text = text.replace(`{${k}}`, String(v ?? ''))
+  return text
 }

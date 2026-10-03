@@ -131,6 +131,9 @@ fn update_user(conn: &Connection, actor: &User, id: &str, patch: &UserPatch, pas
     if password_hash.is_some() {
         audit(conn, &actor.id, id, "user_password_reset", "");
     }
+    if status != target.status && ["active", "rejected", "suspended"].contains(&status.as_str()) {
+        crate::platform_engage::notify(conn, id, &format!("account_{status}"), serde_json::json!({ "reason": reason }), "/platform");
+    }
     conn.query_row(&format!("SELECT {USER_COLS} FROM users WHERE id = ?1"), params![id], row_to_user)
         .map_err(db_err)
 }

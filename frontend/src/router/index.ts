@@ -268,6 +268,12 @@ const router = createRouter({
       meta: { title: 'platform-live-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
     },
     {
+      path: '/platform/notifications',
+      name: 'platform-notifications',
+      component: () => import('@/views/platform/NotificationsView.vue'),
+      meta: { title: 'Notifications', requiresAuth: true, requiresActive: true },
+    },
+    {
       path: '/admin',
       name: 'admin',
       component: () => import('@/views/AdminView.vue'),

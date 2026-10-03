@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
+import ReviewsPanel from '@/components/platform/ReviewsPanel.vue'
 import ContentLists from '@/components/platform/ContentLists.vue'
 import { teacherContent, type Bundle } from '@/api/platformContent'
 import { getTeacher, follow, unfollow, type TeacherPage } from '@/api/platformLearning'
@@ -49,6 +50,8 @@ onMounted(load)
     </button>
 
     <ContentLists :bundle="content" class="mb-6" />
+
+    <ReviewsPanel :target-id="id" target-type="teacher" class="mb-6" />
 
     <h2 class="text-title-md font-bold mb-3">{{ pt('teachesSubjects') }}</h2>
     <p v-if="!teacher.subjects.length" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))">{{ pt('noResults') }}</p>

@@ -3,6 +3,9 @@ import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
+import ReviewsPanel from '@/components/platform/ReviewsPanel.vue'
+import { courseProgress, setLessonDone } from '@/api/platformEngage'
+import { getSubject } from '@/api/platformLearning'
 import { getCourse, updateCourse, deleteCourse, type CourseDetail, type Lesson } from '@/api/platformContent'
 
 const pt = usePt()
@@ -14,6 +17,9 @@ const id = route.params.id as string
 const course = ref<CourseDetail | null>(null)
 const current = ref<Lesson | null>(null)
 const error = ref('')
+const done = ref<Set<string>>(new Set())
+const enrolled = ref(false)
+const percent = computed(() => (course.value?.lessons.length ? Math.round((done.value.size / course.value.lessons.length) * 100) : 0))
 
 const groups = computed(() => {
   const out: { section: string | null; lessons: Lesson[] }[] = []
@@ -28,9 +34,25 @@ const groups = computed(() => {
 async function load() {
   try {
     course.value = await getCourse(id)
+    if (auth.role === 'student') {
+      enrolled.value = (await getSubject(course.value.subject_id)).enrolled
+      if (enrolled.value) done.value = new Set((await courseProgress(id)).completed)
+    }
     current.value = current.value
       ? course.value.lessons.find(l => l.id === current.value!.id) ?? course.value.lessons[0] ?? null
       : course.value.lessons[0] ?? null
+  } catch (e) {
+    error.value = platformErrorMessage(pt, e)
+  }
+}
+async function toggleDone(l: Lesson) {
+  const next = !done.value.has(l.id)
+  try {
+    await setLessonDone(l.id, next)
+    const s = new Set(done.value)
+    if (next) s.add(l.id)
+    else s.delete(l.id)
+    done.value = s
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
   }
@@ -77,16 +99,31 @@ onMounted(load)
         <a :href="current.video_url" target="_blank" rel="noopener noreferrer" class="btn-tonal">{{ pt('openLink') }}</a>
       </div>
       <p v-if="current.description" class="text-body-lg mt-3 whitespace-pre-line">{{ current.description }}</p>
+      <button v-if="enrolled" class="mt-3" :class="done.has(current.id) ? 'btn-outlined' : 'btn-filled'" @click="toggleDone(current)">
+        {{ done.has(current.id) ? pt('markUndone') : pt('markDone') }}
+      </button>
+    </div>
+
+    <div v-if="auth.role === 'student'" class="mb-4">
+      <p v-if="!enrolled" class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ pt('enrollToTrack') }}</p>
+      <template v-else>
+        <div class="flex justify-between text-body-sm mb-1"><span>{{ pt('progress') }}</span><span data-testid="percent">{{ percent }}%</span></div>
+        <div class="h-2 rounded-full overflow-hidden" style="background-color: rgb(var(--md-surface-container-high))" role="progressbar" :aria-valuenow="percent" aria-valuemin="0" aria-valuemax="100">
+          <div class="h-full" :style="{ width: percent + '%', backgroundColor: 'rgb(var(--md-primary))' }"></div>
+        </div>
+      </template>
     </div>
 
     <div v-for="(g, gi) in groups" :key="gi" class="mb-3">
       <div v-if="g.section" class="font-semibold mb-1" style="color: rgb(var(--md-on-surface-variant))">{{ g.section }}</div>
       <ul class="space-y-1">
         <li v-for="l in g.lessons" :key="l.id">
-          <button class="w-full text-start card-filled p-3" :class="{ 'ring-2': current?.id === l.id }" @click="current = l">{{ l.position }}. {{ l.title }}</button>
+          <button class="w-full text-start card-filled p-3" :class="{ 'ring-2': current?.id === l.id }" @click="current = l">{{ l.position }}. {{ l.title }}<span v-if="done.has(l.id)" class="ms-2" style="color: rgb(var(--md-primary))" :aria-label="pt('completedLesson')">✓</span></button>
         </li>
       </ul>
     </div>
+
+    <ReviewsPanel :target-id="id" target-type="course" class="mt-6" />
 
     <div class="flex flex-wrap gap-2 mt-4">
       <router-link v-if="auth.profile?.id === course.teacher_id" :to="`/platform/courses/${course.id}/edit`" class="btn-outlined">{{ pt('edit') }}</router-link>

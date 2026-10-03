@@ -1,6 +1,7 @@
 mod platform;
 mod platform_admin;
 mod platform_content;
+mod platform_engage;
 mod platform_learning;
 mod relay;
 mod routes;
@@ -59,6 +60,7 @@ async fn main() {
                 relay::cleanup_expired(&state.relay);
                 platform::cleanup_expired(&state.platform);
                 platform_content::purge_orphan_files(&state.platform);
+                platform_engage::purge_old_notifications(&state.platform);
             }
         });
     }
@@ -150,6 +152,14 @@ async fn main() {
         .route("/api/platform/teachers/{id}/content", get(platform_content::teacher_content_handler))
         .route("/api/platform/my/content", get(platform_content::my_content_handler))
         .route("/api/platform/feed", get(platform_content::feed_handler))
+        .route("/api/platform/notifications", get(platform_engage::notifications_handler))
+        .route("/api/platform/notifications/read", post(platform_engage::mark_read_handler))
+        .route("/api/platform/lessons/{id}/complete", axum::routing::put(platform_engage::complete_handler).delete(platform_engage::uncomplete_handler))
+        .route("/api/platform/courses/{id}/progress", get(platform_engage::course_progress_handler))
+        .route("/api/platform/my/progress", get(platform_engage::my_progress_handler))
+        .route("/api/platform/reviews", axum::routing::put(platform_engage::put_review_handler))
+        .route("/api/platform/reviews/{target_type}/{id}", get(platform_engage::reviews_handler))
+        .route("/api/platform/reviews/{id}", delete(platform_engage::delete_review_handler))
         .fallback_service(ServeDir::new(&static_dir))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(state);
