@@ -123,7 +123,7 @@ pub struct User {
     pub status_reason: Option<String>,
 }
 
-fn hash_password(password: &str) -> Result<String, Err> {
+pub fn hash_password(password: &str) -> Result<String, Err> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -143,7 +143,7 @@ fn dummy_hash() -> &'static str {
     DUMMY.get_or_init(|| hash_password("dummy-password-for-timing").unwrap_or_default())
 }
 
-fn new_id() -> String {
+pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
@@ -183,9 +183,9 @@ fn rate_limit(conn: &Connection, key: &str, window_ms: i64, max: i64) -> Result<
     Ok(())
 }
 
-const USER_COLS: &str = "id, email, full_name, role, institution_type, status, status_reason";
+pub const USER_COLS: &str = "id, email, full_name, role, institution_type, status, status_reason";
 
-fn row_to_user(r: &rusqlite::Row) -> rusqlite::Result<User> {
+pub fn row_to_user(r: &rusqlite::Row) -> rusqlite::Result<User> {
     Ok(User {
         id: r.get(0)?,
         email: r.get(1)?,
@@ -380,6 +380,24 @@ pub async fn logout_handler(State(state): State<Arc<AppState>>, headers: HeaderM
         let _ = conn.execute("DELETE FROM sessions WHERE token_hash = ?1", params![sha256_hex(token)]);
     }
     StatusCode::NO_CONTENT
+}
+
+#[cfg(test)]
+pub fn create_test_db() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(SCHEMA).unwrap();
+    conn
+}
+
+#[cfg(test)]
+pub fn insert_test_user(conn: &Connection, email: &str, role: &str, status: &str) -> User {
+    let id = new_id();
+    conn.execute(
+        "INSERT INTO users(id, email, password_hash, full_name, role, status, created_at) VALUES (?1, ?2, 'h', 'T', ?3, ?4, 0)",
+        params![id, email, role, status],
+    )
+    .unwrap();
+    User { id, email: email.into(), full_name: "T".into(), role: role.into(), institution_type: None, status: status.into(), status_reason: None }
 }
 
 #[cfg(test)]

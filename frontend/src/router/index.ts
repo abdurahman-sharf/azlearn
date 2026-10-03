@@ -154,6 +154,24 @@ const router = createRouter({
       meta: { title: 'Platform', requiresAuth: true, requiresActive: true },
     },
     {
+      path: '/platform/admin/users',
+      name: 'platform-admin-users',
+      component: () => import('@/views/platform/AdminUsersView.vue'),
+      meta: { title: 'Accounts', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+    },
+    {
+      path: '/platform/admin/institutions',
+      name: 'platform-admin-institutions',
+      component: () => import('@/views/platform/AdminInstitutionsView.vue'),
+      meta: { title: 'Institutions', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+    },
+    {
+      path: '/platform/admin/institutions/:id',
+      name: 'platform-admin-institution',
+      component: () => import('@/views/platform/AdminInstitutionView.vue'),
+      meta: { title: 'Institution', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+    },
+    {
       path: '/admin',
       name: 'admin',
       component: () => import('@/views/AdminView.vue'),

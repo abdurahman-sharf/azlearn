@@ -1,4 +1,5 @@
 mod platform;
+mod platform_admin;
 mod relay;
 mod routes;
 
@@ -84,6 +85,25 @@ async fn main() {
         .route("/api/platform/login", post(platform::login_handler))
         .route("/api/platform/logout", post(platform::logout_handler))
         .route("/api/platform/me", get(platform::me_handler))
+        .route("/api/platform/institutions", get(platform_admin::list_institutions_handler))
+        .route("/api/platform/institutions/{id}/structure", get(platform_admin::structure_handler))
+        .route("/api/platform/admin/users", get(platform_admin::list_users_handler))
+        .route("/api/platform/admin/users/{id}", axum::routing::patch(platform_admin::update_user_handler))
+        .route("/api/platform/admin/institutions", post(platform_admin::create_institution_handler))
+        .route(
+            "/api/platform/admin/institutions/{id}",
+            axum::routing::patch(platform_admin::update_institution_handler).delete(platform_admin::delete_institution_handler),
+        )
+        .route("/api/platform/admin/units", post(platform_admin::create_unit_handler))
+        .route(
+            "/api/platform/admin/units/{id}",
+            axum::routing::patch(platform_admin::update_unit_handler).delete(platform_admin::delete_unit_handler),
+        )
+        .route("/api/platform/admin/subjects", post(platform_admin::create_subject_handler))
+        .route(
+            "/api/platform/admin/subjects/{id}",
+            axum::routing::patch(platform_admin::update_subject_handler).delete(platform_admin::delete_subject_handler),
+        )
         .fallback_service(ServeDir::new(&static_dir))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         .with_state(state);

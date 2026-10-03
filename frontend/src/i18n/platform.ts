@@ -1,4 +1,5 @@
 import { useI18nStore } from '@/stores/i18n'
+import { PlatformError } from '@/lib/platformApi'
 
 const ar = {
   accountTitle: 'حسابي في المنصة',
@@ -39,6 +40,57 @@ const ar = {
   welcome: 'مرحباً،',
   platformHomeSoon: 'ستظهر هنا المدارس والمعاهد والجامعات في المرحلة القادمة.',
   mineAccountDesc: 'تسجيل الدخول والتسجيل في المنصة التعليمية',
+  adminPanel: 'لوحة الإدارة',
+  adminUsers: 'إدارة الحسابات',
+  adminUsersDesc: 'اعتماد المعلمين وتعديل الحسابات',
+  adminInstitutions: 'المؤسسات التعليمية',
+  adminInstitutionsDesc: 'المدارس والمعاهد والجامعات ومستوياتها ومواردها',
+  back: 'رجوع',
+  save: 'حفظ',
+  cancel: 'إلغاء',
+  add: 'إضافة',
+  edit: 'تعديل',
+  del: 'حذف',
+  confirmDelete: 'هل أنت متأكد من الحذف؟ سيُحذف كل ما بداخله.',
+  search: 'بحث بالاسم أو البريد',
+  all: 'الكل',
+  pendingFilter: 'قيد المراجعة',
+  statusActive: 'نشط',
+  statusPending: 'قيد المراجعة',
+  statusRejected: 'مرفوض',
+  statusSuspended: 'موقوف',
+  roleInstitutionAdmin: 'مدير مؤسسة',
+  roleModerator: 'مشرف محتوى',
+  approve: 'اعتماد',
+  reject: 'رفض',
+  suspend: 'إيقاف',
+  reactivate: 'إعادة تفعيل',
+  reasonPrompt: 'سبب القرار (يظهر للمستخدم):',
+  resetPassword: 'تعيين كلمة مرور جديدة',
+  newPasswordPrompt: 'كلمة المرور الجديدة (8 أحرف على الأقل):',
+  passwordChanged: 'تم تغيير كلمة المرور.',
+  noResults: 'لا توجد نتائج.',
+  nameAr: 'الاسم بالعربية',
+  nameEn: 'الاسم بالإنجليزية (اختياري)',
+  city: 'المدينة (اختياري)',
+  newInstitution: 'إضافة مؤسسة',
+  inactive: 'غير مفعّل',
+  toggleActive: 'تفعيل / إخفاء',
+  kindDepartment: 'تخصص / قسم',
+  kindLevel: 'مستوى / صف',
+  kindYear: 'سنة دراسية',
+  kindTerm: 'فصل دراسي',
+  addUnit: 'إضافة عنصر',
+  addSubject: 'إضافة مادة',
+  subjects: 'المواد',
+  structure: 'الهيكل الدراسي',
+  noInstitutions: 'لم تُضف مؤسسات بعد.',
+  yourInstitutions: 'المؤسسات المتاحة',
+  forbidden: 'ليست لديك صلاحية لهذا الإجراء.',
+  notFound: 'العنصر غير موجود.',
+  cannotModifySelf: 'لا يمكنك تغيير دورك أو حالتك بنفسك.',
+  invalidKind: 'هذا النوع غير مسموح في هذا الموضع.',
+  invalidName: 'الاسم غير صالح.',
 }
 
 const en: typeof ar = {
@@ -80,6 +132,57 @@ const en: typeof ar = {
   welcome: 'Welcome,',
   platformHomeSoon: 'Schools, institutes and universities will appear here in the next phase.',
   mineAccountDesc: 'Sign in or register on the learning platform',
+  adminPanel: 'Admin panel',
+  adminUsers: 'Manage accounts',
+  adminUsersDesc: 'Approve teachers and edit accounts',
+  adminInstitutions: 'Institutions',
+  adminInstitutionsDesc: 'Schools, institutes, universities, their levels and subjects',
+  back: 'Back',
+  save: 'Save',
+  cancel: 'Cancel',
+  add: 'Add',
+  edit: 'Edit',
+  del: 'Delete',
+  confirmDelete: 'Delete this? Everything inside it will be removed.',
+  search: 'Search by name or email',
+  all: 'All',
+  pendingFilter: 'Pending',
+  statusActive: 'Active',
+  statusPending: 'Pending',
+  statusRejected: 'Rejected',
+  statusSuspended: 'Suspended',
+  roleInstitutionAdmin: 'Institution admin',
+  roleModerator: 'Moderator',
+  approve: 'Approve',
+  reject: 'Reject',
+  suspend: 'Suspend',
+  reactivate: 'Reactivate',
+  reasonPrompt: 'Reason (shown to the user):',
+  resetPassword: 'Set a new password',
+  newPasswordPrompt: 'New password (at least 8 characters):',
+  passwordChanged: 'Password changed.',
+  noResults: 'No results.',
+  nameAr: 'Name (Arabic)',
+  nameEn: 'Name (English, optional)',
+  city: 'City (optional)',
+  newInstitution: 'Add institution',
+  inactive: 'Inactive',
+  toggleActive: 'Enable / hide',
+  kindDepartment: 'Department / major',
+  kindLevel: 'Level / grade',
+  kindYear: 'Academic year',
+  kindTerm: 'Term',
+  addUnit: 'Add item',
+  addSubject: 'Add subject',
+  subjects: 'Subjects',
+  structure: 'Academic structure',
+  noInstitutions: 'No institutions yet.',
+  yourInstitutions: 'Available institutions',
+  forbidden: 'You are not allowed to do that.',
+  notFound: 'Not found.',
+  cannotModifySelf: 'You cannot change your own role or status.',
+  invalidKind: 'This type is not allowed here.',
+  invalidName: 'Invalid name.',
 }
 
 export type PlatformKey = keyof typeof ar
@@ -99,6 +202,17 @@ export function platformErrorKey(code: string): PlatformKey {
     case 'invalid_password': return 'invalidPassword'
     case 'rate_limited': return 'rateLimited'
     case 'network': return 'networkError'
+    case 'forbidden': return 'forbidden'
+    case 'not_found': return 'notFound'
+    case 'cannot_modify_self': return 'cannotModifySelf'
+    case 'invalid_name': return 'invalidName'
+    case 'invalid_kind':
+    case 'invalid_kind_for_school':
+    case 'invalid_kind_under_parent': return 'invalidKind'
     default: return 'genericError'
   }
+}
+
+export function platformErrorMessage(pt: (k: PlatformKey) => string, e: unknown): string {
+  return pt(platformErrorKey(e instanceof PlatformError ? e.code : ''))
 }
