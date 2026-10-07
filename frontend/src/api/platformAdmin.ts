@@ -41,8 +41,8 @@ const qs = (o: Record<string, string | undefined>) => {
   return s ? `?${s}` : ''
 }
 
-export const listUsers = (f: { status?: string; role?: string; q?: string }) =>
-  platformFetch<Profile[]>(`/admin/users${qs(f)}`)
+export const listUsers = (f: { status?: string; role?: string; q?: string; limit?: number; offset?: number }) =>
+  platformFetch<Profile[]>(`/admin/users${qs({ ...f, limit: f.limit?.toString(), offset: f.offset?.toString() })}`)
 export const updateUser = (
   id: string,
   patch: { role?: string; status?: string; status_reason?: string; full_name?: string; password?: string },

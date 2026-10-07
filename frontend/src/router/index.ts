@@ -157,28 +157,60 @@ const router = createRouter({
       meta: { title: 'Account status', requiresAuth: true },
     },
     {
+      // Admin area: sidebar shell + the existing admin pages as children (URLs unchanged).
+      path: '/platform/admin',
+      component: () => import('@/components/platform/AdminLayout.vue'),
+      meta: { requiresAuth: true, requiresActive: true, roles: ['admin'] },
+      children: [
+        {
+          path: '',
+          name: 'platform-admin',
+          component: () => import('@/views/platform/AdminOverviewView.vue'),
+          meta: { title: 'Overview', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'users',
+          name: 'platform-admin-users',
+          component: () => import('@/views/platform/AdminUsersView.vue'),
+          meta: { title: 'Accounts', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'institutions',
+          name: 'platform-admin-institutions',
+          component: () => import('@/views/platform/AdminInstitutionsView.vue'),
+          meta: { title: 'Institutions', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'institutions/:id',
+          name: 'platform-admin-institution',
+          component: () => import('@/views/platform/AdminInstitutionView.vue'),
+          meta: { title: 'Institution', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'teaching',
+          name: 'platform-admin-teaching',
+          component: () => import('@/views/platform/AdminTeachingView.vue'),
+          meta: { title: 'platform-admin-teaching', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'reports',
+          name: 'platform-admin-reports',
+          component: () => import('@/views/platform/AdminReportsView.vue'),
+          meta: { title: 'platform-admin-reports', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'audit',
+          name: 'platform-admin-audit',
+          component: () => import('@/views/platform/AdminAuditView.vue'),
+          meta: { title: 'platform-admin-audit', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+      ],
+    },
+    {
       path: '/platform',
       name: 'platform-home',
       component: () => import('@/views/platform/PlatformHomeView.vue'),
       meta: { title: 'Platform', requiresAuth: true, requiresActive: true },
-    },
-    {
-      path: '/platform/admin/users',
-      name: 'platform-admin-users',
-      component: () => import('@/views/platform/AdminUsersView.vue'),
-      meta: { title: 'Accounts', requiresAuth: true, requiresActive: true, roles: ['admin'] },
-    },
-    {
-      path: '/platform/admin/institutions',
-      name: 'platform-admin-institutions',
-      component: () => import('@/views/platform/AdminInstitutionsView.vue'),
-      meta: { title: 'Institutions', requiresAuth: true, requiresActive: true, roles: ['admin'] },
-    },
-    {
-      path: '/platform/admin/institutions/:id',
-      name: 'platform-admin-institution',
-      component: () => import('@/views/platform/AdminInstitutionView.vue'),
-      meta: { title: 'Institution', requiresAuth: true, requiresActive: true, roles: ['admin'] },
     },
     {
       path: '/platform/institutions/:id',
@@ -215,12 +247,6 @@ const router = createRouter({
       name: 'platform-teaching',
       component: () => import('@/views/platform/TeachingView.vue'),
       meta: { title: 'platform-teaching', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
-    },
-    {
-      path: '/platform/admin/teaching',
-      name: 'platform-admin-teaching',
-      component: () => import('@/views/platform/AdminTeachingView.vue'),
-      meta: { title: 'platform-admin-teaching', requiresAuth: true, requiresActive: true, roles: ['admin'] },
     },
     {
       path: '/platform/my-content',
@@ -317,18 +343,6 @@ const router = createRouter({
       name: 'platform-attempt',
       component: () => import('@/views/platform/AttemptView.vue'),
       meta: { title: 'platform-attempt', requiresAuth: true, requiresActive: true },
-    },
-    {
-      path: '/platform/admin/reports',
-      name: 'platform-admin-reports',
-      component: () => import('@/views/platform/AdminReportsView.vue'),
-      meta: { title: 'platform-admin-reports', requiresAuth: true, requiresActive: true, roles: ['admin'] },
-    },
-    {
-      path: '/platform/admin/audit',
-      name: 'platform-admin-audit',
-      component: () => import('@/views/platform/AdminAuditView.vue'),
-      meta: { title: 'platform-admin-audit', requiresAuth: true, requiresActive: true, roles: ['admin'] },
     },
     {
       path: '/platform/search',

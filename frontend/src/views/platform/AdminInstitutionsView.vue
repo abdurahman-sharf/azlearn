@@ -67,7 +67,6 @@ onMounted(load)
 
 <template>
   <div class="max-w-3xl mx-auto pb-8">
-    <router-link to="/platform" class="text-body-sm underline">{{ pt('back') }}</router-link>
     <h1 class="text-display-sm font-bold tracking-tight my-3">{{ pt('adminInstitutions') }}</h1>
 
     <div class="flex gap-2 mb-4">

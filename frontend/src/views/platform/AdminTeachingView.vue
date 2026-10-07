@@ -28,7 +28,6 @@ onMounted(load)
 
 <template>
   <div class="max-w-3xl mx-auto pb-8">
-    <router-link to="/platform" class="text-body-sm underline">{{ pt('back') }}</router-link>
     <h1 class="text-display-sm font-bold tracking-tight my-3">{{ pt('adminTeaching') }}</h1>
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
     <p v-if="!items.length" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))">{{ pt('noRequests') }}</p>
