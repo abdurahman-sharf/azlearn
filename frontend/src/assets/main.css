@@ -112,6 +112,108 @@
     --md-elevation-3: 0 4px 8px 3px rgba(0 0 0 / 0.3), 0 1px 3px 0 rgba(0 0 0 / 0.15);
   }
 
+  /* ===== azlearn brand palette (web/Docker builds: <html data-brand="azlearn">) =====
+     Placed BEFORE the accent presets so a user's personal accent (Settings) still wins.
+     Palette values are used verbatim except where WCAG AA text contrast would fail (noted inline). */
+  [data-brand="azlearn"] {
+    --md-source: 37 99 235;
+
+    /* Neutrals: Background #F8FAFC, Surface #FFFFFF, Border #E2E8F0 */
+    --md-surface:                   248 250 252;
+    --md-surface-container-lowest:  255 255 255;
+    --md-surface-container-low:     255 255 255;
+    --md-surface-container:         248 250 252;
+    --md-surface-container-high:    248 250 252;
+    --md-surface-container-highest: 255 255 255;
+
+    --md-on-surface:          15 23 42;     /* Text Primary #0F172A */
+    --md-on-surface-variant:  100 116 139;  /* Text Secondary #64748B (4.6:1 on #F8FAFC) */
+    --md-on-surface-muted:    100 116 139;
+
+    /* Primary Blue #2563EB, Deep Blue #1E3A8A */
+    --md-primary:              37 99 235;
+    --md-on-primary:           255 255 255;
+    --md-primary-container:    219 234 254;
+    --md-on-primary-container: 30 58 138;
+
+    /* Secondary surfaces stay blue-tinted (active navigation = primary blue); Teal lives in --azl-teal*. */
+    --md-secondary:              37 99 235;
+    --md-on-secondary:           255 255 255;
+    --md-secondary-container:    219 234 254;
+    --md-on-secondary-container: 30 58 138;
+
+    /* Tertiary = Teal. #14B8A6 cannot carry white text (2.5:1), so solid use pairs it with dark text. */
+    --md-tertiary:              15 118 110;  /* teal-700 for text/icons on white (5.5:1) */
+    --md-on-tertiary:           255 255 255;
+    --md-tertiary-container:    204 251 241;
+    --md-on-tertiary-container: 19 78 74;
+
+    /* Danger: #EF4444 gives only 3.8:1 with white; #DC2626 (4.8:1) is used for text and filled buttons. */
+    --md-error:              220 38 38;
+    --md-on-error:           255 255 255;
+    --md-error-container:    254 226 226;
+    --md-on-error-container: 127 29 29;
+
+    /* Border #E2E8F0 for dividers; input outlines need 3:1, so #64748B */
+    --md-outline:          100 116 139;
+    --md-outline-variant:  226 232 240;
+
+    /* Raw palette + readable text variants for later phases (success, warning, info, gamification). */
+    --azl-primary: 37 99 235;   --azl-deep-blue: 30 58 138;
+    --azl-teal: 20 184 166;     --azl-teal-text: 15 118 110;  --azl-on-teal: 15 23 42;
+    --azl-amber: 245 158 11;    --azl-amber-text: 180 83 9;   --azl-on-amber: 15 23 42;
+    --azl-success: 34 197 94;   --azl-success-text: 21 128 61;
+    --azl-danger: 239 68 68;
+    --azl-warning: 245 158 11;
+    --azl-info: 14 165 233;     --azl-info-text: 3 105 161;
+  }
+
+  .dark[data-brand="azlearn"] {
+    /* Dark Background #0F172A, Dark Surface #1E293B, Text #F8FAFC, Muted #94A3B8 */
+    --md-surface:                   15 23 42;
+    --md-surface-container-lowest:  11 18 34;
+    --md-surface-container-low:     30 41 59;
+    --md-surface-container:         30 41 59;
+    --md-surface-container-high:    37 50 71;
+    --md-surface-container-highest: 30 41 59;
+
+    --md-on-surface:          248 250 252;
+    --md-on-surface-variant:  148 163 184;
+    --md-on-surface-muted:    148 163 184;
+
+    /* Primary Blue #3B82F6 (dark labels on it: 4.9:1; white would be 3.7:1) */
+    --md-primary:              59 130 246;
+    --md-on-primary:           15 23 42;
+    --md-primary-container:    30 58 138;
+    --md-on-primary-container: 219 234 254;
+
+    --md-secondary:              59 130 246;
+    --md-on-secondary:           15 23 42;
+    --md-secondary-container:    30 58 138;
+    --md-on-secondary-container: 219 234 254;
+
+    /* Teal #2DD4BF */
+    --md-tertiary:              45 212 191;
+    --md-on-tertiary:           15 23 42;
+    --md-tertiary-container:    19 78 74;
+    --md-on-tertiary-container: 204 251 241;
+
+    --md-error:              252 165 165;
+    --md-on-error:           127 29 29;
+    --md-error-container:    127 29 29;
+    --md-on-error-container: 254 226 226;
+
+    --md-outline:          100 116 139;
+    --md-outline-variant:  51 65 85;
+
+    --azl-teal: 45 212 191;   --azl-teal-text: 45 212 191;  --azl-on-teal: 15 23 42;
+    --azl-amber: 251 191 36;  --azl-amber-text: 251 191 36; --azl-on-amber: 15 23 42;
+    --azl-success: 74 222 128; --azl-success-text: 74 222 128;
+    --azl-danger: 248 113 113;
+    --azl-warning: 251 191 36;
+    --azl-info: 56 189 248;   --azl-info-text: 125 211 252;
+  }
+
   /* ===== Material You Accent Color Palettes ===== */
   [data-accent="green"] {
     --md-source: 46 125 79;
@@ -380,6 +482,24 @@
     border-radius: 28px;
     transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1), background-color 0.3s ease;
   }
+
+  /* azlearn: white cards sit on #F8FAFC, so they get the palette's Border colour */
+  [data-brand="azlearn"] .card-filled,
+  [data-brand="azlearn"] .card-elevated {
+    border: 1px solid rgb(var(--md-outline-variant));
+  }
+
+  /* Secondary call to action = Teal (dark label: 7.2:1 on #14B8A6) */
+  .btn-teal {
+    @apply relative inline-flex items-center justify-center gap-2 px-6 h-11
+           font-medium text-sm leading-none rounded-full select-none cursor-pointer;
+    background-color: rgb(var(--azl-teal, var(--md-secondary)));
+    color: rgb(var(--azl-on-teal, var(--md-on-secondary)));
+    transition: all 0.2s cubic-bezier(0.2, 0, 0, 1);
+  }
+  .btn-teal:hover { filter: brightness(0.95); }
+  .btn-teal:active { transform: scale(0.97); }
+  .btn-teal:focus-visible { outline: 2px solid rgb(var(--azl-teal, var(--md-secondary))); outline-offset: 2px; }
 
   /* Outlined Card */
   .card-outlined {

@@ -3,6 +3,10 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18nStore } from '@/stores/i18n'
 import { useTheme } from '@/composables/useTheme'
+import { platformEnabled } from '@/lib/platformApi'
+import { useBrandingStore } from '@/stores/branding'
+import { usePt } from '@/i18n/platform'
+import BrandMark from '@/components/platform/BrandMark.vue'
 import { isTauri, isMacOS, isWindows, isLinux } from '@/utils/platform'
 import TitleBar from './TitleBar.vue'
 import CookieBanner from './CookieBanner.vue'
@@ -23,6 +27,11 @@ const router = useRouter()
 const route = useRoute()
 const i18n = useI18nStore()
 const showLanguageDialog = ref(false)
+const brand = useBrandingStore()
+const pt = usePt()
+// On web/Docker the header carries the platform's own identity (name + logo) and links to the landing page.
+const homePath = platformEnabled ? '/' : '/practice'
+const headerName = computed(() => (platformEnabled ? brand.name ?? pt('defaultPlatformName') : i18n.t('appName')))
 
 const { theme, cycleTheme } = useTheme()
 const isDesktopTauri = isTauri() && (isWindows() || isMacOS() || isLinux())
@@ -103,14 +112,17 @@ const headerStyle = {
         <!-- Logo (browser / mobile only — desktop shows it in TitleBar) -->
         <router-link
           v-if="!isDesktopTauri"
-          to="/practice"
+          :to="homePath"
           class="flex items-center gap-3 shrink-0 no-underline group"
         >
-          <img src="/logo.png" alt="Exameow" class="w-[38px] h-[38px] rounded-xl shrink-0 transition-transform duration-300 group-hover:scale-105" />
-          <div class="hidden sm:block">
-            <div class="text-title-md leading-tight font-bold tracking-tight" style="color: rgb(var(--md-on-surface))">{{ i18n.t('appName') }}</div>
-            <div class="text-label-sm" style="color: rgb(var(--md-on-surface-variant))">{{ i18n.t('appSubtitle') }}</div>
-          </div>
+          <template v-if="platformEnabled"><BrandMark :size="38" data-testid="header-brand" /></template>
+          <template v-else>
+            <img src="/logo.png" alt="Exameow" class="w-[38px] h-[38px] rounded-xl object-contain shrink-0 transition-transform duration-300 group-hover:scale-105" data-testid="header-logo" />
+            <div class="hidden sm:block">
+              <div class="text-title-md leading-tight font-bold tracking-tight" style="color: rgb(var(--md-on-surface))" data-testid="header-name">{{ headerName }}</div>
+              <div class="text-label-sm" style="color: rgb(var(--md-on-surface-variant))">{{ i18n.t('appSubtitle') }}</div>
+            </div>
+          </template>
         </router-link>
 
         <!-- Desktop Nav — Pixel Segmented sliding pill navigation -->

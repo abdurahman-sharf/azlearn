@@ -3,10 +3,15 @@ import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorKey } from '@/i18n/platform'
+import { onMounted } from 'vue'
+import { useBrandingStore } from '@/stores/branding'
+import BrandMark from '@/components/platform/BrandMark.vue'
+import LegalLinks from '@/components/platform/LegalLinks.vue'
 import { PlatformError } from '@/lib/platformApi'
 
 const pt = usePt()
 const auth = useAuthStore()
+onMounted(() => useBrandingStore().load())
 const router = useRouter()
 const route = useRoute()
 
@@ -34,6 +39,7 @@ async function submit() {
 
 <template>
   <div class="max-w-md mx-auto pb-8">
+    <div class="flex justify-center mb-4"><router-link to="/"><BrandMark :size="40" /></router-link></div>
     <h1 class="text-display-sm font-bold tracking-tight mb-6">{{ pt('login') }}</h1>
     <form class="card-elevated p-6 space-y-4" @submit.prevent="submit">
       <label class="block">
@@ -51,5 +57,6 @@ async function submit() {
         <router-link to="/auth/register" class="font-semibold underline">{{ pt('register') }}</router-link>
       </p>
     </form>
+    <div class="mt-5"><LegalLinks /></div>
   </div>
 </template>

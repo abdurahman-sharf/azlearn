@@ -241,11 +241,16 @@ pub struct RegisterReq {
     pub full_name: String,
     pub role: String,
     pub institution_type: Option<String>,
+    /// Must be `true`: acceptance of the terms/privacy policy (recorded with a timestamp).
+    pub consent: Option<bool>,
 }
 
 /// Validates the request and inserts the user. The role is whitelisted here:
 /// anything other than `teacher` becomes `student`; teachers start `pending`.
 fn insert_user(conn: &Connection, req: &RegisterReq, password_hash: &str) -> Result<User, Err> {
+    if req.consent != Some(true) {
+        return Err(err(StatusCode::BAD_REQUEST, "consent_required"));
+    }
     let email = normalize_email(&req.email).ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid_email"))?;
     let full_name = req.full_name.trim();
     if full_name.is_empty() || full_name.chars().count() > 120 {
@@ -258,8 +263,8 @@ fn insert_user(conn: &Connection, req: &RegisterReq, password_hash: &str) -> Res
     let (role, status) = if req.role == "teacher" { ("teacher", "pending") } else { ("student", "active") };
     let id = new_id();
     conn.execute(
-        "INSERT INTO users(id, email, password_hash, full_name, role, institution_type, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO users(id, email, password_hash, full_name, role, institution_type, status, created_at, consented_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
         params![id, email, password_hash, full_name, role, inst, status, now_ms()],
     )
     .map_err(|e| match e {
@@ -518,6 +523,7 @@ mod tests {
             full_name: "Test".into(),
             role: role.into(),
             institution_type: Some("university".into()),
+            consent: Some(true),
         }
     }
 
@@ -528,6 +534,22 @@ mod tests {
         assert_eq!((admin_attempt.role.as_str(), admin_attempt.status.as_str()), ("student", "active"));
         let teacher = insert_user(&conn, &req("t@x.com", "teacher"), "h").unwrap();
         assert_eq!((teacher.role.as_str(), teacher.status.as_str()), ("teacher", "pending"));
+    }
+
+    #[test]
+    fn registration_requires_recorded_consent() {
+        let conn = db();
+        for consent in [None, Some(false)] {
+            let mut r = req("c@x.com", "student");
+            r.consent = consent;
+            assert_eq!(insert_user(&conn, &r, "h").unwrap_err().1.contains("consent_required"), true, "{consent:?}");
+        }
+        let n: i64 = conn.query_row("SELECT count(*) FROM users", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "no account is created without consent");
+        let before = now_ms();
+        insert_user(&conn, &req("c@x.com", "student"), "h").unwrap();
+        let at: i64 = conn.query_row("SELECT consented_at FROM users WHERE email = 'c@x.com'", [], |r| r.get(0)).unwrap();
+        assert!(at >= before && at <= now_ms(), "consent timestamp recorded");
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod platform_content;
 mod platform_engage;
 mod platform_exams;
 mod platform_ops;
+mod platform_public;
 mod platform_settings;
 mod platform_learning;
 mod relay;
@@ -196,6 +197,15 @@ async fn main() {
         .route("/api/platform/search", get(platform_ops::search_handler))
         .route("/api/platform/me/password", post(platform_ops::change_password_handler))
         .route("/api/platform/me", delete(platform_ops::delete_account_handler))
+        .route("/api/platform/public/config", get(platform_public::public_config_handler))
+        .route("/api/platform/public/logo", get(platform_public::logo_handler))
+        .route("/api/platform/public/legal/{slug}", get(platform_public::legal_get_handler))
+        .route("/api/platform/admin/branding", axum::routing::put(platform_public::set_branding_handler))
+        .route(
+            "/api/platform/admin/branding/logo",
+            post(platform_public::upload_logo_handler).delete(platform_public::delete_logo_handler).layer(platform_public::logo_upload_limit()),
+        )
+        .route("/api/platform/admin/legal/{slug}", axum::routing::put(platform_public::legal_put_handler))
         .fallback_service(ServeDir::new(&static_dir))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         // Baseline hardening that cannot break the SPA (no CSP: the app loads wasm/workers/fonts).

@@ -1362,9 +1362,12 @@ mod migration_tests {
         let pending: String = one(&c, "SELECT id FROM attempts WHERE pending = 1");
         let g = grade_attempt(&c, &teacher, &pending, &GradeReq { grades: [("q5".to_string(), 2.0)].into() }).unwrap();
         assert_eq!((g.score, g.pending), (2.0, 0));
-        let resumed = start_attempt(&c, &s1, &published, now_ms()).unwrap();
+        // "now" is anchored to the fixture's own clock (the dump was taken at a fixed moment), so the
+        // exam's time limit does not expire the in-progress attempt as real time passes.
+        let at: i64 = c.query_row("SELECT started_at FROM attempts WHERE status = 'in_progress'", [], |r| r.get(0)).unwrap();
+        let resumed = start_attempt(&c, &s1, &published, at + 1000).unwrap();
         assert!(resumed.resumed, "the in-progress attempt from before the upgrade is resumed");
-        assert!(start_attempt(&c, &s2, &published, now_ms()).is_ok());
+        assert!(start_attempt(&c, &s2, &published, at + 1000).is_ok());
         // creating new exams records the creator
         let subject: String = one(&c, "SELECT subject_id FROM assessments LIMIT 1");
         let new = create_assessment(&c, &teacher, &AssessmentReq {

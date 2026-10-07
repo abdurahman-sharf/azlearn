@@ -6,8 +6,17 @@ const router = createRouter({
   history: createWebHashHistory(),
   routes: [
     {
+      // Landing page on web/Docker (platform enabled); other builds keep opening on practice (see guard).
       path: '/',
-      redirect: '/practice',
+      name: 'home',
+      component: () => import('@/views/platform/LandingView.vue'),
+      meta: { title: 'Home' },
+    },
+    {
+      path: '/legal/:slug(privacy|terms)',
+      name: 'legal',
+      component: () => import('@/views/platform/LegalView.vue'),
+      meta: { title: 'Legal' },
     },
     {
       path: '/practice',
@@ -345,6 +354,13 @@ const router = createRouter({
 // Platform accounts are optional: only routes that opt in via meta are guarded,
 // so every existing (public) feature keeps working without an account.
 router.beforeEach(async (to) => {
+  if (to.name === 'home') {
+    if (!platformEnabled) return '/practice'
+    const auth = useAuthStore()
+    await auth.init()
+    return auth.isLoggedIn ? '/platform' : true
+  }
+  if (to.name === 'legal' && !platformEnabled) return '/practice'
   const needsAuth = to.meta.requiresAuth || to.meta.guestOnly
   if (!needsAuth) return true
   if (!platformEnabled) return '/mine'
