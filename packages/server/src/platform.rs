@@ -27,6 +27,9 @@ pub struct PlatformState {
     pub conn: Mutex<Connection>,
     /// Directory for uploaded attachments (`PLATFORM_FILES_DIR`).
     pub files_dir: std::path::PathBuf,
+    /// Encrypts secrets stored in the `settings` table (AI key, SMTP password); read from phase 1-3.
+    #[allow(dead_code)]
+    pub crypto: crate::platform_settings::Crypto,
 }
 
 const SCHEMA: &str = "
@@ -100,34 +103,40 @@ CREATE TABLE IF NOT EXISTS audit_log (
 /// Applies the core schema plus every feature module's schema (all idempotent).
 pub fn apply_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-    for extra in [crate::platform_learning::SCHEMA, crate::platform_content::SCHEMA, crate::platform_engage::SCHEMA, crate::platform_exams::SCHEMA, crate::platform_ops::SCHEMA] {
+    for extra in [crate::platform_learning::SCHEMA, crate::platform_content::SCHEMA, crate::platform_engage::SCHEMA, crate::platform_exams::SCHEMA, crate::platform_ops::SCHEMA, crate::platform_settings::SCHEMA] {
         conn.execute_batch(extra).map_err(|e| e.to_string())?;
     }
+    crate::platform_exams::migrate(conn)?;
     // Columns added after the first release.
     add_column_if_missing(conn, "users", "bio", "TEXT")?;
+    add_column_if_missing(conn, "users", "consented_at", "INTEGER")?;
     Ok(())
 }
 
-fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<(), String> {
-    let exists: bool = conn
+pub fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    Ok(conn
         .prepare(&format!("PRAGMA table_info({table})"))
         .and_then(|mut s| s.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>())
         .map_err(|e| e.to_string())?
         .iter()
-        .any(|c| c == column);
-    if !exists {
+        .any(|c| c == column))
+}
+
+pub fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<(), String> {
+    if !column_exists(conn, table, column)? {
         conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])
             .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
-pub fn init_db(path: &str, files_dir: &str) -> Result<PlatformState, String> {
+pub fn init_db(path: &str, files_dir: &str, key_file: &str) -> Result<PlatformState, String> {
     std::fs::create_dir_all(files_dir).map_err(|e| format!("cannot create {files_dir}: {e}"))?;
+    let crypto = crate::platform_settings::Crypto::from_key_file(std::path::Path::new(key_file))?;
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
     apply_schema(&conn)?;
-    Ok(PlatformState { conn: Mutex::new(conn), files_dir: files_dir.into() })
+    Ok(PlatformState { conn: Mutex::new(conn), files_dir: files_dir.into(), crypto })
 }
 
 pub fn cleanup_expired(state: &PlatformState) {
@@ -562,9 +571,9 @@ mod tests {
 
     #[test]
     fn bootstrap_creates_admin_once() {
-        let state = PlatformState { conn: Mutex::new(db()), files_dir: std::env::temp_dir() };
+        let state = PlatformState { conn: Mutex::new(db()), files_dir: std::env::temp_dir(), crypto: crate::platform_settings::Crypto::for_tests() };
         assert!(bootstrap_admin(&state, "Root@x.com", "password123").unwrap());
         assert!(!bootstrap_admin(&state, "other@x.com", "password123").unwrap());
-        assert!(bootstrap_admin(&PlatformState { conn: Mutex::new(db()), files_dir: std::env::temp_dir() }, "r@x.com", "short").is_err());
+        assert!(bootstrap_admin(&PlatformState { conn: Mutex::new(db()), files_dir: std::env::temp_dir(), crypto: crate::platform_settings::Crypto::for_tests() }, "r@x.com", "short").is_err());
     }
 }

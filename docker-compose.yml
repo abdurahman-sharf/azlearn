@@ -15,6 +15,7 @@ services:
       - ADMIN_TOKEN_FILE=/app/data/admin_token.txt
       - PLATFORM_DB_PATH=/app/data/exameow-platform.db
       - PLATFORM_FILES_DIR=/app/data/platform-files
+      - PLATFORM_KEY_FILE=/app/data/platform.key
       - PLATFORM_ADMIN_EMAIL=${PLATFORM_ADMIN_EMAIL:-}
       - PLATFORM_ADMIN_PASSWORD=${PLATFORM_ADMIN_PASSWORD:-}
     volumes:

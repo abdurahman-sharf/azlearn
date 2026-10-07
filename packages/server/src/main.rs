@@ -4,6 +4,7 @@ mod platform_content;
 mod platform_engage;
 mod platform_exams;
 mod platform_ops;
+mod platform_settings;
 mod platform_learning;
 mod relay;
 mod routes;
@@ -32,7 +33,16 @@ async fn main() {
         std::env::var("PLATFORM_DB_PATH").unwrap_or_else(|_| "./exameow-platform.db".to_string());
     let platform_files_dir =
         std::env::var("PLATFORM_FILES_DIR").unwrap_or_else(|_| "./platform-files".to_string());
-    let platform = platform::init_db(&platform_db_path, &platform_files_dir)
+    // Master key for encrypted settings: next to the DB unless PLATFORM_KEY_FILE says otherwise.
+    let platform_key_file = std::env::var("PLATFORM_KEY_FILE").unwrap_or_else(|_| {
+        std::path::Path::new(&platform_db_path)
+            .parent()
+            .map(|d| d.join("platform.key"))
+            .unwrap_or_else(|| "platform.key".into())
+            .to_string_lossy()
+            .into_owned()
+    });
+    let platform = platform::init_db(&platform_db_path, &platform_files_dir, &platform_key_file)
         .unwrap_or_else(|e| panic!("failed to init platform db at {platform_db_path}: {e}"));
     let non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     match (non_empty("PLATFORM_ADMIN_EMAIL"), non_empty("PLATFORM_ADMIN_PASSWORD")) {

@@ -1449,8 +1449,10 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
+ "base64 0.22.1",
  "exameow-core",
  "rand 0.8.7",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

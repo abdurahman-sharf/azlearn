@@ -17,3 +17,5 @@ uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 argon2 = "0.5"
 url = "2"
+ring = "0.17"
+base64 = "0.22"

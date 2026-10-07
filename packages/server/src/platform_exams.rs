@@ -20,9 +20,35 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS assessments (
+CREATE TABLE IF NOT EXISTS attempts (
   id TEXT PRIMARY KEY,
-  teacher_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  assessment_id TEXT NOT NULL REFERENCES assessments(id) ON DELETE CASCADE,
+  student_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  started_at INTEGER NOT NULL,
+  submitted_at INTEGER,
+  status TEXT NOT NULL CHECK (status IN ('in_progress','submitted','expired')),
+  answers TEXT NOT NULL DEFAULT '{}',
+  results TEXT NOT NULL DEFAULT '[]',
+  score REAL NOT NULL DEFAULT 0,
+  pending INTEGER NOT NULL DEFAULT 0,
+  saved_at INTEGER,
+  tab_leaves INTEGER NOT NULL DEFAULT 0,
+  order_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_assess ON attempts(assessment_id, student_id);
+CREATE INDEX IF NOT EXISTS idx_attempts_student ON attempts(student_id, started_at);
+";
+
+
+/// Final `assessments` definition (phase 1-0). `teacher_id` is nullable (admin-created exams, phase 1-5),
+/// `created_by` records the creator, and `status` gained the `closed`/`archived` lifecycle states.
+/// SQLite cannot alter NOT NULL or CHECK constraints in place, so older databases are rebuilt (see `rebuild`).
+fn assessments_ddl(table: &str) -> String {
+    format!(
+        "CREATE TABLE {table} (
+  id TEXT PRIMARY KEY,
+  teacher_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
   subject_id TEXT NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
   title TEXT NOT NULL,
   description TEXT,
@@ -34,26 +60,68 @@ CREATE TABLE IF NOT EXISTS assessments (
   closes_at INTEGER,
   max_attempts INTEGER NOT NULL DEFAULT 1,
   show_answers INTEGER NOT NULL DEFAULT 1,
-  status TEXT NOT NULL CHECK (status IN ('draft','published')),
+  shuffle_questions INTEGER NOT NULL DEFAULT 0,
+  shuffle_options INTEGER NOT NULL DEFAULT 0,
+  pass_mark REAL,
+  release_mode TEXT NOT NULL DEFAULT 'immediate' CHECK (release_mode IN ('immediate','after_close')),
+  status TEXT NOT NULL CHECK (status IN ('draft','published','closed','archived')),
+  closed_at INTEGER,
+  archived_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_assess_subject ON assessments(subject_id, status);
-CREATE TABLE IF NOT EXISTS attempts (
-  id TEXT PRIMARY KEY,
-  assessment_id TEXT NOT NULL REFERENCES assessments(id) ON DELETE CASCADE,
-  student_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  started_at INTEGER NOT NULL,
-  submitted_at INTEGER,
-  status TEXT NOT NULL CHECK (status IN ('in_progress','submitted','expired')),
-  answers TEXT NOT NULL DEFAULT '{}',
-  results TEXT NOT NULL DEFAULT '[]',
-  score REAL NOT NULL DEFAULT 0,
-  pending INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_attempts_assess ON attempts(assessment_id, student_id);
-CREATE INDEX IF NOT EXISTS idx_attempts_student ON attempts(student_id, started_at);
-";
+)"
+    )
+}
+
+/// Columns shared by the old and new tables, copied verbatim on rebuild.
+const CARRIED_COLUMNS: &str = "id, teacher_id, subject_id, title, description, questions, question_count, total_points, \
+     duration_min, opens_at, closes_at, max_attempts, show_answers, status, created_at, updated_at";
+
+/// Rebuilds `assessments` atomically: new table -> copy -> drop old -> rename.
+/// Foreign keys are switched off for the swap (otherwise DROP would cascade-delete every attempt) and
+/// verified with `foreign_key_check` before commit; any failure rolls everything back untouched.
+fn rebuild(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;").map_err(|e| e.to_string())?;
+    let result = (|| -> Result<(), String> {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let e = |x: rusqlite::Error| x.to_string();
+        tx.execute_batch("DROP TABLE IF EXISTS assessments_new;").map_err(e)?;
+        tx.execute_batch(&assessments_ddl("assessments_new")).map_err(e)?;
+        tx.execute_batch(&format!(
+            "INSERT INTO assessments_new ({CARRIED_COLUMNS}, created_by)
+             SELECT {CARRIED_COLUMNS}, teacher_id FROM assessments;
+             DROP TABLE assessments;
+             ALTER TABLE assessments_new RENAME TO assessments;"
+        ))
+        .map_err(e)?;
+        let violations: i64 = tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).map_err(e)?;
+        if violations > 0 {
+            return Err(format!("assessments migration aborted: {violations} foreign key violation(s)"));
+        }
+        tx.commit().map_err(e)
+    })();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").map_err(|e| e.to_string())?;
+    result
+}
+
+/// Creates or upgrades the exam tables. Idempotent: safe to run on every start.
+pub fn migrate(conn: &Connection) -> Result<(), String> {
+    let exists: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'assessments')", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        conn.execute_batch(&assessments_ddl("assessments")).map_err(|e| e.to_string())?;
+    } else if !crate::platform::column_exists(conn, "assessments", "created_by")? {
+        rebuild(conn)?;
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_assess_subject ON assessments(subject_id, status);")
+        .map_err(|e| e.to_string())?;
+    // Older `attempts` tables predate autosave / integrity tracking.
+    crate::platform::add_column_if_missing(conn, "attempts", "saved_at", "INTEGER")?;
+    crate::platform::add_column_if_missing(conn, "attempts", "tab_leaves", "INTEGER NOT NULL DEFAULT 0")?;
+    crate::platform::add_column_if_missing(conn, "attempts", "order_json", "TEXT")?;
+    Ok(())
+}
 
 const MAX_QUESTIONS: usize = 200;
 const GRACE_MS: i64 = 60_000;
@@ -324,9 +392,9 @@ fn create_assessment(conn: &Connection, teacher: &User, r: &AssessmentReq) -> Re
     let id = new_id();
     let now = now_ms();
     conn.execute(
-        "INSERT INTO assessments(id, teacher_id, subject_id, title, description, questions, question_count, total_points, duration_min,
+        "INSERT INTO assessments(id, teacher_id, created_by, subject_id, title, description, questions, question_count, total_points, duration_min,
            opens_at, closes_at, max_attempts, show_answers, status, created_at, updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
+         VALUES (?1,?2,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
         params![
             id, teacher.id, subject_id, title, description, serde_json::to_string(questions).map_err(db_err)?,
             questions.len() as i64, total, r.duration_min, r.opens_at, r.closes_at, max_attempts, r.show_answers.unwrap_or(true), status, now
@@ -1108,5 +1176,237 @@ mod tests {
         delete_assessment(&w.conn, &w.teacher, &w.id).unwrap();
         let n: i64 = w.conn.query_row("SELECT count(*) FROM attempts", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+    }
+}
+
+/// Phase 1-0: upgrading a database produced by the previous server version must never lose data.
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::platform::{apply_schema, create_test_db};
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/platform_v1.sql");
+
+    /// The database exactly as the pre-1-0 server wrote it (loaded with FKs off, like a file on disk).
+    fn old_db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        c.execute_batch(FIXTURE).unwrap();
+        c
+    }
+
+    fn tables(c: &Connection) -> Vec<String> {
+        c.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn counts(c: &Connection) -> Vec<(String, i64)> {
+        tables(c).into_iter().map(|t| { let n = c.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0)).unwrap(); (t, n) }).collect()
+    }
+
+    /// (name, type, notnull, default) per column, order-independent.
+    fn columns(c: &Connection, table: &str) -> Vec<(String, String, i64, Option<String>)> {
+        let mut v: Vec<_> = c
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |r| Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        v.sort();
+        v
+    }
+
+    fn one<T: rusqlite::types::FromSql>(c: &Connection, sql: &str) -> T {
+        c.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn fixture_really_is_the_old_schema() {
+        let c = old_db();
+        assert!(!crate::platform::column_exists(&c, "assessments", "created_by").unwrap());
+        assert!(!crate::platform::column_exists(&c, "attempts", "tab_leaves").unwrap());
+        assert!(!crate::platform::column_exists(&c, "users", "consented_at").unwrap());
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM assessments"), 2);
+    }
+
+    #[test]
+    fn upgrade_preserves_every_row_and_value() {
+        let c = old_db();
+        let before = counts(&c);
+        let assess_before: Vec<(String, String, f64, String)> = c
+            .prepare("SELECT id, title, total_points, status FROM assessments ORDER BY id").unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().collect::<Result<_, _>>().unwrap();
+        let attempts_before: Vec<(String, String, f64, i64, String, String)> = c
+            .prepare("SELECT id, status, score, pending, answers, results FROM attempts ORDER BY id").unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).unwrap().collect::<Result<_, _>>().unwrap();
+        let questions_before: Vec<String> = c.prepare("SELECT questions FROM assessments ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+
+        apply_schema(&c).unwrap();
+
+        assert_eq!(counts(&c).into_iter().filter(|(t, _)| before.iter().any(|(b, _)| b == t)).collect::<Vec<_>>(), before, "row counts unchanged for every pre-existing table");
+        let assess_after: Vec<(String, String, f64, String)> = c
+            .prepare("SELECT id, title, total_points, status FROM assessments ORDER BY id").unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(assess_after, assess_before);
+        let attempts_after: Vec<(String, String, f64, i64, String, String)> = c
+            .prepare("SELECT id, status, score, pending, answers, results FROM attempts ORDER BY id").unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(attempts_after, attempts_before, "answers/results/scores byte-identical");
+        let questions_after: Vec<String> = c.prepare("SELECT questions FROM assessments ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(questions_after, questions_before, "question JSON untouched");
+        assert!(attempts_after.iter().any(|a| a.2 == 8.0), "the graded attempt (8.0) survived");
+    }
+
+    #[test]
+    fn upgrade_sets_safe_defaults_and_keeps_integrity() {
+        let c = old_db();
+        apply_schema(&c).unwrap();
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM assessments WHERE created_by IS NOT teacher_id"), 0, "creator = old owner");
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM assessments WHERE shuffle_questions <> 0 OR shuffle_options <> 0 OR pass_mark IS NOT NULL OR closed_at IS NOT NULL OR archived_at IS NOT NULL OR release_mode <> 'immediate'"), 0, "behaviour unchanged by default");
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM attempts WHERE tab_leaves <> 0 OR saved_at IS NOT NULL OR order_json IS NOT NULL"), 0);
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM users WHERE consented_at IS NOT NULL"), 0);
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM pragma_foreign_key_check"), 0, "no dangling references");
+        assert_eq!(one::<String>(&c, "PRAGMA integrity_check"), "ok");
+        assert_eq!(one::<i64>(&c, "PRAGMA foreign_keys"), 1, "foreign keys are back ON after the swap");
+        assert!(tables(&c).contains(&"settings".to_string()));
+        assert!(!tables(&c).contains(&"assessments_new".to_string()), "no leftover temp table");
+    }
+
+    #[test]
+    fn upgrade_is_idempotent() {
+        let c = old_db();
+        apply_schema(&c).unwrap();
+        let snapshot = |c: &Connection| -> (Vec<(String, i64)>, String) {
+            (counts(c), one::<String>(c, "SELECT group_concat(id || title || status || created_by, '|') FROM (SELECT * FROM assessments ORDER BY id)"))
+        };
+        let first = snapshot(&c);
+        apply_schema(&c).unwrap();
+        apply_schema(&c).unwrap();
+        assert_eq!(snapshot(&c), first);
+    }
+
+    #[test]
+    fn upgraded_schema_equals_a_fresh_install() {
+        let migrated = old_db();
+        apply_schema(&migrated).unwrap();
+        let fresh = create_test_db();
+        assert_eq!(tables(&migrated), tables(&fresh), "same set of tables");
+        for t in tables(&fresh) {
+            assert_eq!(columns(&migrated, &t), columns(&fresh, &t), "column definitions differ for `{t}`");
+        }
+    }
+
+    #[test]
+    fn constraints_survive_the_rebuild() {
+        let c = old_db();
+        apply_schema(&c).unwrap();
+        // new lifecycle states are allowed, junk is not
+        let id: String = one(&c, "SELECT assessment_id FROM attempts GROUP BY assessment_id ORDER BY count(*) DESC LIMIT 1");
+        for ok in ["closed", "archived", "draft", "published"] {
+            c.execute("UPDATE assessments SET status = ?1 WHERE id = ?2", params![ok, id]).unwrap();
+        }
+        assert!(c.execute("UPDATE assessments SET status = 'bogus' WHERE id = ?1", params![id]).is_err());
+        assert!(c.execute("UPDATE assessments SET release_mode = 'sometimes' WHERE id = ?1", params![id]).is_err());
+        // FK cascades still work: deleting an assessment removes its attempts
+        let attempts_of: i64 = c.query_row("SELECT count(*) FROM attempts WHERE assessment_id = ?1", params![id], |r| r.get(0)).unwrap();
+        assert!(attempts_of > 0);
+        c.execute("DELETE FROM assessments WHERE id = ?1", params![id]).unwrap();
+        assert_eq!(c.query_row::<i64, _, _>("SELECT count(*) FROM attempts WHERE assessment_id = ?1", params![id], |r| r.get(0)).unwrap(), 0);
+        // legacy owner semantics: deleting the teacher still removes their exams
+        let teacher: String = one(&c, "SELECT teacher_id FROM assessments LIMIT 1");
+        c.execute("DELETE FROM users WHERE id = ?1", params![teacher]).unwrap();
+        assert_eq!(c.query_row::<i64, _, _>("SELECT count(*) FROM assessments WHERE teacher_id = ?1", params![teacher], |r| r.get(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn admin_created_exams_have_no_teacher_and_survive_their_creator() {
+        let c = old_db();
+        apply_schema(&c).unwrap();
+        let admin: String = one(&c, "SELECT id FROM users WHERE role = 'admin' LIMIT 1");
+        let subject: String = one(&c, "SELECT id FROM subjects LIMIT 1");
+        c.execute(
+            "INSERT INTO assessments(id, teacher_id, created_by, subject_id, title, questions, question_count, total_points, status, created_at, updated_at)
+             VALUES ('admin-exam', NULL, ?1, ?2, 'امتحان المدير', '[]', 0, 0, 'draft', 1, 1)",
+            params![admin, subject],
+        )
+        .unwrap();
+        c.execute("DELETE FROM users WHERE id = ?1", params![admin]).unwrap();
+        let (teacher, creator): (Option<String>, Option<String>) =
+            c.query_row("SELECT teacher_id, created_by FROM assessments WHERE id = 'admin-exam'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((teacher, creator), (None, None), "exam survives, creator reference cleared");
+    }
+
+    #[test]
+    fn existing_features_work_on_the_upgraded_database() {
+        let c = old_db();
+        apply_schema(&c).unwrap();
+        let user = |email: &str| -> User {
+            c.query_row(&format!("SELECT {} FROM users WHERE email = ?1", crate::platform::USER_COLS), params![email], crate::platform::row_to_user).unwrap()
+        };
+        let (teacher, s1, s2) = (user("t1@x.com"), user("s1@x.com"), user("s2@x.com"));
+        let published: String = one(&c, "SELECT id FROM assessments WHERE status = 'published'");
+        // teacher dashboard numbers come out as they did before the upgrade
+        let r = results_summary(&c, &teacher, &published).unwrap();
+        assert_eq!((r.submitted, r.highest), (2, 8.0));
+        // student review of the graded attempt still shows the graded items
+        let graded: String = one(&c, "SELECT id FROM attempts WHERE score = 8.0");
+        let view = attempt_result(&c, &s1, &graded).unwrap();
+        assert_eq!((view.score, view.total, view.pending), (8.0, 9.0, 0));
+        assert_eq!(view.items.as_ref().map(|i| i.len()), Some(5));
+        // the pending one is still gradable by the teacher, and a new attempt can start/resume
+        let pending: String = one(&c, "SELECT id FROM attempts WHERE pending = 1");
+        let g = grade_attempt(&c, &teacher, &pending, &GradeReq { grades: [("q5".to_string(), 2.0)].into() }).unwrap();
+        assert_eq!((g.score, g.pending), (2.0, 0));
+        let resumed = start_attempt(&c, &s1, &published, now_ms()).unwrap();
+        assert!(resumed.resumed, "the in-progress attempt from before the upgrade is resumed");
+        assert!(start_attempt(&c, &s2, &published, now_ms()).is_ok());
+        // creating new exams records the creator
+        let subject: String = one(&c, "SELECT subject_id FROM assessments LIMIT 1");
+        let new = create_assessment(&c, &teacher, &AssessmentReq {
+            subject_id: Some(subject), title: Some("جديد".into()), description: None,
+            questions: Some(vec![q("n1", QuestionType::FillBlank, "x", &[], None)]), duration_min: None, opens_at: None, closes_at: None,
+            max_attempts: None, show_answers: None, status: Some("draft".into()), clear_duration: None, clear_window: None,
+        })
+        .unwrap();
+        assert_eq!(c.query_row::<String, _, _>("SELECT created_by FROM assessments WHERE id = ?1", params![new.id], |r| r.get(0)).unwrap(), teacher.id);
+    }
+
+    fn q(id: &str, t: QuestionType, answer: &str, opts: &[&str], score: Option<f64>) -> Question {
+        Question { id: id.into(), qtype: t, stem: format!("سؤال {id}"), options: opts.iter().map(|s| s.to_string()).collect(), answer: answer.into(),
+                   analysis: String::new(), ai_analysis: None, score, subject: None, chapter: None, difficulty: None }
+    }
+
+    #[test]
+    fn a_failed_upgrade_rolls_back_completely() {
+        let c = old_db();
+        let before = counts(&c);
+        // a view squatting on the temp table name makes the swap fail midway
+        c.execute_batch("CREATE VIEW assessments_new AS SELECT 1;").unwrap();
+        let err = apply_schema(&c).unwrap_err();
+        assert!(!err.is_empty());
+        assert!(!crate::platform::column_exists(&c, "assessments", "created_by").unwrap(), "old table left exactly as it was");
+        assert_eq!(counts(&c).into_iter().filter(|(t, _)| before.iter().any(|(b, _)| b == t)).collect::<Vec<_>>(), before, "no rows lost");
+        assert_eq!(one::<i64>(&c, "PRAGMA foreign_keys"), 1, "foreign keys restored even on failure");
+        // fix the obstacle and the same database upgrades cleanly
+        c.execute_batch("DROP VIEW assessments_new;").unwrap();
+        apply_schema(&c).unwrap();
+        assert!(crate::platform::column_exists(&c, "assessments", "created_by").unwrap());
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM assessments"), 2);
+    }
+
+    #[test]
+    fn dangling_references_abort_the_upgrade_without_changes() {
+        let c = old_db();
+        c.execute("INSERT INTO attempts(id, assessment_id, student_id, started_at, status) VALUES ('orphan', 'no-such-exam', (SELECT id FROM users LIMIT 1), 1, 'in_progress')", []).unwrap();
+        let err = apply_schema(&c).unwrap_err();
+        assert!(err.contains("foreign key"), "{err}");
+        assert!(!crate::platform::column_exists(&c, "assessments", "created_by").unwrap());
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM assessments"), 2);
+        assert_eq!(one::<i64>(&c, "PRAGMA foreign_keys"), 1);
     }
 }
