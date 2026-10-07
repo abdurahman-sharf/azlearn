@@ -66,6 +66,21 @@ pub async fn get_models(
     Ok(Json(models))
 }
 
+/// Parses an uploaded study file to text (format chosen by extension, like the original handler).
+pub fn extract_text(file_name: &str, data: &[u8]) -> Result<String, String> {
+    let ext = file_name.rsplit_once('.').map(|(_, e)| e).unwrap_or("txt");
+    let mut temp_file = tempfile::Builder::new()
+        .suffix(&format!(".{ext}"))
+        .tempfile()
+        .map_err(|e| e.to_string())?;
+    temp_file.write_all(data).map_err(|e| e.to_string())?;
+    let (_, temp_path) = temp_file.keep().map_err(|e| e.to_string())?;
+    let temp_path_str = temp_path.to_string_lossy().to_string();
+    let parsed = parse_file(&temp_path_str).map_err(|e| format!("Parse error: {e}"));
+    let _ = std::fs::remove_file(&temp_path_str);
+    parsed
+}
+
 pub async fn generate_exam_handler(
     State(_state): State<Arc<AppState>>,
     mut multipart: Multipart,
@@ -141,26 +156,7 @@ pub async fn generate_exam_handler(
         _ => {
             let file_data =
                 file_data.ok_or((StatusCode::BAD_REQUEST, "No file uploaded".to_string()))?;
-
-            let ext = file_name.rsplit_once('.').map(|(_, e)| e).unwrap_or("txt");
-            let mut temp_file = tempfile::Builder::new()
-                .suffix(&format!(".{ext}"))
-                .tempfile()
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            temp_file
-                .write_all(&file_data)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-            let (_, temp_path) = temp_file
-                .keep()
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            let temp_path_str = temp_path.to_string_lossy().to_string();
-
-            let parsed = parse_file(&temp_path_str)
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Parse error: {e}")))?;
-
-            let _ = std::fs::remove_file(&temp_path_str);
-            parsed
+            extract_text(&file_name, &file_data).map_err(|e| (StatusCode::BAD_REQUEST, e))?
         }
     };
 

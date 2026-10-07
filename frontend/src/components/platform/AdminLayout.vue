@@ -23,6 +23,7 @@ const items = computed<Item[]>(() => [
   { to: '/platform/admin/institutions', label: 'adminInstitutions', testid: 'nav-institutions' },
   { to: '/platform/admin/reports', label: 'adminReports', badge: stats.value?.open_reports, testid: 'nav-reports' },
   { to: '/platform/admin/audit', label: 'adminAudit', testid: 'nav-audit' },
+  { to: '/platform/admin/settings', label: 'settingsTitle', testid: 'nav-settings' },
 ])
 const extra: { to: string; label: PlatformKey; testid: string }[] = [
   { to: '/platform/notifications', label: 'notifications', testid: 'nav-notifications' },

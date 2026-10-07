@@ -1,5 +1,6 @@
 mod platform;
 mod platform_admin;
+mod platform_ai;
 mod platform_content;
 mod platform_engage;
 mod platform_exams;
@@ -200,6 +201,10 @@ async fn main() {
         .route("/api/platform/public/config", get(platform_public::public_config_handler))
         .route("/api/platform/public/logo", get(platform_public::logo_handler))
         .route("/api/platform/public/legal/{slug}", get(platform_public::legal_get_handler))
+        .route("/api/platform/admin/settings", get(platform_ai::get_settings_handler).put(platform_ai::put_settings_handler))
+        .route("/api/platform/admin/settings/ai/test", post(platform_ai::test_handler))
+        .route("/api/platform/admin/ai/usage", get(platform_ai::usage_handler))
+        .route("/api/platform/admin/ai/generate", post(platform_ai::generate_handler).layer(platform_ai::upload_limit()))
         .route("/api/platform/admin/branding", axum::routing::put(platform_public::set_branding_handler))
         .route(
             "/api/platform/admin/branding/logo",
