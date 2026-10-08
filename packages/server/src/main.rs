@@ -1,3 +1,5 @@
+mod auth_gate;
+mod client_ip;
 mod platform;
 mod platform_admin;
 mod platform_ai;
@@ -15,6 +17,8 @@ mod platform_settings;
 mod platform_learning;
 mod relay;
 mod routes;
+mod security_headers;
+mod token_limit;
 
 use axum::{
     routing::{delete, get, post},
@@ -99,6 +103,13 @@ async fn main() {
             }
         });
     }
+
+    let proxy = client_ip::Proxy::from_env();
+    let sec = security_headers::Config::from_env();
+    println!("Content-Security-Policy: {:?}, HSTS: {}", sec.csp, sec.hsts);
+    let token_limiter = Arc::new(token_limit::TokenLimiter::from_env());
+    println!("Signed-in API budget: {} requests/minute per session (PLATFORM_TOKEN_RPM, 0 = off)", token_limiter.per_minute());
+    println!("Client address: trusted proxy hops = {}", proxy.describe());
 
     let static_dir =
         std::env::var("STATIC_DIR").unwrap_or_else(|_| "../frontend/dist".to_string());
@@ -251,12 +262,21 @@ async fn main() {
         )
         .route("/api/platform/admin/legal/{slug}", axum::routing::put(platform_public::legal_put_handler))
         .fallback_service(ServeDir::new(&static_dir))
+        // innermost on purpose: their 401/429 answers still pass through CORS and the security headers below, so
+        // cross-origin clients (Tauri/Cloudflare builds) can read them
+        .layer(axum::middleware::from_fn_with_state(token_limiter, token_limit::middleware))
+        // deny by default: no valid session, no platform API (except register/login/logout/public)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_gate::middleware))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
-        // Baseline hardening that cannot break the SPA (no CSP: the app loads wasm/workers/fonts).
+        // CSP / no-store API / permissions policy / optional HSTS (see security_headers.rs)
+        .layer(axum::middleware::from_fn_with_state(sec, security_headers::middleware))
+        // baseline headers
         .layer(SetResponseHeaderLayer::if_not_present(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")))
         .layer(SetResponseHeaderLayer::if_not_present(header::REFERRER_POLICY, HeaderValue::from_static("strict-origin-when-cross-origin")))
         .layer(SetResponseHeaderLayer::if_not_present(header::X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN")))
-        .with_state(state);
+        .with_state(state)
+        // outermost: decides the client address before any handler (or rate limit) looks at the request
+        .layer(axum::middleware::from_fn_with_state(proxy, client_ip::middleware));
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -267,5 +287,5 @@ async fn main() {
         .await
         .unwrap();
     println!("Exameow server running on http://0.0.0.0:{port}");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
 }

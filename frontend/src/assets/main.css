@@ -448,6 +448,15 @@
 
   .btn-text:hover { background-color: rgba(var(--md-primary) / var(--md-state-hover-alpha)); }
 
+  /* Dark azlearn: the brand blue (#3B82F6) is only 3.97:1 on the card colour (#1E293B), under the 4.5:1 AA minimum for
+     text. Text-only buttons use a lighter tint of whatever the primary is (5.5:1 on cards; it also follows a custom
+     brand colour or accent). Filled buttons keep the exact brand colour with their dark label (4.9:1). */
+  .dark[data-brand="azlearn"] .btn-text,
+  .dark[data-brand="azlearn"] .btn-outlined {
+    color: rgb(108 161 248);
+    color: color-mix(in srgb, rgb(var(--md-primary)) 75%, white);
+  }
+
   /* Icon Button */
   .btn-icon {
     @apply relative inline-flex items-center justify-center w-10 h-10
@@ -901,4 +910,37 @@
 }
 ::-webkit-scrollbar-thumb:hover {
   background: rgb(var(--md-outline-variant) / 0.8);
+}
+
+
+/* Accessibility: skip link (visible only while focused) and respect the OS "reduce motion" setting. */
+.skip-link {
+  position: absolute;
+  inset-inline-start: 0.5rem;
+  top: -4rem;
+  z-index: 100;
+  padding: 0.6rem 1rem;
+  border-radius: 9999px;
+  font-weight: 600;
+  background-color: rgb(var(--md-primary));
+  color: rgb(var(--md-on-primary));
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.3);
+}
+.skip-link:focus { top: 0.5rem; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Visible keyboard focus on every interactive element (WCAG 2.4.7, 1.4.11): a 2px ring in the primary colour.
+   !important beats component-level `outline-none`; mouse clicks never show it (:focus-visible). */
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible,
+summary:focus-visible, [role="button"]:focus-visible, [tabindex]:not([tabindex="-1"]):focus-visible {
+  outline: 2px solid rgb(var(--md-primary)) !important;
+  outline-offset: 2px;
 }

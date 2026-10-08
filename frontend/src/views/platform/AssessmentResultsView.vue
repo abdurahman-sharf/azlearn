@@ -155,7 +155,7 @@ const SORTS: { key: SortKey; label: PlatformKey }[] = [
         <select v-model="f.sort" class="input-outlined" :aria-label="pt('rsSortBy')" data-testid="tbl-sort" @change="refilter">
           <option v-for="s in SORTS" :key="s.key" :value="s.key">{{ pt(s.label) }}</option>
         </select>
-        <select v-model="f.dir" class="input-outlined" data-testid="tbl-dir" @change="refilter"><option value="desc">{{ pt('rsDesc') }}</option><option value="asc">{{ pt('rsAsc') }}</option></select>
+        <select v-model="f.dir" class="input-outlined" :aria-label="pt('rsSortDir')" data-testid="tbl-dir" @change="refilter"><option value="desc">{{ pt('rsDesc') }}</option><option value="asc">{{ pt('rsAsc') }}</option></select>
       </form>
       <p v-if="!loadingRows && !rows.length" class="text-body-md" style="color: rgb(var(--md-on-surface-variant))" data-testid="tbl-empty">{{ pt('rsNoAttempts') }}</p>
       <ul class="space-y-2">
@@ -173,7 +173,7 @@ const SORTS: { key: SortKey; label: PlatformKey }[] = [
           </router-link>
         </li>
       </ul>
-      <nav v-if="pages > 1" class="flex items-center justify-between gap-3" data-testid="tbl-pager">
+      <nav v-if="pages > 1" class="flex items-center justify-between gap-3" :aria-label="pt('pageLabel')" data-testid="tbl-pager">
         <button class="btn-outlined" :disabled="page === 0 || loadingRows" data-testid="tbl-prev" @click="go(-1)">{{ pt('prevPage') }}</button>
         <span class="text-body-sm"><span dir="ltr" class="inline-block">{{ page + 1 }} / {{ pages }}</span> · <span dir="ltr" class="inline-block">{{ total }}</span></span>
         <button class="btn-outlined" :disabled="page + 1 >= pages || loadingRows" data-testid="tbl-next" @click="go(1)">{{ pt('nextPage') }}</button>

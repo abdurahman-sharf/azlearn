@@ -76,7 +76,7 @@ onMounted(load)
     </div>
 
     <section v-if="assessments.length" class="mb-6">
-      <h3 class="text-title-md font-bold mb-2">{{ pt('assessments') }}</h3>
+      <h2 class="text-title-md font-bold mb-2">{{ pt('assessments') }}</h2>
       <AssessmentList :items="assessments" />
     </section>
 

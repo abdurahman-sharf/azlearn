@@ -33,7 +33,7 @@ onMounted(async () => {
     </div>
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
     <section v-if="assessments.length" class="mb-6">
-      <h3 class="text-title-md font-bold mb-2">{{ pt('assessments') }}</h3>
+      <h2 class="text-title-md font-bold mb-2">{{ pt('assessments') }}</h2>
       <AssessmentList :items="assessments" show-status show-edit />
     </section>
     <ContentLists :bundle="bundle" show-status show-edit />

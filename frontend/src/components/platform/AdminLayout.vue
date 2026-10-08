@@ -76,8 +76,9 @@ async function logout() {
         <button class="rounded-full px-4 py-2.5 text-body-md whitespace-nowrap text-start" style="color: rgb(var(--md-on-surface-variant))" data-testid="nav-logout" @click="logout">{{ pt('logout') }}</button>
       </nav>
     </aside>
-    <main class="min-w-0 flex-1">
+    <!-- a <div>, not <main>: the app shell already provides the page's single main landmark -->
+    <div class="min-w-0 flex-1">
       <router-view />
-    </main>
+    </div>
   </div>
 </template>

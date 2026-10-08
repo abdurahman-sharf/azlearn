@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import type { Question } from '@exameow/shared'
 import { usePt, type PlatformKey } from '@/i18n/platform'
 import { letter, totals } from '@/utils/examBuilder'
+import { useDialog } from '@/composables/useDialog'
 
 // Shows the exam the way a student would see it before starting: no correct answers, nothing is created.
 const props = defineProps<{
@@ -14,6 +15,8 @@ const props = defineProps<{
   shuffle: boolean
 }>()
 const emit = defineEmits<{ close: [] }>()
+const panel = ref<HTMLElement | null>(null)
+useDialog(ref(true), panel, () => emit('close'))
 const pt = usePt()
 const sum = computed(() => totals(props.questions))
 const options = (q: Question) => (q.type === 'true_false' && !q.options.length ? ['صحيح', 'خطأ'] : q.options)
@@ -21,7 +24,7 @@ const options = (q: Question) => (q.type === 'true_false' && !q.options.length ?
 
 <template>
   <div class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-3 sm:p-6" style="background-color: rgb(0 0 0 / 0.5)" data-testid="exam-preview" role="dialog" aria-modal="true" :aria-label="pt('exPreviewTitle')">
-    <div class="w-full max-w-2xl rounded-2xl p-5 space-y-4 my-4" style="background-color: rgb(var(--md-surface)); color: rgb(var(--md-on-surface))">
+    <div ref="panel" class="w-full max-w-2xl rounded-2xl p-5 space-y-4 my-4" style="background-color: rgb(var(--md-surface)); color: rgb(var(--md-on-surface))">
       <div class="flex items-start justify-between gap-3">
         <div class="min-w-0">
           <p class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ pt('exPreviewNote') }}</p>

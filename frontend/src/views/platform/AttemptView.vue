@@ -113,5 +113,8 @@ onMounted(load)
 
     <button v-if="isGrader && pendingItems.length" class="btn-filled mt-4" data-testid="save-grades" @click="saveGrades">{{ pt('saveGrades') }}</button>
   </div>
-  <p v-else-if="error" class="max-w-3xl mx-auto" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+  <div v-else-if="error" class="max-w-3xl mx-auto">
+    <h1 class="sr-only">{{ pt('attemptPageTitle') }}</h1>
+    <p role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+  </div>
 </template>

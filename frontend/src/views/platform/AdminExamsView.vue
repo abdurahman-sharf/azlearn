@@ -127,7 +127,7 @@ const tabs: { key: Phase | 'all' | ''; label: PlatformKey }[] = [
       </li>
     </ul>
 
-    <nav v-if="pages > 1" class="flex items-center justify-between gap-3" data-testid="exam-pager">
+    <nav v-if="pages > 1" class="flex items-center justify-between gap-3" :aria-label="pt('pageLabel')" data-testid="exam-pager">
       <button class="btn-outlined" :disabled="page === 0 || loading" data-testid="exam-prev" @click="page--; load()">{{ pt('prevPage') }}</button>
       <span class="text-body-sm"><span dir="ltr" class="inline-block">{{ page + 1 }} / {{ pages }}</span> · <span dir="ltr" class="inline-block">{{ total }}</span> {{ pt('bankFound') }}</span>
       <button class="btn-outlined" :disabled="page + 1 >= pages || loading" data-testid="exam-next" @click="page++; load()">{{ pt('nextPage') }}</button>

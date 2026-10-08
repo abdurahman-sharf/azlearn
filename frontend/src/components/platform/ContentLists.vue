@@ -18,7 +18,7 @@ const empty = computed(() => !props.bundle.posts.length && !props.bundle.courses
     <p v-if="empty" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))">{{ pt('noContent') }}</p>
 
     <section v-if="bundle.live.length && !hideLive">
-      <h3 class="text-title-md font-bold mb-2">{{ pt('liveSessions') }}</h3>
+      <h2 class="text-title-md font-bold mb-2">{{ pt('liveSessions') }}</h2>
       <ul class="space-y-2">
         <li v-for="l in bundle.live" :key="l.id" class="card-filled p-3" :class="{ 'opacity-60': l.status === 'cancelled' }">
           <div class="flex items-start gap-2">
@@ -39,7 +39,7 @@ const empty = computed(() => !props.bundle.posts.length && !props.bundle.courses
     </section>
 
     <section v-if="bundle.courses.length">
-      <h3 class="text-title-md font-bold mb-2">{{ pt('courses') }}</h3>
+      <h2 class="text-title-md font-bold mb-2">{{ pt('courses') }}</h2>
       <ul class="space-y-2">
         <li v-for="c in bundle.courses" :key="c.id" class="card-filled p-3 flex items-center gap-2">
           <router-link :to="`/platform/courses/${c.id}`" class="flex-1 min-w-0">
@@ -53,7 +53,7 @@ const empty = computed(() => !props.bundle.posts.length && !props.bundle.courses
     </section>
 
     <section v-if="bundle.posts.length">
-      <h3 class="text-title-md font-bold mb-2">{{ pt('posts') }}</h3>
+      <h2 class="text-title-md font-bold mb-2">{{ pt('posts') }}</h2>
       <ul class="space-y-2">
         <li v-for="p in bundle.posts" :key="p.id" class="card-filled p-3 flex items-center gap-2">
           <router-link :to="`/platform/posts/${p.id}`" class="flex-1 min-w-0">

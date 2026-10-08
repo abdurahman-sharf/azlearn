@@ -1,3 +1,4 @@
+use super::arabic::{fix_visual_order, has_arabic};
 use super::ParserError;
 use lopdf::Document;
 use unicode_normalization::UnicodeNormalization;
@@ -21,11 +22,18 @@ fn normalize_compat_chars(s: &str) -> String {
 }
 
 pub fn extract_pdf(path: &str) -> Result<String, ParserError> {
-    match extract_via_lopdf(path) {
-        Ok(text) if !text.trim().is_empty() => return Ok(normalize_compat_chars(&text)),
-        Ok(_) | Err(_) => {}
-    }
-    extract_via_pdf_extract(path).map(|t| normalize_compat_chars(&t))
+    let primary = extract_via_lopdf(path).ok().filter(|t| !t.trim().is_empty());
+    let text = match primary {
+        // Arabic: lopdf returns one word per line with unmapped glyphs for some fonts; pdf-extract keeps whole lines
+        // in a form `fix_visual_order` can restore, so it is preferred whenever it also finds Arabic.
+        Some(t) if has_arabic(&t) => match extract_via_pdf_extract(path) {
+            Ok(p) if has_arabic(&p) && !p.trim().is_empty() => p,
+            _ => t,
+        },
+        Some(t) => t,
+        None => extract_via_pdf_extract(path)?,
+    };
+    Ok(normalize_compat_chars(&fix_visual_order(&text)))
 }
 
 fn extract_via_lopdf(path: &str) -> Result<String, ParserError> {

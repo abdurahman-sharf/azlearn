@@ -80,7 +80,7 @@ const isCorrect = (it: BankItem, i: number) => (it.type === 'single_choice' || i
         </div>
       </li>
     </ul>
-    <nav v-if="pages() > 1" class="flex items-center justify-between gap-3">
+    <nav v-if="pages() > 1" class="flex items-center justify-between gap-3" :aria-label="pt('pageLabel')">
       <button class="btn-outlined" :disabled="page === 0" data-testid="pick-prev" @click="page--; load()">{{ pt('prevPage') }}</button>
       <span class="text-body-sm" dir="ltr">{{ page + 1 }} / {{ pages() }}</span>
       <button class="btn-outlined" :disabled="page + 1 >= pages()" data-testid="pick-next" @click="page++; load()">{{ pt('nextPage') }}</button>

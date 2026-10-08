@@ -198,7 +198,7 @@ const diffLabel = (d: string) => (d === 'none' ? pt('bankNoDifficulty') : pt(`ba
         </li>
       </ul>
 
-      <nav v-if="pages > 1" class="flex items-center justify-between gap-3" data-testid="bank-pager">
+      <nav v-if="pages > 1" class="flex items-center justify-between gap-3" :aria-label="pt('pageLabel')" data-testid="bank-pager">
         <button class="btn-outlined" :disabled="page === 0 || loading" data-testid="bank-prev" @click="go(-1)">{{ pt('prevPage') }}</button>
         <span class="text-body-sm">{{ pt('bankPage') }} <span dir="ltr" class="inline-block">{{ page + 1 }} / {{ pages }}</span> · <span dir="ltr" class="inline-block">{{ total }}</span> {{ pt('bankFound') }}</span>
         <button class="btn-outlined" :disabled="page + 1 >= pages || loading" data-testid="bank-next" @click="go(1)">{{ pt('nextPage') }}</button>

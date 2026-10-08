@@ -71,7 +71,7 @@ async function logout() {
       <form class="mb-4" @submit.prevent="router.push({ path: '/platform/search', query: { q: searchQ } })">
         <input v-model="searchQ" type="search" maxlength="60" :placeholder="pt('searchPlaceholder')" class="input-outlined w-full" data-testid="home-search" />
       </form>
-      <nav class="flex flex-wrap gap-2 mb-6">
+      <nav class="flex flex-wrap gap-2 mb-6" :aria-label="pt('quickLinks')">
         <router-link to="/platform/teachers" class="btn-tonal">{{ pt('browseTeachers') }}</router-link>
         <router-link v-if="auth.role === 'teacher'" to="/platform/teaching" class="btn-tonal">{{ pt('myTeaching') }}</router-link>
         <router-link v-if="auth.role === 'teacher'" to="/platform/my-content" class="btn-filled">{{ pt('myContent') }}</router-link>

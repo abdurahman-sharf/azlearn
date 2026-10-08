@@ -29,6 +29,11 @@ const i18n = useI18nStore()
 const showLanguageDialog = ref(false)
 const brand = useBrandingStore()
 const pt = usePt()
+const mainEl = ref<HTMLElement | null>(null)
+function focusMain() {
+  mainEl.value?.focus()
+  mainEl.value?.scrollIntoView({ block: 'start' })
+}
 // On web/Docker the header carries the platform's own identity (name + logo) and links to the landing page.
 const homePath = platformEnabled ? '/' : '/practice'
 const headerName = computed(() => (platformEnabled ? brand.name ?? pt('defaultPlatformName') : i18n.t('appName')))
@@ -102,6 +107,9 @@ const headerStyle = {
     <!-- ====== Desktop TitleBar (Tauri only) ====== -->
     <TitleBar v-if="isDesktopTauri" />
 
+    <!-- Bypass block (WCAG 2.4.1): first tab stop jumps over the navigation. Not an href="#…": the hash is the router's. -->
+    <a class="skip-link" href="#main-content" data-testid="skip-link" @click.prevent="focusMain">{{ pt('skipToContent') }}</a>
+
     <!-- ====== Top App Bar ====== -->
     <header
       class="sticky z-30 select-none"
@@ -128,6 +136,7 @@ const headerStyle = {
         <!-- Desktop Nav — Pixel Segmented sliding pill navigation -->
         <div class="hidden sm:flex items-center" :class="isDesktopTauri ? '' : 'ml-6'">
           <nav
+            :aria-label="headerName"
             class="relative flex items-center p-1 rounded-full gap-0.5 shadow-sm"
             style="background-color: rgb(var(--md-surface-container-high))"
           >
@@ -188,7 +197,7 @@ const headerStyle = {
     </header>
 
     <!-- ====== Main Content ====== -->
-    <main class="flex-1 mx-auto w-full max-w-5xl xl:max-w-6xl px-3 sm:px-6 py-4 sm:py-7">
+    <main id="main-content" ref="mainEl" tabindex="-1" class="flex-1 mx-auto w-full max-w-5xl xl:max-w-6xl px-3 sm:px-6 py-4 sm:py-7 focus:outline-none">
       <router-view v-slot="{ Component }">
         <transition name="slide-up" mode="out-in">
           <component :is="Component" />
@@ -198,6 +207,7 @@ const headerStyle = {
 
     <!-- ====== Bottom Navigation Bar (Mobile Pixel M3) ====== -->
     <nav
+      :aria-label="headerName"
       class="sm:hidden sticky bottom-0 z-30 safe-bottom"
       :style="{
         backgroundColor: 'rgba(var(--md-surface-container-lowest) / 0.92)',

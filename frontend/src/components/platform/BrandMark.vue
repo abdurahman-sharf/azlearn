@@ -16,7 +16,7 @@ const wordmark = computed(() => !brand.logo && !brand.name)
   <span class="inline-flex items-center gap-3 align-middle" data-testid="brand-mark">
     <template v-if="wordmark">
       <!-- The official azlearn lockup has dark-blue letters, so it sits on a white chip (needed in dark mode). -->
-      <span class="inline-flex items-center rounded-xl bg-white px-2 py-1 shrink-0" data-testid="brand-wordmark" :aria-label="name">
+      <span class="inline-flex items-center rounded-xl bg-white px-2 py-1 shrink-0" data-testid="brand-wordmark" role="img" :aria-label="name">
         <img src="/azlearn-logo.png" alt="" :style="{ height: size * 1.1 + 'px', width: 'auto' }" />
       </span>
       <span class="sr-only" data-testid="brand-name">{{ name }}</span>

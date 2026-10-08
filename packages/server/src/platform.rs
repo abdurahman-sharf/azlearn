@@ -337,7 +337,7 @@ pub fn bearer(headers: &HeaderMap) -> Option<&str> {
         .filter(|t| !t.is_empty())
 }
 
-fn user_for_token(conn: &Connection, token: &str) -> Option<User> {
+pub(crate) fn user_for_token(conn: &Connection, token: &str) -> Option<User> {
     conn.query_row(
         &format!(
             "SELECT {USER_COLS} FROM users WHERE id = (SELECT user_id FROM sessions WHERE token_hash = ?1 AND expires_at > ?2)"

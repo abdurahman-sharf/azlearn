@@ -1,4 +1,4 @@
-use exameow_core::parser::{extract_csv, extract_epub, extract_excel, extract_html, extract_odt, extract_pptx, extract_txt, FileFormat, ParserError};
+use exameow_core::parser::{extract_csv, extract_docx, extract_epub, extract_excel, extract_html, extract_odt, extract_pdf, extract_pptx, extract_txt, parse_file, FileFormat, ParserError};
 
 #[test]
 fn test_extract_txt() {
@@ -226,4 +226,97 @@ fn test_extract_odt_paragraphs() {
     let first_pos = text.find("First paragraph.").unwrap();
     assert!(title_pos < first_pos);
     let _ = std::fs::remove_file(&path);
+}
+
+// ───────── XML entities (quick-xml reports them as separate events) ─────────
+
+fn zip_of(path: &std::path::Path, entries: &[(&str, &str)]) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    let mut z = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    for (name, body) in entries {
+        z.start_file(*name, SimpleFileOptions::default()).unwrap();
+        z.write_all(body.as_bytes()).unwrap();
+    }
+    z.finish().unwrap();
+}
+
+#[test]
+fn test_docx_decodes_entities_and_arabic_runs() {
+    let path = std::env::temp_dir().join("exameow_entities.docx");
+    zip_of(&path, &[("word/document.xml", r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+        <w:p><w:r><w:t xml:space="preserve">Tom &amp; Jerry &lt;b&gt; &quot;quoted&quot; &#1575;&#x644;</w:t></w:r></w:p>
+        <w:p><w:r><w:t>مقدمة في قواعد البيانات</w:t></w:r></w:p>
+        <w:p><w:r><w:t>   </w:t></w:r></w:p>
+        <w:p><w:r><w:t>second</w:t></w:r><w:r><w:t>third</w:t></w:r></w:p></w:body></w:document>"#)]);
+    let text = extract_docx(path.to_str().unwrap()).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines, vec!["Tom & Jerry <b> \"quoted\" ال", "مقدمة في قواعد البيانات", "second", "third"]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_pptx_and_odt_decode_entities() {
+    let pptx = std::env::temp_dir().join("exameow_entities.pptx");
+    zip_of(&pptx, &[("ppt/slides/slide1.xml", r#"<?xml version="1.0"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Q&amp;A: 2 &lt; 3</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#)]);
+    assert!(extract_pptx(pptx.to_str().unwrap()).unwrap().contains("Q&A: 2 < 3"));
+    let odt = std::env::temp_dir().join("exameow_entities.odt");
+    zip_of(&odt, &[("content.xml", r#"<?xml version="1.0"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:text><text:p>R&amp;D &#8212; 5 &gt; 4 &apos;ok&apos;</text:p></office:text></office:body></office:document-content>"#)]);
+    assert!(extract_odt(odt.to_str().unwrap()).unwrap().contains("R&D — 5 > 4 'ok'"));
+    let _ = std::fs::remove_file(&pptx);
+    let _ = std::fs::remove_file(&odt);
+}
+
+// ───────── PDF ─────────
+
+#[test]
+fn test_arabic_pdf_is_extracted_in_reading_order() {
+    // printed by Chromium from an Arabic page: shaped glyphs, right-to-left lines stored in visual order
+    let text = extract_pdf("tests/fixtures/arabic.pdf").unwrap();
+    for expected in ["مقدمة في قواعد البيانات", "قاعدة البيانات هي", "نظام", "المفتاح", "القيم الفارغة"] {
+        assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+    }
+    assert!(!text.chars().any(|c| matches!(c as u32, 0xFB50..=0xFDFF | 0xFE70..=0xFEFF)), "presentation forms must be normalised:\n{text}");
+    let title = text.find("مقدمة في قواعد البيانات").unwrap();
+    let body = text.find("قاعدة البيانات هي").unwrap();
+    assert!(title < body, "lines keep their order");
+}
+
+#[test]
+fn test_parse_file_dispatches_pdf_through_the_arabic_fix() {
+    let text = parse_file("tests/fixtures/arabic.pdf").unwrap();
+    assert!(text.contains("قواعد البيانات"));
+}
+
+/// A PDF whose catalog holds an array nested `depth` levels deep. Robustness regression test: hostile nesting must
+/// come back as an error, never as a stack overflow that aborts the whole server process (lopdf is upgraded past
+/// RUSTSEC-2026-0187, which is about exactly that class of input).
+fn nested_pdf(depth: usize) -> Vec<u8> {
+    let mut v = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R /X ".to_vec();
+    v.extend(std::iter::repeat(b'[').take(depth));
+    v.extend(std::iter::repeat(b']').take(depth));
+    v.extend_from_slice(b" >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\ntrailer\n<< /Root 1 0 R /Size 3 >>\n%%EOF\n");
+    v
+}
+
+#[test]
+fn test_deeply_nested_pdf_is_rejected_without_crashing_the_process() {
+    for depth in [50_000usize, 1_000_000] {
+        let path = std::env::temp_dir().join(format!("exameow_nested_{depth}.pdf"));
+        std::fs::write(&path, nested_pdf(depth)).unwrap();
+        // the assertion is that this returns at all (a stack overflow would kill the test binary)
+        let r = extract_pdf(path.to_str().unwrap());
+        assert!(r.is_err(), "no text can come out of a PDF without pages");
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn test_garbage_pdfs_are_errors_not_panics() {
+    for (i, bytes) in [b"%PDF-1.4".to_vec(), b"not a pdf at all".to_vec(), vec![0u8; 4096], b"%PDF-1.7\n1 0 obj\n<<".to_vec()].into_iter().enumerate() {
+        let path = std::env::temp_dir().join(format!("exameow_garbage_{i}.pdf"));
+        std::fs::write(&path, bytes).unwrap();
+        assert!(extract_pdf(path.to_str().unwrap()).is_err(), "case {i}");
+        let _ = std::fs::remove_file(&path);
+    }
 }
