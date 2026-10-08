@@ -1,5 +1,6 @@
 mod txt;
 mod docx;
+mod arabic;
 mod pdf;
 mod table;
 mod csv;
@@ -15,6 +16,7 @@ use std::path::Path;
 pub use txt::extract_txt;
 pub use docx::extract_docx;
 pub use pdf::extract_pdf;
+pub use arabic::{fix_visual_order, has_arabic};
 pub use csv::extract_csv;
 pub use excel::extract_excel;
 pub use epub::extract_epub;

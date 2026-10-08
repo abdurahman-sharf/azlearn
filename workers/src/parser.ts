@@ -1,3 +1,5 @@
+import { fixVisualOrder } from './arabicPdf'
+
 export interface ParseResult {
   text: string
   fileName: string
@@ -222,7 +224,7 @@ async function parsePdf(data: ArrayBuffer): Promise<string> {
   const decoded = allText.map(t => decodePdfText(t, cidMap)).filter(Boolean)
   const unique = [...new Set(decoded)]
 
-  if (unique.length > 0) return normalizeCompatChars(unique.join('\n'))
+  if (unique.length > 0) return normalizeCompatChars(fixVisualOrder(unique.join('\n')))
   return fallbackDecode(data, 'pdf')
 }
 

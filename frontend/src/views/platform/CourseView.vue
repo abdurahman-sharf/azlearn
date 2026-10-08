@@ -109,7 +109,7 @@ onMounted(load)
       <p v-if="!enrolled" class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ pt('enrollToTrack') }}</p>
       <template v-else>
         <div class="flex justify-between text-body-sm mb-1"><span>{{ pt('progress') }}</span><span data-testid="percent">{{ percent }}%</span></div>
-        <div class="h-2 rounded-full overflow-hidden" style="background-color: rgb(var(--md-surface-container-high))" role="progressbar" :aria-valuenow="percent" aria-valuemin="0" aria-valuemax="100">
+        <div class="h-2 rounded-full overflow-hidden" style="background-color: rgb(var(--md-surface-container-high))" role="progressbar" :aria-label="pt('progress')" :aria-valuenow="percent" aria-valuemin="0" aria-valuemax="100">
           <div class="h-full" :style="{ width: percent + '%', backgroundColor: 'rgb(var(--md-primary))' }"></div>
         </div>
       </template>

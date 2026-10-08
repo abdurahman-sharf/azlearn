@@ -6,8 +6,17 @@ const router = createRouter({
   history: createWebHashHistory(),
   routes: [
     {
+      // Landing page on web/Docker (platform enabled); other builds keep opening on practice (see guard).
       path: '/',
-      redirect: '/practice',
+      name: 'home',
+      component: () => import('@/views/platform/LandingView.vue'),
+      meta: { title: 'Home' },
+    },
+    {
+      path: '/legal/:slug(privacy|terms)',
+      name: 'legal',
+      component: () => import('@/views/platform/LegalView.vue'),
+      meta: { title: 'Legal' },
     },
     {
       path: '/practice',
@@ -148,28 +157,108 @@ const router = createRouter({
       meta: { title: 'Account status', requiresAuth: true },
     },
     {
+      // Admin area: sidebar shell + the existing admin pages as children (URLs unchanged).
+      path: '/platform/admin',
+      component: () => import('@/components/platform/AdminLayout.vue'),
+      meta: { requiresAuth: true, requiresActive: true, roles: ['admin'] },
+      children: [
+        {
+          path: '',
+          name: 'platform-admin',
+          component: () => import('@/views/platform/AdminOverviewView.vue'),
+          meta: { title: 'Overview', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'users',
+          name: 'platform-admin-users',
+          component: () => import('@/views/platform/AdminUsersView.vue'),
+          meta: { title: 'Accounts', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'institutions',
+          name: 'platform-admin-institutions',
+          component: () => import('@/views/platform/AdminInstitutionsView.vue'),
+          meta: { title: 'Institutions', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'institutions/:id',
+          name: 'platform-admin-institution',
+          component: () => import('@/views/platform/AdminInstitutionView.vue'),
+          meta: { title: 'Institution', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'teaching',
+          name: 'platform-admin-teaching',
+          component: () => import('@/views/platform/AdminTeachingView.vue'),
+          meta: { title: 'platform-admin-teaching', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'reports',
+          name: 'platform-admin-reports',
+          component: () => import('@/views/platform/AdminReportsView.vue'),
+          meta: { title: 'platform-admin-reports', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'exams',
+          name: 'platform-admin-exams',
+          component: () => import('@/views/platform/AdminExamsView.vue'),
+          meta: { title: 'Exams', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'exams/new',
+          name: 'platform-admin-exam-new',
+          component: () => import('@/views/platform/AdminExamEditorView.vue'),
+          meta: { title: 'New exam', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'exams/:id/edit',
+          name: 'platform-admin-exam-edit',
+          component: () => import('@/views/platform/AdminExamEditorView.vue'),
+          meta: { title: 'Edit exam', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'bank',
+          name: 'platform-admin-bank',
+          component: () => import('@/views/platform/AdminBankView.vue'),
+          meta: { title: 'Question bank', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'settings',
+          name: 'platform-admin-settings',
+          component: () => import('@/views/platform/AdminSettingsView.vue'),
+          meta: { title: 'Settings', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'audit',
+          name: 'platform-admin-audit',
+          component: () => import('@/views/platform/AdminAuditView.vue'),
+          meta: { title: 'platform-admin-audit', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'system',
+          name: 'platform-admin-system',
+          component: () => import('@/views/platform/AdminSystemView.vue'),
+          meta: { title: 'System status', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+      ],
+    },
+    {
+      path: '/platform/grading',
+      name: 'platform-grading',
+      component: () => import('@/views/platform/GradingQueueView.vue'),
+      meta: { title: 'Grading', requiresAuth: true, requiresActive: true, roles: ['teacher', 'admin'] },
+    },
+    {
+      path: '/platform/grading/:id',
+      name: 'platform-grade-exam',
+      component: () => import('@/views/platform/GradeExamView.vue'),
+      meta: { title: 'Grading', requiresAuth: true, requiresActive: true, roles: ['teacher', 'admin'] },
+    },
+    {
       path: '/platform',
       name: 'platform-home',
       component: () => import('@/views/platform/PlatformHomeView.vue'),
       meta: { title: 'Platform', requiresAuth: true, requiresActive: true },
-    },
-    {
-      path: '/platform/admin/users',
-      name: 'platform-admin-users',
-      component: () => import('@/views/platform/AdminUsersView.vue'),
-      meta: { title: 'Accounts', requiresAuth: true, requiresActive: true, roles: ['admin'] },
-    },
-    {
-      path: '/platform/admin/institutions',
-      name: 'platform-admin-institutions',
-      component: () => import('@/views/platform/AdminInstitutionsView.vue'),
-      meta: { title: 'Institutions', requiresAuth: true, requiresActive: true, roles: ['admin'] },
-    },
-    {
-      path: '/platform/admin/institutions/:id',
-      name: 'platform-admin-institution',
-      component: () => import('@/views/platform/AdminInstitutionView.vue'),
-      meta: { title: 'Institution', requiresAuth: true, requiresActive: true, roles: ['admin'] },
     },
     {
       path: '/platform/institutions/:id',
@@ -206,12 +295,6 @@ const router = createRouter({
       name: 'platform-teaching',
       component: () => import('@/views/platform/TeachingView.vue'),
       meta: { title: 'platform-teaching', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
-    },
-    {
-      path: '/platform/admin/teaching',
-      name: 'platform-admin-teaching',
-      component: () => import('@/views/platform/AdminTeachingView.vue'),
-      meta: { title: 'platform-admin-teaching', requiresAuth: true, requiresActive: true, roles: ['admin'] },
     },
     {
       path: '/platform/my-content',
@@ -310,18 +393,6 @@ const router = createRouter({
       meta: { title: 'platform-attempt', requiresAuth: true, requiresActive: true },
     },
     {
-      path: '/platform/admin/reports',
-      name: 'platform-admin-reports',
-      component: () => import('@/views/platform/AdminReportsView.vue'),
-      meta: { title: 'platform-admin-reports', requiresAuth: true, requiresActive: true, roles: ['admin'] },
-    },
-    {
-      path: '/platform/admin/audit',
-      name: 'platform-admin-audit',
-      component: () => import('@/views/platform/AdminAuditView.vue'),
-      meta: { title: 'platform-admin-audit', requiresAuth: true, requiresActive: true, roles: ['admin'] },
-    },
-    {
       path: '/platform/search',
       name: 'platform-search',
       component: () => import('@/views/platform/SearchView.vue'),
@@ -345,6 +416,13 @@ const router = createRouter({
 // Platform accounts are optional: only routes that opt in via meta are guarded,
 // so every existing (public) feature keeps working without an account.
 router.beforeEach(async (to) => {
+  if (to.name === 'home') {
+    if (!platformEnabled) return '/practice'
+    const auth = useAuthStore()
+    await auth.init()
+    return auth.isLoggedIn ? '/platform' : true
+  }
+  if (to.name === 'legal' && !platformEnabled) return '/practice'
   const needsAuth = to.meta.requiresAuth || to.meta.guestOnly
   if (!needsAuth) return true
   if (!platformEnabled) return '/mine'

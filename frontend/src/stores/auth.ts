@@ -55,6 +55,7 @@ export const useAuthStore = defineStore('auth', () => {
     fullName: string
     role: 'student' | 'teacher'
     institutionType: InstitutionType
+    consent: boolean
   }): Promise<AccountStatus> {
     const res = await platformFetch<{ status: AccountStatus }>('/register', {
       body: {
@@ -63,6 +64,7 @@ export const useAuthStore = defineStore('auth', () => {
         full_name: input.fullName,
         role: input.role,
         institution_type: input.institutionType,
+        consent: input.consent,
       },
     })
     return res.status

@@ -52,7 +52,7 @@ onMounted(load)
     <ul class="space-y-2">
       <li v-for="n in list.items" :key="n.id">
         <button class="w-full text-start card-filled p-3" :class="{ 'ring-2': !n.read }" @click="open(n)">
-          <div class="break-words" :class="{ 'font-bold': !n.read }">{{ formatNotification(pt, n.kind, n.data) }}</div>
+          <div class="break-words" :class="{ 'font-bold': !n.read }">{{ formatNotification(pt, n.kind, n.data, fmt) }}</div>
           <div class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ fmt(n.created_at) }}</div>
         </button>
       </li>

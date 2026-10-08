@@ -50,9 +50,17 @@ onMounted(load)
       <template v-if="a.opens_at">{{ pt('opensAt').replace(/\s*\(.*\)/, '') }}: {{ fmt(a.opens_at) }}</template>
       <template v-if="a.closes_at"> · {{ pt('closesAt').replace(/\s*\(.*\)/, '') }}: {{ fmt(a.closes_at) }}</template>
     </p>
+    <p v-if="a.pass_mark || a.release_mode === 'after_close'" class="text-body-sm mb-3" data-testid="exam-terms">
+      <template v-if="a.pass_mark">{{ pt('tkPassMark') }}: <span dir="ltr" class="inline-block">{{ a.pass_mark }}%</span></template><template v-if="a.pass_mark && a.release_mode === 'after_close'"> · </template><template v-if="a.release_mode === 'after_close'">{{ pt('tkResultAfterClose') }}</template>
+    </p>
+    <p v-if="a.status === 'closed' || a.status === 'archived'" class="text-body-md font-semibold mb-3" data-testid="exam-closed">{{ pt('tkClosedExam') }}</p>
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
 
     <template v-if="auth.role === 'student'">
+      <section v-if="a.can_start && !a.in_progress_attempt" class="card-filled p-4 mb-4 space-y-1" data-testid="exam-rules">
+        <h2 class="font-bold">{{ pt('tkRulesTitle') }}</h2>
+        <ul class="list-disc ps-5 text-body-sm space-y-0.5"><li>{{ pt('tkRules1') }}</li><li>{{ pt('tkRules2') }}</li><li v-if="a.shuffle_questions || a.shuffle_options">{{ pt('tkRules3') }}</li><li>{{ pt('tkRules4') }}</li></ul>
+      </section>
       <p class="text-body-sm mb-3">{{ pt('attemptsUsed') }}: <span dir="ltr" class="inline-block">{{ a.attempts_used }} / {{ a.max_attempts }}</span></p>
       <router-link v-if="a.can_start" :to="`/platform/assessments/${a.id}/take`" class="btn-filled inline-flex mb-4">
         {{ a.in_progress_attempt ? pt('resumeAssessment') : pt('startAssessment') }}
@@ -60,9 +68,11 @@ onMounted(load)
       <ul class="space-y-2">
         <li v-for="t in a.attempts.filter(x => x.status !== 'in_progress')" :key="t.attempt_id">
           <router-link :to="`/platform/attempts/${t.attempt_id}`" class="card-filled block p-3">
-            <span v-if="t.status === 'submitted'" class="font-bold inline-block" dir="ltr">{{ t.score }} / {{ t.total }}</span>
+            <span v-if="t.status === 'submitted' && !t.released" class="text-body-sm" data-testid="attempt-embargo">{{ pt('tkResultAfterClose') }}</span>
+            <span v-else-if="t.status === 'submitted'" class="font-bold inline-block" dir="ltr">{{ t.score }} / {{ t.total }}</span>
             <span v-else>{{ pt('expiredAttempt') }}</span>
             <span v-if="t.pending" class="text-body-sm ms-2">· {{ pt('pendingGrading') }}</span>
+            <span v-if="t.passed !== null" class="text-body-sm ms-2 font-semibold">· {{ t.passed ? pt('tkPassed') : pt('tkFailed') }}</span>
             <span class="text-body-sm ms-2" style="color: rgb(var(--md-on-surface-variant))">{{ fmt(t.started_at) }}</span>
           </router-link>
         </li>
@@ -71,7 +81,7 @@ onMounted(load)
 
     <div v-if="!isOwner" class="mt-4"><ReportButton target-type="assessment" :target-id="a.id" /></div>
 
-    <div v-if="isOwner || auth.role === 'admin'" class="flex flex-wrap gap-2 mt-4">
+    <div v-if="isOwner || auth.role === 'admin' || (auth.role === 'teacher' && !a.teacher_id)" class="flex flex-wrap gap-2 mt-4">
       <router-link :to="`/platform/assessments/${a.id}/results`" class="btn-filled">{{ pt('results') }} ({{ a.attempt_count }})</router-link>
       <router-link v-if="isOwner" :to="`/platform/assessments/${a.id}/edit`" class="btn-outlined">{{ pt('edit') }}</router-link>
       <template v-if="auth.role === 'admin'">

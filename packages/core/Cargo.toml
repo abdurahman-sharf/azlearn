@@ -8,15 +8,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 csv = "1"
-lopdf = "0.34"
-pdf-extract = "0.7"
-quick-xml = "0.37"
+lopdf = "0.45"
+pdf-extract = "0.12"
+quick-xml = "0.41"
 zip = "2"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 ring = "0.17"
 thiserror = "2"
 encoding_rs = "0.8"
-calamine = "0.26"
+calamine = "0.36"
 unicode-normalization = "0.1"
 tokio = { version = "1", features = ["full"] }

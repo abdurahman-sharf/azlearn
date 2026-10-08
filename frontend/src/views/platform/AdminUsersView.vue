@@ -10,6 +10,10 @@ const auth = useAuthStore()
 const users = ref<Profile[]>([])
 const filter = ref<'pending' | 'all'>('pending')
 const q = ref('')
+const role = ref('')
+const page = ref(0)
+const PAGE = 25
+const hasMore = ref(false)
 const loading = ref(false)
 const error = ref('')
 const notice = ref('')
@@ -28,12 +32,30 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    users.value = await listUsers({ status: filter.value === 'pending' ? 'pending' : undefined, q: q.value.trim() || undefined })
+    // Ask for one extra row to know whether a next page exists (no separate count request).
+    const rows = await listUsers({
+      status: filter.value === 'pending' ? 'pending' : undefined,
+      role: role.value || undefined,
+      q: q.value.trim() || undefined,
+      limit: PAGE + 1,
+      offset: page.value * PAGE,
+    })
+    hasMore.value = rows.length > PAGE
+    users.value = rows.slice(0, PAGE)
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
   } finally {
     loading.value = false
   }
+}
+
+function search() {
+  page.value = 0
+  load()
+}
+function go(delta: number) {
+  page.value += delta
+  load()
 }
 
 async function apply(u: Profile, patch: Parameters<typeof updateUser>[1]) {
@@ -64,15 +86,18 @@ onMounted(load)
 
 <template>
   <div class="max-w-3xl mx-auto pb-8">
-    <router-link to="/platform" class="text-body-sm underline">{{ pt('back') }}</router-link>
     <h1 class="text-display-sm font-bold tracking-tight my-3">{{ pt('adminUsers') }}</h1>
 
     <div class="flex gap-2 mb-3">
-      <button :class="filter === 'pending' ? 'btn-filled' : 'btn-outlined'" @click="filter = 'pending'; load()">{{ pt('pendingFilter') }}</button>
-      <button :class="filter === 'all' ? 'btn-filled' : 'btn-outlined'" @click="filter = 'all'; load()">{{ pt('all') }}</button>
+      <button :class="filter === 'pending' ? 'btn-filled' : 'btn-outlined'" @click="filter = 'pending'; search()">{{ pt('pendingFilter') }}</button>
+      <button :class="filter === 'all' ? 'btn-filled' : 'btn-outlined'" @click="filter = 'all'; search()">{{ pt('all') }}</button>
     </div>
-    <form class="mb-4" @submit.prevent="load">
-      <input v-model="q" type="search" :placeholder="pt('search')" class="input-outlined w-full" />
+    <form class="mb-4 flex gap-2" @submit.prevent="search">
+      <input v-model="q" type="search" :placeholder="pt('search')" class="input-outlined flex-1 min-w-0" data-testid="users-search" />
+      <select v-model="role" class="input-outlined" :aria-label="pt('accountRole')" data-testid="users-role-filter" @change="search">
+        <option value="">{{ pt('allRoles') }}</option>
+        <option v-for="r in ROLES" :key="r" :value="r">{{ pt(roleKey[r]!) }}</option>
+      </select>
     </form>
 
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
@@ -112,5 +137,11 @@ onMounted(load)
         </div>
       </li>
     </ul>
+
+    <nav v-if="page > 0 || hasMore" class="flex items-center justify-between gap-3 mt-4" :aria-label="pt('pageLabel')" data-testid="users-pager">
+      <button class="btn-outlined" :disabled="page === 0 || loading" data-testid="users-prev" @click="go(-1)">{{ pt('prevPage') }}</button>
+      <span class="text-body-sm">{{ pt('pageLabel') }} <span dir="ltr" class="inline-block">{{ page + 1 }}</span></span>
+      <button class="btn-outlined" :disabled="!hasMore || loading" data-testid="users-next" @click="go(1)">{{ pt('nextPage') }}</button>
+    </nav>
   </div>
 </template>

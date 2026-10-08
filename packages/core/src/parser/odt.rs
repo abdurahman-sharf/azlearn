@@ -20,11 +20,12 @@ pub fn extract_odt(path: &str) -> Result<String, ParserError> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Text(ref t)) => {
-                let s = t.unescape().unwrap_or_default();
+                let s = t.decode().unwrap_or_default();
                 if !s.trim().is_empty() {
                     out.push_str(&s);
                 }
             }
+            Ok(Event::GeneralRef(ref r)) => out.push_str(&super::xml_text::resolve_ref(r)),
             Ok(Event::End(ref e)) => {
                 if matches!(e.local_name().as_ref(), b"p" | b"h") && !out.ends_with('\n') {
                     out.push('\n');

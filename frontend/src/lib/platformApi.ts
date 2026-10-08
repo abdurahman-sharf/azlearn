@@ -10,7 +10,7 @@ const base = ((import.meta.env.VITE_PLATFORM_API as string | undefined) ?? '').r
 export const platformEnabled = !!base || (!isCloudflare() && !isTauri())
 
 export class PlatformError extends Error {
-  constructor(public code: string, public status: number) {
+  constructor(public code: string, public status: number, public data: Record<string, unknown> = {}) {
     super(code)
   }
 }
@@ -49,6 +49,6 @@ export async function platformFetch<T>(path: string, init: { method?: string; bo
   }
   if (res.status === 204) return undefined as T
   const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new PlatformError((data as { error?: string }).error ?? 'unknown', res.status)
+  if (!res.ok) throw new PlatformError((data as { error?: string }).error ?? 'unknown', res.status, data as Record<string, unknown>)
   return data as T
 }

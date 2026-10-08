@@ -17,6 +17,7 @@ const ROLES: [&str; 5] = ["admin", "institution_admin", "moderator", "teacher", 
 const STATUSES: [&str; 4] = ["active", "pending", "rejected", "suspended"];
 const TYPES: [&str; 3] = ["school", "institute", "university"];
 const MAX_USERS_LISTED: i64 = 200;
+const DEFAULT_USERS_PAGE: i64 = MAX_USERS_LISTED; // unchanged default for old clients; the UI pages explicitly
 
 // ───────── users ─────────
 
@@ -25,22 +26,26 @@ pub struct UserFilter {
     status: Option<String>,
     role: Option<String>,
     q: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 fn list_users(conn: &Connection, f: &UserFilter) -> Res<Vec<User>> {
     let q = f.q.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| {
         format!("%{}%", s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_").to_lowercase())
     });
+    let limit = f.limit.unwrap_or(DEFAULT_USERS_PAGE).clamp(1, MAX_USERS_LISTED);
+    let offset = f.offset.unwrap_or(0).clamp(0, 1_000_000);
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {USER_COLS} FROM users
              WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR role = ?2)
                AND (?3 IS NULL OR lower(email) LIKE ?3 ESCAPE '\\' OR lower(full_name) LIKE ?3 ESCAPE '\\')
-             ORDER BY created_at DESC LIMIT {MAX_USERS_LISTED}"
+             ORDER BY created_at DESC, id LIMIT ?4 OFFSET ?5"
         ))
         .map_err(db_err)?;
     let rows = stmt
-        .query_map(params![f.status, f.role, q], row_to_user)
+        .query_map(params![f.status, f.role, q, limit, offset], row_to_user)
         .map_err(db_err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
@@ -680,9 +685,28 @@ mod tests {
         let conn = create_test_db();
         insert_test_user(&conn, "a_b@x.com", "student", "active");
         insert_test_user(&conn, "axb@x.com", "student", "active");
-        let f = |q: &str| UserFilter { status: None, role: None, q: Some(q.into()) };
+        let f = |q: &str| UserFilter { status: None, role: None, q: Some(q.into()), limit: None, offset: None };
         assert_eq!(list_users(&conn, &f("a_b")).unwrap().len(), 1);
         assert_eq!(list_users(&conn, &f("%")).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn user_listing_pages_without_gaps_or_repeats() {
+        let conn = create_test_db();
+        for i in 0..7 {
+            insert_test_user(&conn, &format!("u{i}@x.com"), if i % 2 == 0 { "student" } else { "teacher" }, "active");
+        }
+        let page = |limit, offset, role: Option<&str>| {
+            let f = UserFilter { status: None, role: role.map(Into::into), q: None, limit: Some(limit), offset: Some(offset) };
+            list_users(&conn, &f).unwrap().into_iter().map(|u| u.id).collect::<Vec<_>>()
+        };
+        let all = page(200, 0, None);
+        assert_eq!(all.len(), 7);
+        let stitched: Vec<_> = [page(3, 0, None), page(3, 3, None), page(3, 6, None)].concat();
+        assert_eq!(stitched, all, "pages are contiguous and stable even with equal created_at");
+        assert!(page(3, 7, None).is_empty());
+        assert_eq!(page(50, 0, Some("teacher")).len(), 3);
+        assert_eq!(page(0, -5, None).len(), 1, "limit is clamped to at least 1 and offset to at least 0");
     }
 
     #[test]

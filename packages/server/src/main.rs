@@ -1,12 +1,25 @@
+mod auth_gate;
+mod client_ip;
+mod legacy_guard;
 mod platform;
 mod platform_admin;
+mod platform_ai;
+mod platform_backup;
+mod platform_bank;
+mod platform_exam_admin;
+mod platform_grading;
 mod platform_content;
 mod platform_engage;
 mod platform_exams;
 mod platform_ops;
+mod platform_public;
+mod platform_reminders;
+mod platform_settings;
 mod platform_learning;
 mod relay;
 mod routes;
+mod security_headers;
+mod token_limit;
 
 use axum::{
     routing::{delete, get, post},
@@ -22,18 +35,21 @@ use axum::http::{header, HeaderValue};
 
 #[tokio::main]
 async fn main() {
+    // `exameow-server restore <backup.zip> [--yes]`: offline restore, then exit (the server must be stopped)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("restore") {
+        std::process::exit(platform_backup::cli_restore(&args[1..]));
+    }
     let config_store = ConfigStore::new("ExameowServer").unwrap_or_else(|_| {
         eprintln!("Warning: could not init config store, using transient store");
         ConfigStore::new("ExameowServerTransient").unwrap()
     });
     let db_path = std::env::var("EXAM_DB_PATH").unwrap_or_else(|_| "./exameow.db".to_string());
     let relay = relay::init_db(&db_path).unwrap_or_else(|e| panic!("failed to init exam db at {db_path}: {e}"));
-    let platform_db_path =
-        std::env::var("PLATFORM_DB_PATH").unwrap_or_else(|_| "./exameow-platform.db".to_string());
-    let platform_files_dir =
-        std::env::var("PLATFORM_FILES_DIR").unwrap_or_else(|_| "./platform-files".to_string());
-    let platform = platform::init_db(&platform_db_path, &platform_files_dir)
-        .unwrap_or_else(|e| panic!("failed to init platform db at {platform_db_path}: {e}"));
+    let layout = platform_backup::Layout::from_env();
+    let platform = platform::init_db(&layout)
+        .unwrap_or_else(|e| panic!("failed to init platform db at {}: {e}", layout.db_path.display()));
+    platform_backup::startup(&platform);
     let non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     match (non_empty("PLATFORM_ADMIN_EMAIL"), non_empty("PLATFORM_ADMIN_PASSWORD")) {
         (Some(email), Some(password)) => match platform::bootstrap_admin(&platform, &email, &password) {
@@ -53,6 +69,8 @@ async fn main() {
         relay,
         platform,
         admin_token: Mutex::new(admin_token),
+        legacy: legacy_guard::LegacyGuard::from_env(),
+        auth_failures: token_limit::TokenLimiter::from_env_named("PLATFORM_AUTH_FAIL_RPM", 600),
     });
 
     {
@@ -65,9 +83,36 @@ async fn main() {
                 platform::cleanup_expired(&state.platform);
                 platform_content::purge_orphan_files(&state.platform);
                 platform_engage::purge_old_notifications(&state.platform);
+                platform_exams::settle_overdue(&state.platform);
+                // tonight's backup (phase 1-9): also fires on the first tick after a start if the last slot was missed
+                let st = state.clone();
+                let _ = tokio::task::spawn_blocking(move || platform_backup::run_nightly(&st.platform, relay::now_ms())).await;
             }
         });
     }
+
+    // Exam reminders and "results available" notifications (phase 1-8). The first tick fires at once, so a
+    // server that was stopped catches up on start; a missed tick is skipped, never replayed in a burst.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let state = state.clone();
+                // SQLite work: keep it off the async workers
+                let _ = tokio::task::spawn_blocking(move || platform_reminders::run(&state.platform)).await;
+            }
+        });
+    }
+
+    let proxy = client_ip::Proxy::from_env();
+    let sec = security_headers::Config::from_env();
+    println!("Content-Security-Policy: {:?}, HSTS: {}", sec.csp, sec.hsts);
+    let token_limiter = Arc::new(token_limit::TokenLimiter::from_env());
+    println!("Signed-in API budget: {} requests/minute per session (PLATFORM_TOKEN_RPM, 0 = off)", token_limiter.per_minute());
+    println!("Client address: trusted proxy hops = {}", proxy.describe());
 
     let static_dir =
         std::env::var("STATIC_DIR").unwrap_or_else(|_| "../frontend/dist".to_string());
@@ -182,17 +227,60 @@ async fn main() {
         .route("/api/platform/admin/reports", get(platform_ops::list_reports_handler))
         .route("/api/platform/admin/reports/{id}", axum::routing::patch(platform_ops::resolve_report_handler))
         .route("/api/platform/admin/stats", get(platform_ops::stats_handler))
+        .route("/api/platform/admin/backup", post(platform_backup::create_handler))
+        .route("/api/platform/admin/backups", get(platform_backup::list_handler))
+        .route("/api/platform/admin/backups/{id}", get(platform_backup::download_handler))
+        .route("/api/platform/admin/system", get(platform_backup::system_handler))
         .route("/api/platform/admin/audit", get(platform_ops::audit_handler))
         .route("/api/platform/search", get(platform_ops::search_handler))
         .route("/api/platform/me/password", post(platform_ops::change_password_handler))
         .route("/api/platform/me", delete(platform_ops::delete_account_handler))
+        .route("/api/platform/public/config", get(platform_public::public_config_handler))
+        .route("/api/platform/public/logo", get(platform_public::logo_handler))
+        .route("/api/platform/public/legal/{slug}", get(platform_public::legal_get_handler))
+        .route("/api/platform/admin/settings", get(platform_ai::get_settings_handler).put(platform_ai::put_settings_handler))
+        .route("/api/platform/admin/settings/ai/test", post(platform_ai::test_handler))
+        .route("/api/platform/admin/ai/usage", get(platform_ai::usage_handler))
+        .route("/api/platform/admin/ai/generate", post(platform_ai::generate_handler).layer(platform_ai::upload_limit()))
+        .route("/api/platform/admin/bank", get(platform_bank::list_handler).post(platform_bank::create_handler))
+        .route("/api/platform/admin/bank/facets", get(platform_bank::facets_handler))
+        .route("/api/platform/admin/bank/bulk", post(platform_bank::bulk_handler))
+        .route("/api/platform/admin/bank/import", post(platform_bank::import_handler).layer(platform_bank::import_limit()))
+        .route("/api/platform/admin/bank/{id}", axum::routing::patch(platform_bank::update_handler))
+        .route("/api/platform/admin/exams", get(platform_exam_admin::list_handler).post(platform_exam_admin::create_handler))
+        .route("/api/platform/admin/exams/{id}", get(platform_exam_admin::get_handler).patch(platform_exam_admin::update_handler).delete(platform_exam_admin::delete_handler))
+        .route("/api/platform/admin/exams/{id}/{action}", post(platform_exam_admin::action_handler))
+        .route("/api/platform/attempts/{id}/answers", axum::routing::put(platform_exams::save_handler))
+        .route("/api/platform/attempts/{id}/events", post(platform_exams::event_handler))
+        .route("/api/platform/grading/pending", get(platform_grading::pending_handler))
+        .route("/api/platform/assessments/{id}/grading", get(platform_grading::sheet_handler))
+        .route("/api/platform/assessments/{id}/grade-batch", post(platform_grading::batch_handler))
+        .route("/api/platform/assessments/{id}/analytics", get(platform_grading::analytics_handler))
+        .route("/api/platform/assessments/{id}/attempts", get(platform_grading::table_handler))
+        .route("/api/platform/assessments/{id}/export", get(platform_grading::export_handler))
+        .route("/api/platform/admin/branding", axum::routing::put(platform_public::set_branding_handler))
+        .route(
+            "/api/platform/admin/branding/logo",
+            post(platform_public::upload_logo_handler).delete(platform_public::delete_logo_handler).layer(platform_public::logo_upload_limit()),
+        )
+        .route("/api/platform/admin/legal/{slug}", axum::routing::put(platform_public::legal_put_handler))
         .fallback_service(ServeDir::new(&static_dir))
+        // both sit inside CORS and the security headers on purpose: their 401/429 answers still carry those headers,
+        // so cross-origin clients (Tauri/Cloudflare builds) can read them
+        // deny by default: no valid session, no platform API (except register/login/logout/public)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_gate::middleware))
+        // outside the gate: a token over its budget (valid or made up) is refused before any database lookup
+        .layer(axum::middleware::from_fn_with_state(token_limiter, token_limit::middleware))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
-        // Baseline hardening that cannot break the SPA (no CSP: the app loads wasm/workers/fonts).
+        // CSP / no-store API / permissions policy / optional HSTS (see security_headers.rs)
+        .layer(axum::middleware::from_fn_with_state(sec, security_headers::middleware))
+        // baseline headers
         .layer(SetResponseHeaderLayer::if_not_present(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")))
         .layer(SetResponseHeaderLayer::if_not_present(header::REFERRER_POLICY, HeaderValue::from_static("strict-origin-when-cross-origin")))
         .layer(SetResponseHeaderLayer::if_not_present(header::X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN")))
-        .with_state(state);
+        .with_state(state)
+        // outermost: decides the client address before any handler (or rate limit) looks at the request
+        .layer(axum::middleware::from_fn_with_state(proxy, client_ip::middleware));
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -203,5 +291,5 @@ async fn main() {
         .await
         .unwrap();
     println!("Exameow server running on http://0.0.0.0:{port}");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
 }

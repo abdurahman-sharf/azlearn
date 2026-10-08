@@ -15,8 +15,11 @@ services:
       - ADMIN_TOKEN_FILE=/app/data/admin_token.txt
       - PLATFORM_DB_PATH=/app/data/exameow-platform.db
       - PLATFORM_FILES_DIR=/app/data/platform-files
+      - PLATFORM_KEY_FILE=/app/data/platform.key
       - PLATFORM_ADMIN_EMAIL=${PLATFORM_ADMIN_EMAIL:-}
       - PLATFORM_ADMIN_PASSWORD=${PLATFORM_ADMIN_PASSWORD:-}
+      # Backups go to /app/data/backups (same volume). Optional: PLATFORM_BACKUP_HOUR (UTC hour or "off"),
+      # PLATFORM_BACKUP_KEEP (nightly, default 7), PLATFORM_BACKUP_KEEP_MANUAL (default 5).
     volumes:
       - exameow-data:/app/data
     restart: unless-stopped

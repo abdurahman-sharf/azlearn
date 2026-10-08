@@ -161,7 +161,8 @@ export const httpApi = {
       const res = await fetch(`${BASE_URL}/api/config/load`)
       if (res.ok) {
         const data = await res.json()
-        return data
+        // null = nothing saved on the server (or this visitor may not read it): use this browser's copy
+        if (data) return data
       }
     } catch {}
     const stored = localStorage.getItem('exameow_config')

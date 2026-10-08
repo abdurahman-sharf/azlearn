@@ -60,7 +60,7 @@ impl SharedStringWriter {
     }
 }
 
-fn escape_xml(s: &str) -> String {
+pub(super) fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -68,7 +68,7 @@ fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn col_letter(idx: usize) -> String {
+pub(super) fn col_letter(idx: usize) -> String {
     let mut n = idx;
     let mut result = Vec::new();
     loop {

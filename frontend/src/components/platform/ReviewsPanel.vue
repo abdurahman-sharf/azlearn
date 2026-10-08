@@ -53,12 +53,12 @@ watch(() => props.targetId, load)
 
 <template>
   <section v-if="data" class="space-y-3" data-testid="reviews">
-    <h3 class="text-title-md font-bold">
+    <h2 class="text-title-md font-bold">
       {{ pt('reviewsTitle') }}
       <span v-if="data.count" class="text-body-lg" style="color: rgb(var(--md-primary))">
         <span aria-hidden="true">{{ stars(data.average) }}</span> {{ data.average }} ({{ data.count }} {{ pt('reviewsCount') }})
       </span>
-    </h3>
+    </h2>
 
     <form v-if="data.can_review" class="card-elevated p-3 space-y-2" @submit.prevent="submit">
       <div class="font-semibold">{{ pt('yourRating') }}</div>

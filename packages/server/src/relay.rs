@@ -218,7 +218,7 @@ fn normalize_choice(s: &str) -> String {
         .trim()
         .to_uppercase()
         .chars()
-        .filter(|c| ('A'..='H').contains(c))
+        .filter(|c| ('A'..='J').contains(c))
         .collect();
     chars.sort();
     chars.into_iter().collect()
@@ -255,14 +255,9 @@ pub fn grade(q: &Question, user: Option<&str>) -> Option<bool> {
     }
 }
 
+/// The client address resolved by `client_ip::middleware` (never the raw `X-Forwarded-For`, which clients forge).
 pub fn client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+    crate::client_ip::from_headers(headers)
 }
 
 pub fn admin_token_valid(state: &crate::routes::AppState, headers: &HeaderMap) -> bool {
