@@ -122,6 +122,8 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     crate::platform::add_column_if_missing(conn, "attempts", "order_json", "TEXT")?;
     // Question -> bank item it was copied from (statistics only); the exam itself is a fixed snapshot.
     crate::platform::add_column_if_missing(conn, "assessments", "source_map", "TEXT")?;
+    // When students were last told about the exam (phase 1-8): the closing reminder never lands on top of it.
+    crate::platform::add_column_if_missing(conn, "assessments", "published_at", "INTEGER")?;
     Ok(())
 }
 
@@ -345,7 +347,7 @@ pub(crate) fn get_info(conn: &Connection, viewer_id: &str, id: &str) -> Res<Asse
 
 /// Shared SQL predicate: an admin-created exam (no teacher) needs nothing more; a teacher's exam needs the
 /// teacher to be active and approved for the subject. Expects aliases `a` (assessments) and `u` (its teacher).
-const TEACHER_OK: &str = "(a.teacher_id IS NULL OR (u.status = 'active'
+pub(crate) const TEACHER_OK: &str = "(a.teacher_id IS NULL OR (u.status = 'active'
             AND EXISTS(SELECT 1 FROM teacher_subjects ts WHERE ts.teacher_id = a.teacher_id AND ts.subject_id = a.subject_id AND ts.status = 'approved')))";
 
 /// Published (or closed, so students can still see it and their results), subject active, teacher in good standing.
@@ -440,12 +442,14 @@ pub(crate) fn create_assessment(conn: &Connection, teacher: &User, r: &Assessmen
     )
     .map_err(db_err)?;
     if status == "published" {
-        announce(conn, teacher, subject_id, &id, &title);
+        announce(conn, teacher, subject_id, &id, &title, now);
     }
     get_info(conn, &teacher.id, &id)
 }
 
-pub(crate) fn announce(conn: &Connection, teacher: &User, subject_id: &str, id: &str, title: &str) {
+/// Tells the audience about a newly published exam and records when (`published_at`).
+pub(crate) fn announce(conn: &Connection, teacher: &User, subject_id: &str, id: &str, title: &str, now: i64) {
+    let _ = conn.execute("UPDATE assessments SET published_at = ?2 WHERE id = ?1", params![id, now]);
     crate::platform_engage::notify_audience(
         conn,
         &teacher.id,
@@ -555,7 +559,7 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
             crate::platform_engage::notify(conn, owner, "content_unpublished", json!({ "title": title }), &format!("/platform/assessments/{id}"));
         }
     } else if status == "published" && cur.status != "published" {
-        announce(conn, user, &cur.subject_id, id, &title);
+        announce(conn, user, &cur.subject_id, id, &title, now_ms());
     }
     get_info(conn, &user.id, id)
 }
@@ -945,7 +949,7 @@ pub struct AttemptResult {
 
 /// Results are visible at once for `immediate` exams; for `after_close` only once the exam is closed
 /// (manually, or its closing time has passed).
-fn is_released(release_mode: &str, status: &str, closes_at: Option<i64>, now: i64) -> bool {
+pub(crate) fn is_released(release_mode: &str, status: &str, closes_at: Option<i64>, now: i64) -> bool {
     release_mode != "after_close" || matches!(status, "closed" | "archived") || closes_at.map_or(false, |c| c <= now)
 }
 
@@ -1118,8 +1122,15 @@ pub(crate) fn grade_attempt(conn: &Connection, grader: &User, attempt_id: &str, 
     .map_err(db_err)?;
     // tell the student once, when the last pending answer gets its grade (not on later corrections)
     if pending == 0 && pending_before > 0 {
-        let title: String = conn.query_row("SELECT title FROM assessments WHERE id = ?1", params![assessment_id], |r| r.get(0)).map_err(db_err)?;
-        crate::platform_engage::notify(conn, &student_id, "assessment_graded", json!({ "title": title }), &format!("/platform/attempts/{attempt_id}"));
+        let (title, mode, exam_status, closes_at): (String, String, String, Option<i64>) = conn
+            .query_row("SELECT title, release_mode, status, closes_at FROM assessments WHERE id = ?1", params![assessment_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map_err(db_err)?;
+        // While the result is withheld (`after_close`) the student is told when it is released instead (phase 1-8).
+        if is_released(&mode, &exam_status, closes_at, now_ms()) {
+            crate::platform_engage::notify(conn, &student_id, "assessment_graded", json!({ "title": title }), &format!("/platform/attempts/{attempt_id}"));
+        }
     }
     attempt_result(conn, grader, attempt_id)
 }
@@ -1680,6 +1691,14 @@ mod migration_tests {
         assert_eq!(one::<i64>(&c, "PRAGMA foreign_keys"), 1, "foreign keys are back ON after the swap");
         assert!(tables(&c).contains(&"settings".to_string()));
         assert!(!tables(&c).contains(&"assessments_new".to_string()), "no leftover temp table");
+        // phase 1-8: old exams count as announced long ago, the reminder table starts empty, and a sweep over
+        // the migrated data neither fails nor invents notifications for finished exams
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM assessments WHERE published_at IS NOT NULL"), 0);
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM exam_reminders"), 0);
+        let before = one::<i64>(&c, "SELECT count(*) FROM notifications");
+        let swept = crate::platform_reminders::sweep(&c, now_ms());
+        assert_eq!(swept, crate::platform_reminders::Sweep::default(), "the fixture's exams are long over");
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM notifications"), before);
     }
 
     #[test]

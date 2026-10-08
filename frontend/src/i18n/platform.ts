@@ -633,6 +633,8 @@ const ar = {
   invalidPoints: 'الدرجة غير صالحة.',
   n_new_assessment: '{teacher} نشر اختباراً: {title}',
   n_assessment_graded: 'تم تصحيح اختبارك: {title}',
+  n_exam_closing: 'يُغلق الاختبار «{title}» في {closes_at} ولم تبدأه بعد.',
+  n_exam_results: 'أصبحت نتيجة اختبارك «{title}» متاحة الآن.',
   noNotifications: 'لا توجد إشعارات.',
   markAllRead: 'تعليم الكل كمقروء',
   n_account_active: 'تم تفعيل حسابك.',
@@ -1350,6 +1352,8 @@ const en: typeof ar = {
   invalidPoints: 'Invalid points.',
   n_new_assessment: '{teacher} published an assessment: {title}',
   n_assessment_graded: 'Your assessment was graded: {title}',
+  n_exam_closing: '“{title}” closes on {closes_at} and you have not started it yet.',
+  n_exam_results: 'The result of “{title}” is now available.',
   noNotifications: 'No notifications.',
   markAllRead: 'Mark all as read',
   n_account_active: 'Your account is now active.',
@@ -1523,11 +1527,20 @@ export function platformErrorMessage(pt: (k: PlatformKey) => string, e: unknown)
 }
 
 /** Renders a stored notification (`kind` + `data`) in the current language. */
-export function formatNotification(pt: (k: PlatformKey) => string, kind: string, data: Record<string, string | number | null>): string {
+export function formatNotification(
+  pt: (k: PlatformKey) => string,
+  kind: string,
+  data: Record<string, string | number | null>,
+  /** Formats timestamp fields (`*_at`, epoch ms) in the viewer's language. */
+  fmtTime?: (ms: number) => string,
+): string {
   const key = `n_${kind}` as PlatformKey
   let text = pt(key)
   if (!text) return kind
-  for (const [k, v] of Object.entries(data)) text = text.replace(`{${k}}`, String(v ?? ''))
+  for (const [k, v] of Object.entries(data)) {
+    const value = fmtTime && k.endsWith('_at') && typeof v === 'number' ? fmtTime(v) : String(v ?? '')
+    text = text.replace(`{${k}}`, value)
+  }
   return text
 }
 

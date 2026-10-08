@@ -285,7 +285,7 @@ pub fn create_exam(conn: &Connection, admin: &User, r: &ExamReq, now: i64) -> Re
     audit(conn, &admin.id, &id, "exam_create", status);
     if status == "published" {
         audit(conn, &admin.id, &id, "exam_publish", "on create");
-        announce(conn, admin, subject_id, &id, &title);
+        announce(conn, admin, subject_id, &id, &title, now);
     }
     get_exam(conn, admin, &id, now)
 }
@@ -388,6 +388,10 @@ pub fn update_exam(conn: &Connection, admin: &User, id: &str, r: &ExamReq, now: 
         ],
     )
     .map_err(db_err)?;
+    // extending a closing time that had already passed reopens the exam (see `reopen`)
+    if base.closes_at.map_or(false, |c| c <= now) && cfg.closes_at.map_or(true, |c| c > now) {
+        crate::platform_reminders::reset_results(conn, id);
+    }
     audit(conn, &admin.id, id, "exam_update", if frozen { "frozen" } else { "" });
     get_exam(conn, admin, id, now)
 }
@@ -412,7 +416,7 @@ pub fn act(conn: &Connection, admin: &User, id: &str, action: &str, now: i64) ->
             let (questions, _) = load_snapshot(conn, id)?;
             check_publishable(&questions, subject_state(conn, &cur.subject_id)?, &Cfg::of(&cur), now)?;
             set("published", None, None)?;
-            announce(conn, admin, &cur.subject_id, id, &cur.title);
+            announce(conn, admin, &cur.subject_id, id, &cur.title, now);
         }
         "unpublish" => {
             if cur.status != "published" || cur.teacher_id.is_some() && false {
@@ -438,6 +442,8 @@ pub fn act(conn: &Connection, admin: &User, id: &str, action: &str, now: i64) ->
                 return Err(bad("invalid_time")); // extend the closing time first
             }
             set("published", None, None)?;
+            // results are withheld again until the next close, so "results available" will be due again then
+            crate::platform_reminders::reset_results(conn, id);
         }
         "archive" => {
             if cur.status == "published" {

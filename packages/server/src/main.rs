@@ -9,6 +9,7 @@ mod platform_engage;
 mod platform_exams;
 mod platform_ops;
 mod platform_public;
+mod platform_reminders;
 mod platform_settings;
 mod platform_learning;
 mod relay;
@@ -81,6 +82,22 @@ async fn main() {
                 platform_content::purge_orphan_files(&state.platform);
                 platform_engage::purge_old_notifications(&state.platform);
                 platform_exams::settle_overdue(&state.platform);
+            }
+        });
+    }
+
+    // Exam reminders and "results available" notifications (phase 1-8). The first tick fires at once, so a
+    // server that was stopped catches up on start; a missed tick is skipped, never replayed in a burst.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let state = state.clone();
+                // SQLite work: keep it off the async workers
+                let _ = tokio::task::spawn_blocking(move || platform_reminders::run(&state.platform)).await;
             }
         });
     }

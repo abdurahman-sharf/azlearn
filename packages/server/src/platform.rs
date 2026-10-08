@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 /// Applies the core schema plus every feature module's schema (all idempotent).
 pub fn apply_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-    for extra in [crate::platform_learning::SCHEMA, crate::platform_content::SCHEMA, crate::platform_engage::SCHEMA, crate::platform_exams::SCHEMA, crate::platform_ops::SCHEMA, crate::platform_settings::SCHEMA, crate::platform_ai::SCHEMA, crate::platform_bank::SCHEMA] {
+    for extra in [crate::platform_learning::SCHEMA, crate::platform_content::SCHEMA, crate::platform_engage::SCHEMA, crate::platform_exams::SCHEMA, crate::platform_ops::SCHEMA, crate::platform_settings::SCHEMA, crate::platform_ai::SCHEMA, crate::platform_bank::SCHEMA, crate::platform_reminders::SCHEMA] {
         conn.execute_batch(extra).map_err(|e| e.to_string())?;
     }
     crate::platform_exams::migrate(conn)?;
