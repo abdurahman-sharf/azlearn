@@ -60,7 +60,7 @@ const TRUE_WORDS: &[&str] = &["a", "true", "t", "yes", "y", "1", "√", "对", "
 const FALSE_WORDS: &[&str] = &["b", "false", "f", "no", "n", "0", "×", "错", "错误", "否", "خطا", "خاطي", "خاطئ", "خطاء", "لا", "غير صحيح"];
 
 /// Brings an answer into the form the graders expect: choice letters sorted (`AC`), true/false as `A`/`B`.
-fn normalize_answer(qtype: &QuestionType, options: &[String], answer: &str) -> Res<String> {
+pub(crate) fn normalize_answer(qtype: &QuestionType, options: &[String], answer: &str) -> Res<String> {
     match qtype {
         QuestionType::SingleChoice | QuestionType::MultiChoice => {
             // Leading letters/separators only, so "B. القاهرة" and "A, C" both work; a letter
@@ -112,6 +112,33 @@ fn clean_tags(tags: &[String]) -> Res<Vec<String>> {
         return Err(bad("invalid_tags"));
     }
     Ok(out)
+}
+
+/// Cleans one question that is about to be stored in an exam: options trimmed, answers brought to the
+/// grader's canonical form (same rules as the bank), shape validated. Ids, score, chapter and difficulty are kept.
+pub(crate) fn clean_exam_question(q: &Question) -> Res<Question> {
+    let mut options: Vec<String> = q.options.iter().map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect();
+    if q.qtype == QuestionType::TrueFalse && options.is_empty() {
+        options = vec!["صحيح".into(), "خطأ".into()];
+    }
+    if !matches!(q.qtype, QuestionType::SingleChoice | QuestionType::MultiChoice | QuestionType::TrueFalse) {
+        options.clear();
+    }
+    let cleaned = Question {
+        id: q.id.trim().to_string(),
+        qtype: q.qtype.clone(),
+        stem: q.stem.trim().to_string(),
+        answer: normalize_answer(&q.qtype, &options, &q.answer)?,
+        options,
+        analysis: q.analysis.trim().to_string(),
+        ai_analysis: None,
+        score: q.score,
+        subject: None,
+        chapter: q.chapter.as_deref().map(str::trim).filter(|c| !c.is_empty() && c.chars().count() <= MAX_CHAPTER_CHARS).map(String::from),
+        difficulty: q.difficulty.clone(),
+    };
+    validate_question(&cleaned)?;
+    Ok(cleaned)
 }
 
 // ───────── data types ─────────

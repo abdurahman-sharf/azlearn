@@ -2,6 +2,7 @@ mod platform;
 mod platform_admin;
 mod platform_ai;
 mod platform_bank;
+mod platform_exam_admin;
 mod platform_content;
 mod platform_engage;
 mod platform_exams;
@@ -211,6 +212,9 @@ async fn main() {
         .route("/api/platform/admin/bank/bulk", post(platform_bank::bulk_handler))
         .route("/api/platform/admin/bank/import", post(platform_bank::import_handler).layer(platform_bank::import_limit()))
         .route("/api/platform/admin/bank/{id}", axum::routing::patch(platform_bank::update_handler))
+        .route("/api/platform/admin/exams", get(platform_exam_admin::list_handler).post(platform_exam_admin::create_handler))
+        .route("/api/platform/admin/exams/{id}", get(platform_exam_admin::get_handler).patch(platform_exam_admin::update_handler).delete(platform_exam_admin::delete_handler))
+        .route("/api/platform/admin/exams/{id}/{action}", post(platform_exam_admin::action_handler))
         .route("/api/platform/admin/branding", axum::routing::put(platform_public::set_branding_handler))
         .route(
             "/api/platform/admin/branding/logo",

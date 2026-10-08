@@ -199,6 +199,24 @@ const router = createRouter({
           meta: { title: 'platform-admin-reports', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
+          path: 'exams',
+          name: 'platform-admin-exams',
+          component: () => import('@/views/platform/AdminExamsView.vue'),
+          meta: { title: 'Exams', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'exams/new',
+          name: 'platform-admin-exam-new',
+          component: () => import('@/views/platform/AdminExamEditorView.vue'),
+          meta: { title: 'New exam', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
+          path: 'exams/:id/edit',
+          name: 'platform-admin-exam-edit',
+          component: () => import('@/views/platform/AdminExamEditorView.vue'),
+          meta: { title: 'Edit exam', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
+        {
           path: 'bank',
           name: 'platform-admin-bank',
           component: () => import('@/views/platform/AdminBankView.vue'),

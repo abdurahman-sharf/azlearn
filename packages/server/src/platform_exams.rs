@@ -120,10 +120,12 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     crate::platform::add_column_if_missing(conn, "attempts", "saved_at", "INTEGER")?;
     crate::platform::add_column_if_missing(conn, "attempts", "tab_leaves", "INTEGER NOT NULL DEFAULT 0")?;
     crate::platform::add_column_if_missing(conn, "attempts", "order_json", "TEXT")?;
+    // Question -> bank item it was copied from (statistics only); the exam itself is a fixed snapshot.
+    crate::platform::add_column_if_missing(conn, "assessments", "source_map", "TEXT")?;
     Ok(())
 }
 
-const MAX_QUESTIONS: usize = 200;
+pub(crate) const MAX_QUESTIONS: usize = 200;
 const GRACE_MS: i64 = 60_000;
 const OPEN_ENDED_LIMIT_MS: i64 = 24 * 3_600_000;
 
@@ -172,11 +174,11 @@ fn auto_grade(q: &Question, user: Option<&str>) -> Option<bool> {
     }
 }
 
-fn points_of(q: &Question) -> f64 {
+pub(crate) fn points_of(q: &Question) -> f64 {
     q.score.filter(|s| s.is_finite() && *s >= 0.0).unwrap_or(1.0)
 }
 
-fn round2(x: f64) -> f64 {
+pub(crate) fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
 
@@ -233,7 +235,7 @@ pub(crate) fn validate_question(q: &Question) -> Res<()> {
     Ok(())
 }
 
-fn validate_questions(qs: &[Question]) -> Res<()> {
+pub(crate) fn validate_questions(qs: &[Question]) -> Res<()> {
     if qs.is_empty() || qs.len() > MAX_QUESTIONS {
         return Err(bad("invalid_question_count"));
     }
@@ -248,7 +250,7 @@ fn validate_questions(qs: &[Question]) -> Res<()> {
     Ok(())
 }
 
-fn check_window(opens: Option<i64>, closes: Option<i64>) -> Res<()> {
+pub(crate) fn check_window(opens: Option<i64>, closes: Option<i64>) -> Res<()> {
     if let (Some(o), Some(c)) = (opens, closes) {
         if c <= o {
             return Err(bad("invalid_time"));
@@ -261,32 +263,44 @@ fn check_window(opens: Option<i64>, closes: Option<i64>) -> Res<()> {
 
 #[derive(Serialize, Debug, Clone)]
 pub struct AssessmentInfo {
-    id: String,
-    teacher_id: String,
-    teacher_name: String,
-    subject_id: String,
-    subject_name: String,
-    title: String,
-    description: Option<String>,
-    question_count: i64,
-    total_points: f64,
-    duration_min: Option<i64>,
-    opens_at: Option<i64>,
-    closes_at: Option<i64>,
-    max_attempts: i64,
-    show_answers: bool,
-    status: String,
-    attempts_used: i64,
-    attempt_count: i64,
+    pub(crate) id: String,
+    /// `None` for exams created by an admin (they have no owning teacher).
+    pub(crate) teacher_id: Option<String>,
+    /// The owning teacher's name, or the creating admin's for admin exams.
+    pub(crate) teacher_name: String,
+    pub(crate) subject_id: String,
+    pub(crate) subject_name: String,
+    pub(crate) title: String,
+    pub(crate) description: Option<String>,
+    pub(crate) question_count: i64,
+    pub(crate) total_points: f64,
+    pub(crate) duration_min: Option<i64>,
+    pub(crate) opens_at: Option<i64>,
+    pub(crate) closes_at: Option<i64>,
+    pub(crate) max_attempts: i64,
+    pub(crate) show_answers: bool,
+    pub(crate) status: String,
+    pub(crate) attempts_used: i64,
+    pub(crate) attempt_count: i64,
+    pub(crate) shuffle_questions: bool,
+    pub(crate) shuffle_options: bool,
+    /// Pass mark as a percentage of the total points.
+    pub(crate) pass_mark: Option<f64>,
+    /// `immediate` or `after_close`.
+    pub(crate) release_mode: String,
+    pub(crate) closed_at: Option<i64>,
+    pub(crate) archived_at: Option<i64>,
+    pub(crate) created_by: Option<String>,
 }
 
-const INFO_SELECT: &str = "SELECT a.id, a.teacher_id, u.full_name, a.subject_id, s.name_ar, a.title, a.description, a.question_count,
+pub(crate) const INFO_SELECT: &str = "SELECT a.id, a.teacher_id, COALESCE(u.full_name, cb.full_name, ''), a.subject_id, s.name_ar, a.title, a.description, a.question_count,
         a.total_points, a.duration_min, a.opens_at, a.closes_at, a.max_attempts, a.show_answers, a.status,
         (SELECT count(*) FROM attempts t WHERE t.assessment_id = a.id AND t.student_id = ?1),
-        (SELECT count(*) FROM attempts t WHERE t.assessment_id = a.id)
-     FROM assessments a JOIN users u ON u.id = a.teacher_id JOIN subjects s ON s.id = a.subject_id";
+        (SELECT count(*) FROM attempts t WHERE t.assessment_id = a.id),
+        a.shuffle_questions, a.shuffle_options, a.pass_mark, a.release_mode, a.closed_at, a.archived_at, a.created_by
+     FROM assessments a LEFT JOIN users u ON u.id = a.teacher_id LEFT JOIN users cb ON cb.id = a.created_by JOIN subjects s ON s.id = a.subject_id";
 
-fn map_info(r: &rusqlite::Row) -> rusqlite::Result<AssessmentInfo> {
+pub(crate) fn map_info(r: &rusqlite::Row) -> rusqlite::Result<AssessmentInfo> {
     Ok(AssessmentInfo {
         id: r.get(0)?,
         teacher_id: r.get(1)?,
@@ -305,29 +319,40 @@ fn map_info(r: &rusqlite::Row) -> rusqlite::Result<AssessmentInfo> {
         status: r.get(14)?,
         attempts_used: r.get(15)?,
         attempt_count: r.get(16)?,
+        shuffle_questions: r.get(17)?,
+        shuffle_options: r.get(18)?,
+        pass_mark: r.get(19)?,
+        release_mode: r.get(20)?,
+        closed_at: r.get(21)?,
+        archived_at: r.get(22)?,
+        created_by: r.get(23)?,
     })
 }
 
-fn get_info(conn: &Connection, viewer_id: &str, id: &str) -> Res<AssessmentInfo> {
+pub(crate) fn get_info(conn: &Connection, viewer_id: &str, id: &str) -> Res<AssessmentInfo> {
     conn.query_row(&format!("{INFO_SELECT} WHERE a.id = ?2"), params![viewer_id, id], map_info)
         .optional()
         .map_err(db_err)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))
 }
 
-/// Published, teacher active and approved for the subject, subject active.
+/// Shared SQL predicate: an admin-created exam (no teacher) needs nothing more; a teacher's exam needs the
+/// teacher to be active and approved for the subject. Expects aliases `a` (assessments) and `u` (its teacher).
+const TEACHER_OK: &str = "(a.teacher_id IS NULL OR (u.status = 'active'
+            AND EXISTS(SELECT 1 FROM teacher_subjects ts WHERE ts.teacher_id = a.teacher_id AND ts.subject_id = a.subject_id AND ts.status = 'approved')))";
+
+/// Published (or closed, so students can still see it and their results), subject active, teacher in good standing.
 fn publicly_visible(conn: &Connection, id: &str) -> Res<bool> {
     conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM assessments a JOIN users u ON u.id = a.teacher_id JOIN subjects s ON s.id = a.subject_id
-          WHERE a.id = ?1 AND a.status = 'published' AND u.status = 'active' AND s.is_active = 1
-            AND EXISTS(SELECT 1 FROM teacher_subjects ts WHERE ts.teacher_id = a.teacher_id AND ts.subject_id = a.subject_id AND ts.status = 'approved'))",
+        &format!("SELECT EXISTS(SELECT 1 FROM assessments a LEFT JOIN users u ON u.id = a.teacher_id JOIN subjects s ON s.id = a.subject_id
+          WHERE a.id = ?1 AND a.status IN ('published','closed') AND s.is_active = 1 AND {TEACHER_OK})"),
         params![id],
         |r| r.get(0),
     )
     .map_err(db_err)
 }
 
-fn is_enrolled(conn: &Connection, student_id: &str, subject_id: &str) -> Res<bool> {
+pub(crate) fn is_enrolled(conn: &Connection, student_id: &str, subject_id: &str) -> Res<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM subject_enrollments WHERE student_id = ?1 AND subject_id = ?2)",
         params![student_id, subject_id],
@@ -336,7 +361,7 @@ fn is_enrolled(conn: &Connection, student_id: &str, subject_id: &str) -> Res<boo
     .map_err(db_err)
 }
 
-fn load_questions(conn: &Connection, id: &str) -> Res<Vec<Question>> {
+pub(crate) fn load_questions(conn: &Connection, id: &str) -> Res<Vec<Question>> {
     let raw: String = conn.query_row("SELECT questions FROM assessments WHERE id = ?1", params![id], |r| r.get(0)).map_err(db_err)?;
     serde_json::from_str(&raw).map_err(db_err)
 }
@@ -360,14 +385,14 @@ pub struct AssessmentReq {
     clear_window: Option<bool>,
 }
 
-fn check_duration(d: Option<i64>) -> Res<()> {
+pub(crate) fn check_duration(d: Option<i64>) -> Res<()> {
     match d {
         Some(m) if !(1..=480).contains(&m) => Err(bad("invalid_time")),
         _ => Ok(()),
     }
 }
 
-fn create_assessment(conn: &Connection, teacher: &User, r: &AssessmentReq) -> Res<AssessmentInfo> {
+pub(crate) fn create_assessment(conn: &Connection, teacher: &User, r: &AssessmentReq) -> Res<AssessmentInfo> {
     let subject_id = r.subject_id.as_deref().unwrap_or("");
     let assigned: bool = conn
         .query_row(
@@ -413,7 +438,7 @@ fn create_assessment(conn: &Connection, teacher: &User, r: &AssessmentReq) -> Re
     get_info(conn, &teacher.id, &id)
 }
 
-fn announce(conn: &Connection, teacher: &User, subject_id: &str, id: &str, title: &str) {
+pub(crate) fn announce(conn: &Connection, teacher: &User, subject_id: &str, id: &str, title: &str) {
     crate::platform_engage::notify_audience(
         conn,
         &teacher.id,
@@ -424,8 +449,9 @@ fn announce(conn: &Connection, teacher: &User, subject_id: &str, id: &str, title
     );
 }
 
-fn owner_of(conn: &Connection, id: &str) -> Res<String> {
-    conn.query_row("SELECT teacher_id FROM assessments WHERE id = ?1", params![id], |r| r.get(0))
+/// The owning teacher, or `None` for an admin-created exam.
+pub(crate) fn owner_of(conn: &Connection, id: &str) -> Res<Option<String>> {
+    conn.query_row("SELECT teacher_id FROM assessments WHERE id = ?1", params![id], |r| r.get::<_, Option<String>>(0))
         .optional()
         .map_err(db_err)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))
@@ -433,7 +459,7 @@ fn owner_of(conn: &Connection, id: &str) -> Res<String> {
 
 fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq) -> Res<AssessmentInfo> {
     let owner = owner_of(conn, id)?;
-    let is_owner = owner == user.id;
+    let is_owner = owner.as_deref() == Some(user.id.as_str());
     if !is_owner && user.role != "admin" {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
@@ -444,6 +470,10 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
     let cur = get_info(conn, "", id)?;
+    // A closed/archived exam is read-only for its teacher (an admin closed or archived it).
+    if is_owner && !["draft", "published"].contains(&cur.status.as_str()) {
+        return Err(err(StatusCode::CONFLICT, "closed"));
+    }
     let title = match &r.title {
         Some(t) => text(t, 200, "invalid_title")?,
         None => cur.title.clone(),
@@ -465,7 +495,7 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
         let ok: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM teacher_subjects WHERE teacher_id = ?1 AND subject_id = ?2 AND status = 'approved')",
-                params![owner, cur.subject_id],
+                params![user.id, cur.subject_id],
                 |x| x.get(0),
             )
             .map_err(db_err)?;
@@ -492,7 +522,9 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
     .map_err(db_err)?;
     if !is_owner {
         audit(conn, &user.id, id, "assessment_moderated", &status);
-        crate::platform_engage::notify(conn, &owner, "content_unpublished", json!({ "title": title }), &format!("/platform/assessments/{id}"));
+        if let Some(owner) = &owner {
+            crate::platform_engage::notify(conn, owner, "content_unpublished", json!({ "title": title }), &format!("/platform/assessments/{id}"));
+        }
     } else if status == "published" && cur.status != "published" {
         announce(conn, user, &cur.subject_id, id, &title);
     }
@@ -501,7 +533,7 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
 
 fn delete_assessment(conn: &Connection, user: &User, id: &str) -> Res<()> {
     let owner = owner_of(conn, id)?;
-    if owner != user.id && user.role != "admin" {
+    if owner.as_deref() != Some(user.id.as_str()) && user.role != "admin" {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
     conn.execute("DELETE FROM assessments WHERE id = ?1", params![id]).map_err(db_err)?;
@@ -523,12 +555,12 @@ pub struct PublicQuestion {
 
 #[derive(Serialize, Debug)]
 pub struct StartRes {
-    attempt_id: String,
-    started_at: i64,
+    pub(crate) attempt_id: String,
+    pub(crate) started_at: i64,
     /// Server-enforced deadline (ms epoch).
-    ends_at: i64,
-    questions: Vec<PublicQuestion>,
-    resumed: bool,
+    pub(crate) ends_at: i64,
+    pub(crate) questions: Vec<PublicQuestion>,
+    pub(crate) resumed: bool,
 }
 
 fn deadline(started_at: i64, duration_min: Option<i64>) -> i64 {
@@ -552,7 +584,7 @@ fn expire_stale(conn: &Connection, assessment_id: &str, student_id: &str, durati
     Ok(())
 }
 
-fn start_attempt(conn: &Connection, student: &User, assessment_id: &str, now: i64) -> Res<StartRes> {
+pub(crate) fn start_attempt(conn: &Connection, student: &User, assessment_id: &str, now: i64) -> Res<StartRes> {
     if !publicly_visible(conn, assessment_id)? {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
@@ -578,6 +610,9 @@ fn start_attempt(conn: &Connection, student: &User, assessment_id: &str, now: i6
         .map_err(db_err)?;
     if let Some((id, started)) = open {
         return Ok(StartRes { attempt_id: id, started_at: started, ends_at: deadline(started, info.duration_min), questions: public(&questions), resumed: true });
+    }
+    if info.status != "published" {
+        return Err(err(StatusCode::FORBIDDEN, "closed"));
     }
     if info.opens_at.map_or(false, |o| now < o) {
         return Err(err(StatusCode::FORBIDDEN, "not_open_yet"));
@@ -622,7 +657,7 @@ pub struct AttemptResult {
     title: String,
     student_name: String,
     status: String,
-    score: f64,
+    pub(crate) score: f64,
     total: f64,
     pending: i64,
     started_at: i64,
@@ -639,7 +674,7 @@ fn clean_answers(raw: &HashMap<String, String>, questions: &[Question]) -> HashM
         .collect()
 }
 
-fn submit_attempt(conn: &Connection, student: &User, attempt_id: &str, raw: &HashMap<String, String>, now: i64) -> Res<AttemptResult> {
+pub(crate) fn submit_attempt(conn: &Connection, student: &User, attempt_id: &str, raw: &HashMap<String, String>, now: i64) -> Res<AttemptResult> {
     let (assessment_id, started, status): (String, i64, String) = conn
         .query_row(
             "SELECT assessment_id, started_at, status FROM attempts WHERE id = ?1 AND student_id = ?2",
@@ -681,7 +716,7 @@ fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str) -> Res<Att
                 Ok((
                     r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, f64>(3)?, r.get::<_, i64>(4)?,
                     r.get::<_, i64>(5)?, r.get::<_, Option<i64>>(6)?, r.get::<_, String>(7)?, r.get::<_, String>(8)?,
-                    r.get::<_, String>(9)?, r.get::<_, f64>(10)?, r.get::<_, bool>(11)?, r.get::<_, String>(12)?, r.get::<_, String>(13)?,
+                    r.get::<_, String>(9)?, r.get::<_, f64>(10)?, r.get::<_, bool>(11)?, r.get::<_, Option<String>>(12)?, r.get::<_, String>(13)?,
                 ))
             },
         )
@@ -689,7 +724,7 @@ fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str) -> Res<Att
         .map_err(db_err)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
     let (assessment_id, student_id, status, score, pending, started_at, submitted_at, answers_raw, results_raw, title, total, show, teacher_id, student_name) = row;
-    let is_owner = teacher_id == viewer.id || viewer.role == "admin";
+    let is_owner = teacher_id.as_deref() == Some(viewer.id.as_str()) || viewer.role == "admin";
     if student_id != viewer.id && !is_owner {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
@@ -745,10 +780,10 @@ fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str) -> Res<Att
 
 #[derive(Deserialize)]
 pub struct GradeReq {
-    grades: HashMap<String, f64>,
+    pub(crate) grades: HashMap<String, f64>,
 }
 
-fn grade_attempt(conn: &Connection, teacher: &User, attempt_id: &str, g: &GradeReq) -> Res<AttemptResult> {
+pub(crate) fn grade_attempt(conn: &Connection, teacher: &User, attempt_id: &str, g: &GradeReq) -> Res<AttemptResult> {
     let (assessment_id, student_id, status, results_raw): (String, String, String, String) = conn
         .query_row("SELECT assessment_id, student_id, status, results FROM attempts WHERE id = ?1", params![attempt_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -756,7 +791,8 @@ fn grade_attempt(conn: &Connection, teacher: &User, attempt_id: &str, g: &GradeR
         .optional()
         .map_err(db_err)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
-    if owner_of(conn, &assessment_id)? != teacher.id {
+    // The owning teacher or an admin grades; admin exams (no owner) are graded by admins.
+    if owner_of(conn, &assessment_id)?.as_deref() != Some(teacher.id.as_str()) && teacher.role != "admin" {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
     if status != "submitted" {
@@ -810,7 +846,7 @@ pub struct ResultsSummary {
 
 fn results_summary(conn: &Connection, user: &User, id: &str) -> Res<ResultsSummary> {
     let owner = owner_of(conn, id)?;
-    if owner != user.id && user.role != "admin" {
+    if owner.as_deref() != Some(user.id.as_str()) && user.role != "admin" {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
     let info = get_info(conn, &user.id, id)?;
@@ -842,8 +878,7 @@ fn results_summary(conn: &Connection, user: &User, id: &str) -> Res<ResultsSumma
 
 fn list_for_subject(conn: &Connection, student_id: &str, subject_id: &str) -> Res<Vec<AssessmentInfo>> {
     conn.prepare(&format!(
-        "{INFO_SELECT} WHERE a.subject_id = ?2 AND a.status = 'published' AND u.status = 'active' AND s.is_active = 1
-           AND EXISTS(SELECT 1 FROM teacher_subjects ts WHERE ts.teacher_id = a.teacher_id AND ts.subject_id = a.subject_id AND ts.status = 'approved')
+        "{INFO_SELECT} WHERE a.subject_id = ?2 AND a.status = 'published' AND s.is_active = 1 AND {TEACHER_OK}
          ORDER BY a.updated_at DESC LIMIT 50"
     ))
     .map_err(db_err)?
@@ -863,11 +898,10 @@ fn list_mine(conn: &Connection, teacher_id: &str) -> Res<Vec<AssessmentInfo>> {
 }
 
 /// Published assessments of the student's enrolled subjects.
-fn list_available(conn: &Connection, student_id: &str) -> Res<Vec<AssessmentInfo>> {
+pub(crate) fn list_available(conn: &Connection, student_id: &str) -> Res<Vec<AssessmentInfo>> {
     conn.prepare(&format!(
-        "{INFO_SELECT} WHERE a.status = 'published' AND u.status = 'active' AND s.is_active = 1
+        "{INFO_SELECT} WHERE a.status = 'published' AND s.is_active = 1 AND {TEACHER_OK}
            AND EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?1 AND e.subject_id = a.subject_id)
-           AND EXISTS(SELECT 1 FROM teacher_subjects ts WHERE ts.teacher_id = a.teacher_id AND ts.subject_id = a.subject_id AND ts.status = 'approved')
          ORDER BY a.updated_at DESC LIMIT 30"
     ))
     .map_err(db_err)?
@@ -934,7 +968,7 @@ pub async fn detail_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(i
     let u = require_active(&s, &h)?;
     let conn = lock(&s)?;
     let info = get_info(&conn, &u.id, &id)?;
-    let is_owner = info.teacher_id == u.id || u.role == "admin";
+    let is_owner = info.teacher_id.as_deref() == Some(u.id.as_str()) || u.role == "admin";
     if !is_owner && !publicly_visible(&conn, &id)? {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
@@ -949,7 +983,7 @@ pub async fn detail_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(i
         let used = attempts.len() as i64;
         can_start = is_enrolled(&conn, &u.id, &info.subject_id)?
             && (open_attempt.is_some()
-                || (used < info.max_attempts && info.opens_at.map_or(true, |o| now >= o) && info.closes_at.map_or(true, |c| now <= c)));
+                || (info.status == "published" && used < info.max_attempts && info.opens_at.map_or(true, |o| now >= o) && info.closes_at.map_or(true, |c| now <= c)));
     }
     Ok(Json(AssessmentDetail { info, can_start, in_progress_attempt: open_attempt, attempts }))
 }
@@ -975,7 +1009,10 @@ pub async fn attempt_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(
 }
 
 pub async fn grade_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>, Json(g): Json<GradeReq>) -> Res<Json<AttemptResult>> {
-    let u = require_role(&s, &h, "teacher")?;
+    let u = require_active(&s, &h)?;
+    if u.role != "teacher" && u.role != "admin" {
+        return Err(err(StatusCode::FORBIDDEN, "forbidden"));
+    }
     grade_attempt(&*lock(&s)?, &u, &id, &g).map(Json)
 }
 
@@ -1088,7 +1125,8 @@ mod tests {
         assert_eq!(r.items.as_ref().unwrap().len(), 5);
         assert_eq!(submit_attempt(&w.conn, &w.student, &start.attempt_id, &ans(&[]), now + 6000).unwrap_err().0, StatusCode::CONFLICT, "no double submit");
         // teacher grades the short answer
-        assert_eq!(grade_attempt(&w.conn, &w.admin, &start.attempt_id, &GradeReq { grades: ans_f(&[("q5", 3.0)]) }).unwrap_err().0, StatusCode::FORBIDDEN);
+        let other_teacher = crate::platform::insert_test_user(&w.conn, "t2@x.com", "teacher", "active");
+        assert_eq!(grade_attempt(&w.conn, &other_teacher, &start.attempt_id, &GradeReq { grades: ans_f(&[("q5", 3.0)]) }).unwrap_err().0, StatusCode::FORBIDDEN, "another teacher cannot grade");
         assert_eq!(grade_attempt(&w.conn, &w.teacher, &start.attempt_id, &GradeReq { grades: ans_f(&[("q5", 9.0)]) }).unwrap_err().0, StatusCode::BAD_REQUEST, "above max");
         assert_eq!(grade_attempt(&w.conn, &w.teacher, &start.attempt_id, &GradeReq { grades: ans_f(&[("q1", 0.0)]) }).unwrap_err().0, StatusCode::BAD_REQUEST, "auto-graded cannot be overridden");
         let g = grade_attempt(&w.conn, &w.teacher, &start.attempt_id, &GradeReq { grades: ans_f(&[("q5", 3.0)]) }).unwrap();

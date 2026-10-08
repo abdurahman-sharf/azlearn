@@ -4,6 +4,7 @@ import { usePt, platformErrorMessage } from '@/i18n/platform'
 import { getStructure, listInstitutions, type Institution, type Subject } from '@/api/platformAdmin'
 
 // Institution → subject picker for admin screens; the last choice is remembered per browser.
+const props = withDefaults(defineProps<{ remember?: boolean }>(), { remember: true })
 const subjectId = defineModel<string>({ default: '' })
 const pt = usePt()
 const KEY = 'exameow-admin-subject'
@@ -30,6 +31,7 @@ async function onInstitution() {
 }
 
 watch(subjectId, (v) => {
+  if (!props.remember) return
   try { localStorage.setItem(KEY, JSON.stringify({ i: institutionId.value, s: v })) } catch { /* storage unavailable */ }
 })
 
@@ -41,6 +43,7 @@ onMounted(async () => {
     return
   }
   let saved: { i?: string; s?: string } = {}
+  if (!props.remember) return
   try { saved = JSON.parse(localStorage.getItem(KEY) ?? '{}') } catch { /* ignore */ }
   if (saved.i && institutions.value.some((i) => i.id === saved.i)) {
     institutionId.value = saved.i

@@ -39,7 +39,7 @@ onMounted(async () => {
       const a = await getAssessment(id)
       subjectId.value = a.subject_id; title.value = a.title; description.value = a.description ?? ''
       duration.value = a.duration_min; opensAt.value = toLocal(a.opens_at); closesAt.value = toLocal(a.closes_at)
-      maxAttempts.value = a.max_attempts; showAnswers.value = a.show_answers; status.value = a.status
+      maxAttempts.value = a.max_attempts; showAnswers.value = a.show_answers; status.value = a.status === 'published' ? 'published' : 'draft'
       locked.value = a.attempt_count > 0
     } else {
       subjectId.value = (route.query.subject as string) || subjects.value[0]?.subject_id || ''

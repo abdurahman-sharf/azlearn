@@ -2,11 +2,14 @@ import { platformFetch } from '@/lib/platformApi'
 import type { Question } from '@exameow/shared'
 
 export interface AssessmentInfo {
-  id: string; teacher_id: string; teacher_name: string; subject_id: string; subject_name: string
+  /** null for exams created by an admin */
+  id: string; teacher_id: string | null; teacher_name: string; subject_id: string; subject_name: string
   title: string; description: string | null; question_count: number; total_points: number
   duration_min: number | null; opens_at: number | null; closes_at: number | null
-  max_attempts: number; show_answers: boolean; status: 'draft' | 'published'
+  max_attempts: number; show_answers: boolean; status: 'draft' | 'published' | 'closed' | 'archived'
   attempts_used: number; attempt_count: number
+  shuffle_questions: boolean; shuffle_options: boolean; pass_mark: number | null
+  release_mode: 'immediate' | 'after_close'; closed_at: number | null; archived_at: number | null; created_by: string | null
 }
 export interface MyAttempt {
   attempt_id: string; assessment_id: string; title: string

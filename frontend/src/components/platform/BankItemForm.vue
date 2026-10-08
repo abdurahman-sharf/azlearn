@@ -3,7 +3,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { usePt, type PlatformKey } from '@/i18n/platform'
 import { BANK_DIFFICULTIES, BANK_TYPES, type BankItem, type BankItemInput, type BankType } from '@/api/platformBank'
 
-const props = defineProps<{ item?: BankItem | null }>()
+const props = defineProps<{ item?: BankItem | null; hideTags?: boolean }>()
 const emit = defineEmits<{ save: [BankItemInput]; cancel: [] }>()
 const pt = usePt()
 const letter = (i: number) => String.fromCharCode(65 + i)
@@ -122,7 +122,7 @@ function submit() {
       <span class="text-label-lg">{{ pt('bankFormAnalysis') }}</span>
       <textarea v-model="f.analysis" rows="2" maxlength="6000" dir="auto" class="input-outlined w-full mt-1" data-testid="form-analysis"></textarea>
     </label>
-    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+    <div class="grid grid-cols-1 gap-3" :class="hideTags ? 'sm:grid-cols-2' : 'sm:grid-cols-3'">
       <label class="block"><span class="text-label-lg">{{ pt('bankFormChapter') }}</span>
         <input v-model="f.chapter" maxlength="100" class="input-outlined w-full mt-1" data-testid="form-chapter" /></label>
       <label class="block"><span class="text-label-lg">{{ pt('bankFormDifficulty') }}</span>
@@ -130,7 +130,7 @@ function submit() {
           <option value="">{{ pt('bankNoDifficulty') }}</option>
           <option v-for="d in BANK_DIFFICULTIES" :key="d" :value="d">{{ pt(`bank_d_${d}` as PlatformKey) }}</option>
         </select></label>
-      <label class="block"><span class="text-label-lg">{{ pt('bankFormTags') }}</span>
+      <label v-if="!hideTags" class="block"><span class="text-label-lg">{{ pt('bankFormTags') }}</span>
         <input v-model="f.tags" class="input-outlined w-full mt-1" data-testid="form-tags" /></label>
     </div>
     <p v-if="problem" role="alert" class="text-body-sm" style="color: rgb(var(--md-error))" data-testid="form-problem">{{ pt('errBankQuestion') }}</p>
