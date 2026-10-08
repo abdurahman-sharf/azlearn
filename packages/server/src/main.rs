@@ -3,6 +3,7 @@ mod platform_admin;
 mod platform_ai;
 mod platform_bank;
 mod platform_exam_admin;
+mod platform_grading;
 mod platform_content;
 mod platform_engage;
 mod platform_exams;
@@ -218,6 +219,12 @@ async fn main() {
         .route("/api/platform/admin/exams/{id}/{action}", post(platform_exam_admin::action_handler))
         .route("/api/platform/attempts/{id}/answers", axum::routing::put(platform_exams::save_handler))
         .route("/api/platform/attempts/{id}/events", post(platform_exams::event_handler))
+        .route("/api/platform/grading/pending", get(platform_grading::pending_handler))
+        .route("/api/platform/assessments/{id}/grading", get(platform_grading::sheet_handler))
+        .route("/api/platform/assessments/{id}/grade-batch", post(platform_grading::batch_handler))
+        .route("/api/platform/assessments/{id}/analytics", get(platform_grading::analytics_handler))
+        .route("/api/platform/assessments/{id}/attempts", get(platform_grading::table_handler))
+        .route("/api/platform/assessments/{id}/export", get(platform_grading::export_handler))
         .route("/api/platform/admin/branding", axum::routing::put(platform_public::set_branding_handler))
         .route(
             "/api/platform/admin/branding/logo",

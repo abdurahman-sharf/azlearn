@@ -81,7 +81,7 @@ onMounted(load)
 
     <div v-if="!isOwner" class="mt-4"><ReportButton target-type="assessment" :target-id="a.id" /></div>
 
-    <div v-if="isOwner || auth.role === 'admin'" class="flex flex-wrap gap-2 mt-4">
+    <div v-if="isOwner || auth.role === 'admin' || (auth.role === 'teacher' && !a.teacher_id)" class="flex flex-wrap gap-2 mt-4">
       <router-link :to="`/platform/assessments/${a.id}/results`" class="btn-filled">{{ pt('results') }} ({{ a.attempt_count }})</router-link>
       <router-link v-if="isOwner" :to="`/platform/assessments/${a.id}/edit`" class="btn-outlined">{{ pt('edit') }}</router-link>
       <template v-if="auth.role === 'admin'">

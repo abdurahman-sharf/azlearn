@@ -10,6 +10,7 @@ import ContentLists from '@/components/platform/ContentLists.vue'
 import { feed, type Bundle } from '@/api/platformContent'
 import { notifications, myProgress, type ProgressItem } from '@/api/platformEngage'
 import { myEnrollments, type EnrolledSubject } from '@/api/platformLearning'
+import { pendingExams } from '@/api/platformGrading'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -23,12 +24,16 @@ const unread = ref(0)
 const searchQ = ref('')
 const available = ref<AssessmentInfo[]>([])
 const progress = ref<ProgressItem[]>([])
+const gradingCount = ref(0)
 
 onMounted(async () => {
   if (auth.role === 'admin') { router.replace('/platform/admin'); return }
   try {
     unread.value = (await notifications()).unread
   } catch { /* the bell is optional */ }
+  if (auth.role === 'teacher') {
+    try { gradingCount.value = (await pendingExams()).reduce((n, e) => n + e.pending_answers, 0) } catch { /* the badge is optional */ }
+  }
   try {
     // Teachers/students see the institutions of the type they registered with.
     institutions.value = await listInstitutions(auth.profile?.institution_type ?? undefined)
@@ -70,6 +75,7 @@ async function logout() {
         <router-link to="/platform/teachers" class="btn-tonal">{{ pt('browseTeachers') }}</router-link>
         <router-link v-if="auth.role === 'teacher'" to="/platform/teaching" class="btn-tonal">{{ pt('myTeaching') }}</router-link>
         <router-link v-if="auth.role === 'teacher'" to="/platform/my-content" class="btn-filled">{{ pt('myContent') }}</router-link>
+        <router-link v-if="auth.role === 'teacher'" to="/platform/grading" class="btn-tonal" data-testid="home-grading">{{ pt('gdTeacherLink') }}<span v-if="gradingCount" class="ms-2 px-2 rounded-full text-xs font-bold" style="background-color: rgb(var(--md-primary)); color: rgb(var(--md-on-primary))" data-testid="home-grading-n">{{ gradingCount }}</span></router-link>
         <router-link to="/platform/profile" class="btn-outlined">{{ pt('myProfile') }}</router-link>
         <router-link to="/platform/account" class="btn-outlined">{{ pt('accountSettings') }}</router-link>
       </nav>

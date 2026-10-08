@@ -19,3 +19,6 @@ argon2 = "0.5"
 url = "2"
 ring = "0.17"
 base64 = "0.22"
+
+[dev-dependencies]
+csv = "1"

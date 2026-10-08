@@ -237,6 +237,18 @@ const router = createRouter({
       ],
     },
     {
+      path: '/platform/grading',
+      name: 'platform-grading',
+      component: () => import('@/views/platform/GradingQueueView.vue'),
+      meta: { title: 'Grading', requiresAuth: true, requiresActive: true, roles: ['teacher', 'admin'] },
+    },
+    {
+      path: '/platform/grading/:id',
+      name: 'platform-grade-exam',
+      component: () => import('@/views/platform/GradeExamView.vue'),
+      meta: { title: 'Grading', requiresAuth: true, requiresActive: true, roles: ['teacher', 'admin'] },
+    },
+    {
       path: '/platform',
       name: 'platform-home',
       component: () => import('@/views/platform/PlatformHomeView.vue'),

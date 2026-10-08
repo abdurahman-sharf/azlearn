@@ -234,6 +234,8 @@ pub struct Stats {
     users: serde_json::Value,
     pending_teachers: i64,
     pending_teaching: i64,
+    /// Written answers waiting for a manual grade (all exams).
+    pending_grading: i64,
     open_reports: i64,
     signups_7d: i64,
     institutions: serde_json::Value,
@@ -262,6 +264,7 @@ fn stats(conn: &Connection, now: i64) -> Res<Stats> {
         users: grouped(conn, "SELECT role, count(*) FROM users GROUP BY role")?,
         pending_teachers: count(conn, "SELECT count(*) FROM users WHERE role = 'teacher' AND status = 'pending'")?,
         pending_teaching: count(conn, "SELECT count(*) FROM teacher_subjects WHERE status = 'pending'")?,
+        pending_grading: count(conn, "SELECT COALESCE(SUM(pending), 0) FROM attempts WHERE status = 'submitted'")?,
         open_reports: count(conn, "SELECT count(DISTINCT target_type || target_id) FROM reports WHERE status = 'open'")?,
         signups_7d: conn
             .query_row("SELECT count(*) FROM users WHERE created_at > ?1", params![now - 7 * 86_400_000], |r| r.get(0))

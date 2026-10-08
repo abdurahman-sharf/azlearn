@@ -19,6 +19,7 @@ interface Item { to: string; label: PlatformKey; badge?: number; exact?: boolean
 const items = computed<Item[]>(() => [
   { to: '/platform/admin', label: 'adminOverview', exact: true, testid: 'nav-overview' },
   { to: '/platform/admin/exams', label: 'exTitle', testid: 'nav-exams' },
+  { to: '/platform/grading', label: 'navGrading', badge: stats.value?.pending_grading, testid: 'nav-grading' },
   { to: '/platform/admin/bank', label: 'bankTitle', testid: 'nav-bank' },
   { to: '/platform/admin/users', label: 'adminUsers', badge: stats.value?.pending_teachers, testid: 'nav-users' },
   { to: '/platform/admin/teaching', label: 'adminTeaching', badge: stats.value?.pending_teaching, testid: 'nav-teaching' },

@@ -183,11 +183,11 @@ pub(crate) fn round2(x: f64) -> f64 {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct Outcome {
-    id: String,
-    correct: Option<bool>,
-    points: f64,
-    max: f64,
+pub(crate) struct Outcome {
+    pub(crate) id: String,
+    pub(crate) correct: Option<bool>,
+    pub(crate) points: f64,
+    pub(crate) max: f64,
 }
 
 fn grade_all(questions: &[Question], answers: &HashMap<String, String>) -> (Vec<Outcome>, f64, i64) {
@@ -291,6 +291,13 @@ pub struct AssessmentInfo {
     pub(crate) closed_at: Option<i64>,
     pub(crate) archived_at: Option<i64>,
     pub(crate) created_by: Option<String>,
+}
+
+impl AssessmentInfo {
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> String {
+        self.id.clone()
+    }
 }
 
 pub(crate) const INFO_SELECT: &str = "SELECT a.id, a.teacher_id, COALESCE(u.full_name, cb.full_name, ''), a.subject_id, s.name_ar, a.title, a.description, a.question_count,
@@ -455,6 +462,28 @@ pub(crate) fn owner_of(conn: &Connection, id: &str) -> Res<Option<String>> {
         .optional()
         .map_err(db_err)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))
+}
+
+/// Who may grade and see the results of an exam: any admin; the owning teacher of a teacher's exam;
+/// for an admin-created exam (no owner) any active teacher approved for its subject (PRD G2).
+pub(crate) fn can_grade(conn: &Connection, user: &User, assessment_id: &str) -> Res<bool> {
+    if user.role == "admin" {
+        return Ok(true);
+    }
+    if user.role != "teacher" {
+        return Ok(false);
+    }
+    match owner_of(conn, assessment_id)? {
+        Some(owner) => Ok(owner == user.id),
+        None => conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM assessments a JOIN teacher_subjects ts ON ts.subject_id = a.subject_id
+                  WHERE a.id = ?1 AND ts.teacher_id = ?2 AND ts.status = 'approved')",
+                params![assessment_id, user.id],
+                |r| r.get(0),
+            )
+            .map_err(db_err),
+    }
 }
 
 fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq) -> Res<AssessmentInfo> {
@@ -920,7 +949,7 @@ fn is_released(release_mode: &str, status: &str, closes_at: Option<i64>, now: i6
     release_mode != "after_close" || matches!(status, "closed" | "archived") || closes_at.map_or(false, |c| c <= now)
 }
 
-fn passed_flag(score: f64, total: f64, pending: i64, pass_mark: Option<f64>) -> Option<bool> {
+pub(crate) fn passed_flag(score: f64, total: f64, pending: i64, pass_mark: Option<f64>) -> Option<bool> {
     let pm = pass_mark?;
     if pending > 0 || total <= 0.0 {
         return None;
@@ -981,7 +1010,7 @@ fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str) -> Res<Att
         .map_err(db_err)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
     let (assessment_id, student_id, status, score, pending, started_at, submitted_at, answers_raw, results_raw, title, total, show, teacher_id, student_name, release_mode, exam_status, closes_at, pass_mark, tab_leaves) = row;
-    let is_owner = teacher_id.as_deref() == Some(viewer.id.as_str()) || viewer.role == "admin";
+    let is_owner = teacher_id.as_deref() == Some(viewer.id.as_str()) || viewer.role == "admin" || (viewer.role == "teacher" && teacher_id.is_none() && can_grade(conn, viewer, &assessment_id)?);
     if student_id != viewer.id && !is_owner {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
@@ -1047,26 +1076,32 @@ pub struct GradeReq {
     pub(crate) grades: HashMap<String, f64>,
 }
 
-pub(crate) fn grade_attempt(conn: &Connection, teacher: &User, attempt_id: &str, g: &GradeReq) -> Res<AttemptResult> {
-    let (assessment_id, student_id, status, results_raw): (String, String, String, String) = conn
-        .query_row("SELECT assessment_id, student_id, status, results FROM attempts WHERE id = ?1", params![attempt_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+pub(crate) fn grade_attempt(conn: &Connection, grader: &User, attempt_id: &str, g: &GradeReq) -> Res<AttemptResult> {
+    let (assessment_id, student_id, status, results_raw, answers_raw): (String, String, String, String, String) = conn
+        .query_row("SELECT assessment_id, student_id, status, results, answers FROM attempts WHERE id = ?1", params![attempt_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })
         .optional()
         .map_err(db_err)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
-    // The owning teacher or an admin grades; admin exams (no owner) are graded by admins.
-    if owner_of(conn, &assessment_id)?.as_deref() != Some(teacher.id.as_str()) && teacher.role != "admin" {
+    if !can_grade(conn, grader, &assessment_id)? {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
     if status != "submitted" {
         return Err(err(StatusCode::CONFLICT, "not_submitted"));
     }
+    let questions = load_questions(conn, &assessment_id)?;
+    let answers: HashMap<String, String> = serde_json::from_str(&answers_raw).unwrap_or_default();
     let mut outcomes: Vec<Outcome> = serde_json::from_str(&results_raw).map_err(db_err)?;
+    let pending_before = outcomes.iter().filter(|o| o.correct.is_none()).count();
     for (qid, pts) in &g.grades {
+        let q = questions.iter().find(|q| &q.id == qid).ok_or_else(|| bad("invalid_question_id"))?;
         let o = outcomes.iter_mut().find(|o| &o.id == qid).ok_or_else(|| bad("invalid_question_id"))?;
-        if o.correct.is_some() {
-            return Err(bad("not_gradable")); // only pending short answers can be graded by hand
+        // Only written (short) answers are graded by hand; a grade can be corrected later, but a blank
+        // answer stays 0 and objective questions are never overridden.
+        let written = answers.get(qid).map_or(false, |a| !a.trim().is_empty());
+        if q.qtype != QuestionType::ShortAnswer || !written {
+            return Err(bad("not_gradable"));
         }
         if !pts.is_finite() || *pts < 0.0 || *pts > o.max {
             return Err(bad("invalid_points"));
@@ -1081,11 +1116,12 @@ pub(crate) fn grade_attempt(conn: &Connection, teacher: &User, attempt_id: &str,
         params![serde_json::to_string(&outcomes).map_err(db_err)?, score, pending, attempt_id],
     )
     .map_err(db_err)?;
-    if pending == 0 && !g.grades.is_empty() {
+    // tell the student once, when the last pending answer gets its grade (not on later corrections)
+    if pending == 0 && pending_before > 0 {
         let title: String = conn.query_row("SELECT title FROM assessments WHERE id = ?1", params![assessment_id], |r| r.get(0)).map_err(db_err)?;
         crate::platform_engage::notify(conn, &student_id, "assessment_graded", json!({ "title": title }), &format!("/platform/attempts/{attempt_id}"));
     }
-    attempt_result(conn, teacher, attempt_id)
+    attempt_result(conn, grader, attempt_id)
 }
 
 #[derive(Serialize, Debug)]
@@ -1114,8 +1150,7 @@ pub struct ResultsSummary {
 }
 
 fn results_summary(conn: &Connection, user: &User, id: &str, now: i64) -> Res<ResultsSummary> {
-    let owner = owner_of(conn, id)?;
-    if owner.as_deref() != Some(user.id.as_str()) && user.role != "admin" {
+    if !can_grade(conn, user, id)? {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
     let info = get_info(conn, &user.id, id)?;
@@ -1266,7 +1301,7 @@ pub async fn detail_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(i
     let u = require_active(&s, &h)?;
     let conn = lock(&s)?;
     let info = get_info(&conn, &u.id, &id)?;
-    let is_owner = info.teacher_id.as_deref() == Some(u.id.as_str()) || u.role == "admin";
+    let is_owner = info.teacher_id.as_deref() == Some(u.id.as_str()) || u.role == "admin" || (u.role == "teacher" && info.teacher_id.is_none() && can_grade(&conn, &u, &id)?);
     if !is_owner && !publicly_visible(&conn, &id)? {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }

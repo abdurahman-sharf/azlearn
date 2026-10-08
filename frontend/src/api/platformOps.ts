@@ -6,7 +6,7 @@ export interface ReportRow {
   reporter: string; status: 'open' | 'resolved' | 'dismissed'; note: string | null; created_at: number; open_reports_on_target: number
 }
 export interface Stats {
-  users: Record<string, number>; pending_teachers: number; pending_teaching: number; open_reports: number
+  users: Record<string, number>; pending_teachers: number; pending_teaching: number; pending_grading: number; open_reports: number
   signups_7d: number; institutions: Record<string, number>; subjects: number; attempts_submitted: number
   content: { posts: number; courses: number; lessons: number; live: number; assessments: number }
 }
