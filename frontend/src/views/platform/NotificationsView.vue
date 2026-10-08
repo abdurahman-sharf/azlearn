@@ -4,12 +4,18 @@ import { useRouter } from 'vue-router'
 import { useI18nStore } from '@/stores/i18n'
 import { usePt, platformErrorMessage, formatNotification } from '@/i18n/platform'
 import { notifications, markRead, type NotificationList } from '@/api/platformEngage'
+import { useAuthStore } from '@/stores/auth'
+import { useTeacherStats } from '@/lib/teacherStats'
 
 const pt = usePt()
 const i18n = useI18nStore()
 const router = useRouter()
 const list = ref<NotificationList>({ unread: 0, items: [] })
 const error = ref('')
+// the teacher's sidebar shows the unread count: reading here must update it without waiting for the next page change
+const auth = useAuthStore()
+const { refresh: refreshBadges } = useTeacherStats()
+const syncBadge = () => { if (auth.role === 'teacher') refreshBadges() }
 
 const fmt = (ms: number) => new Date(ms).toLocaleString(i18n.locale === 'ar' ? 'ar' : undefined, { dateStyle: 'medium', timeStyle: 'short' })
 
@@ -23,7 +29,7 @@ async function load() {
 
 async function open(n: NotificationList['items'][number]) {
   try {
-    if (!n.read) await markRead([n.id])
+    if (!n.read) { await markRead([n.id]); syncBadge() }
   } catch { /* opening the link matters more than the read flag */ }
   if (n.link && n.link.startsWith('/')) router.push(n.link)
   else await load()
@@ -33,6 +39,7 @@ async function readAll() {
   try {
     await markRead()
     await load()
+    syncBadge()
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
   }

@@ -8,6 +8,7 @@ import ReviewsPanel from '@/components/platform/ReviewsPanel.vue'
 import ContentLists from '@/components/platform/ContentLists.vue'
 import { teacherContent, type Bundle } from '@/api/platformContent'
 import { getTeacher, follow, unfollow, type TeacherPage } from '@/api/platformLearning'
+import PageError from '@/components/platform/PageError.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -42,9 +43,9 @@ onMounted(load)
 <template>
   <div v-if="teacher" class="max-w-3xl mx-auto pb-8">
     <router-link to="/platform/teachers" class="text-body-sm underline">{{ pt('browseTeachers') }}</router-link>
-    <h1 class="text-display-sm font-bold tracking-tight mt-3">{{ teacher.full_name }}</h1>
-    <p class="text-body-sm mb-3" style="color: rgb(var(--md-on-surface-variant))">{{ teacher.followers }} {{ pt('followers') }}</p>
-    <p v-if="teacher.bio" class="text-body-lg mb-4 whitespace-pre-line">{{ teacher.bio }}</p>
+    <h1 class="text-display-sm font-bold tracking-tight mt-3" dir="auto">{{ teacher.full_name }}</h1>
+    <p class="text-body-sm mb-3" style="color: rgb(var(--md-on-surface-variant))"><span dir="ltr" class="inline-block">{{ teacher.followers }}</span> {{ pt('followers') }}</p>
+    <p v-if="teacher.bio" class="text-body-lg mb-4 whitespace-pre-line" dir="auto" data-testid="teacher-bio">{{ teacher.bio }}</p>
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
     <button v-if="auth.role === 'student'" :class="teacher.following ? 'btn-outlined' : 'btn-filled'" class="mb-6" @click="toggleFollow">
       {{ teacher.following ? pt('unfollow') : pt('follow') }}
@@ -67,5 +68,5 @@ onMounted(load)
       </li>
     </ul>
   </div>
-  <p v-else-if="error" class="max-w-3xl mx-auto" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+  <PageError v-else-if="error" :message="error" back-to="/platform/teachers" />
 </template>

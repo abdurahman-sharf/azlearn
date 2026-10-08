@@ -5,6 +5,7 @@ import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
 import ReportButton from '@/components/platform/ReportButton.vue'
 import { getPost, updatePost, deletePost, downloadFile, type Post } from '@/api/platformContent'
+import PageError from '@/components/platform/PageError.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -38,7 +39,7 @@ onMounted(load)
 <template>
   <div v-if="post" class="max-w-3xl mx-auto pb-8">
     <router-link :to="`/platform/subjects/${post.subject_id}`" class="text-body-sm underline">{{ post.subject_name }}</router-link>
-    <h1 class="text-display-sm font-bold tracking-tight mt-3 break-words">{{ post.title }}</h1>
+    <h1 class="text-display-sm font-bold tracking-tight mt-3 break-words" dir="auto">{{ post.title }}</h1>
     <p class="text-body-sm mb-4" style="color: rgb(var(--md-on-surface-variant))">
       {{ post.kind === 'summary' ? pt('kindSummary') : pt('kindArticle') }} · {{ pt('by') }}
       <router-link :to="`/platform/teachers/${post.teacher_id}`" class="underline">{{ post.teacher_name }}</router-link>
@@ -60,5 +61,5 @@ onMounted(load)
       </template>
     </div>
   </div>
-  <p v-else-if="error" class="max-w-3xl mx-auto" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+  <PageError v-else-if="error" :message="error" />
 </template>

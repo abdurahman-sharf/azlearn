@@ -450,8 +450,14 @@ pub(crate) fn create_assessment(conn: &Connection, teacher: &User, r: &Assessmen
 }
 
 /// Tells the audience about a newly published exam and records when (`published_at`).
+/// Only the **first** publication announces: `published_at` is claimed with a conditional update and never
+/// overwritten, so unpublishing and publishing again (or flipping draft/published while editing) does not
+/// notify every follower and enrolled student a second time.
 pub(crate) fn announce(conn: &Connection, teacher: &User, subject_id: &str, id: &str, title: &str, now: i64) {
-    let _ = conn.execute("UPDATE assessments SET published_at = ?2 WHERE id = ?1", params![id, now]);
+    let first = conn.execute("UPDATE assessments SET published_at = ?2 WHERE id = ?1 AND published_at IS NULL", params![id, now]).map_or(false, |n| n == 1);
+    if !first {
+        return;
+    }
     crate::platform_engage::notify_audience(
         conn,
         &teacher.id,
@@ -526,6 +532,11 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
     if !["draft", "published"].contains(&status.as_str()) {
         return Err(bad("invalid_status"));
     }
+    // Students already sat (or are sitting) this exam: pulling it back to a draft would hide it from them mid-way.
+    // Closing it is the way to stop new attempts (admins have their own lifecycle actions for that).
+    if status == "draft" && cur.status != "draft" && cur.attempt_count > 0 {
+        return Err(err(StatusCode::CONFLICT, "has_attempts"));
+    }
     if status == "published" && is_owner {
         let ok: bool = conn
             .query_row(
@@ -566,14 +577,50 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
     get_info(conn, &user.id, id)
 }
 
+/// Deleting an exam takes every attempt and grade with it (`ON DELETE CASCADE`), so an exam that students have
+/// already sat can never be deleted here — not by its teacher, and not by an admin through this legacy route
+/// (an admin removes it from the admin screen, which asks for the exam's title first). Closing or archiving
+/// is the way to retire such an exam.
 fn delete_assessment(conn: &Connection, user: &User, id: &str) -> Res<()> {
     let owner = owner_of(conn, id)?;
     if owner.as_deref() != Some(user.id.as_str()) && user.role != "admin" {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
+    let attempts: i64 = conn.query_row("SELECT count(*) FROM attempts WHERE assessment_id = ?1", params![id], |r| r.get(0)).map_err(db_err)?;
+    if attempts > 0 {
+        return Err(err(StatusCode::CONFLICT, "has_attempts"));
+    }
     conn.execute("DELETE FROM assessments WHERE id = ?1", params![id]).map_err(db_err)?;
-    audit(conn, &user.id, id, "assessment_deleted", "");
+    audit(conn, &user.id, id, "assessment_deleted", &format!("attempts={attempts}"));
     Ok(())
+}
+
+// ───────── "may teachers create exams?" (teachers.can_create_exams) ─────────
+
+/// 403 `exams_disabled` while the admin has explicitly switched teacher exams off (unset = on).
+/// Enforced by the HTTP entry points below, not inside `create_assessment`/`update_assessment`, which
+/// stay pure so other modules and tests can call them directly.
+pub(crate) fn ensure_exams_enabled(conn: &Connection, crypto: &crate::platform_settings::Crypto) -> Res<()> {
+    if crate::platform_ai::exams_enabled(conn, crypto)? {
+        Ok(())
+    } else {
+        Err(err(StatusCode::FORBIDDEN, "exams_disabled"))
+    }
+}
+
+/// Creating an exam (draft or published) needs the switch to be on.
+pub(crate) fn create_checked(conn: &Connection, crypto: &crate::platform_settings::Crypto, teacher: &User, r: &AssessmentReq) -> Res<AssessmentInfo> {
+    ensure_exams_enabled(conn, crypto)?;
+    create_assessment(conn, teacher, r)
+}
+
+/// Moving an exam to `published` needs the switch to be on. Everything else stays possible with it off:
+/// editing, closing, and managing an exam that is already published (switching off stops *new* exams only).
+pub(crate) fn update_checked(conn: &Connection, crypto: &crate::platform_settings::Crypto, user: &User, id: &str, r: &AssessmentReq) -> Res<AssessmentInfo> {
+    if r.status.as_deref() == Some("published") && get_info(conn, "", id)?.status != "published" {
+        ensure_exams_enabled(conn, crypto)?;
+    }
+    update_assessment(conn, user, id, r)
 }
 
 // ───────── student: start / submit ─────────
@@ -1287,12 +1334,12 @@ fn my_attempts(conn: &Connection, student_id: &str, assessment_id: Option<&str>)
 
 pub async fn create_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Json(r): Json<AssessmentReq>) -> Res<(StatusCode, Json<AssessmentInfo>)> {
     let u = require_role(&s, &h, "teacher")?;
-    create_assessment(&*lock(&s)?, &u, &r).map(|i| (StatusCode::CREATED, Json(i)))
+    create_checked(&*lock(&s)?, &s.platform.crypto, &u, &r).map(|i| (StatusCode::CREATED, Json(i)))
 }
 
 pub async fn update_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>, Json(r): Json<AssessmentReq>) -> Res<Json<AssessmentInfo>> {
     let u = require_active(&s, &h)?;
-    update_assessment(&*lock(&s)?, &u, &id, &r).map(Json)
+    update_checked(&*lock(&s)?, &s.platform.crypto, &u, &id, &r).map(Json)
 }
 
 pub async fn delete_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>) -> Res<StatusCode> {
@@ -1590,10 +1637,180 @@ mod tests {
         start_attempt(&w.conn, &w.student, &w.id, now_ms()).unwrap();
         let replace = AssessmentReq { questions: Some(questions()), title: None, ..patch("") };
         assert_eq!(update_assessment(&w.conn, &w.teacher, &w.id, &replace).unwrap_err().0, StatusCode::CONFLICT);
-        // deleting cascades attempts
-        delete_assessment(&w.conn, &w.teacher, &w.id).unwrap();
+        // phase 3-1: deleting would cascade every attempt and grade away, so it is refused while attempts exist
+        // (this used to delete them; the dedicated rules are covered in `safety_tests`)
+        assert_eq!(delete_assessment(&w.conn, &w.teacher, &w.id).unwrap_err().0, StatusCode::CONFLICT);
         let n: i64 = w.conn.query_row("SELECT count(*) FROM attempts", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 0);
+        assert_eq!(n, 1, "the attempt survived the refused delete");
+    }
+
+    // ───── phase 3-1: the teachers.can_create_exams switch and exam safety ─────
+
+    fn crypto() -> crate::platform_settings::Crypto {
+        crate::platform_settings::Crypto::for_tests()
+    }
+
+    fn switch(w: &W, on: bool) {
+        let req: crate::platform_ai::SettingsReq = serde_json::from_value(json!({ "teachers_can_create_exams": on })).unwrap();
+        crate::platform_ai::apply_settings(&w.conn, &crypto(), &w.admin.id, &req).unwrap();
+    }
+
+    fn exam_req(status: &str) -> AssessmentReq {
+        AssessmentReq {
+            subject_id: Some("s1".into()), title: Some("امتحان جديد".into()), description: None, questions: Some(questions()), duration_min: None,
+            opens_at: None, closes_at: None, max_attempts: Some(1), show_answers: None, status: Some(status.into()), clear_duration: None, clear_window: None,
+        }
+    }
+
+    fn status_patch(status: &str) -> AssessmentReq {
+        AssessmentReq {
+            subject_id: None, title: None, description: None, questions: None, duration_min: None, opens_at: None, closes_at: None,
+            max_attempts: None, show_answers: None, status: Some(status.into()), clear_duration: None, clear_window: None,
+        }
+    }
+
+    fn code(e: &crate::relay::Err) -> String {
+        serde_json::from_str::<serde_json::Value>(&e.1).unwrap()["error"].as_str().unwrap_or("").to_string()
+    }
+
+    fn status_of(w: &W, id: &str) -> String {
+        w.conn.query_row("SELECT status FROM assessments WHERE id = ?1", params![id], |r| r.get(0)).unwrap()
+    }
+
+    fn announcements(w: &W) -> i64 {
+        w.conn.query_row("SELECT count(*) FROM notifications WHERE user_id = ?1 AND kind = 'new_assessment'", params![w.student.id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn an_unset_switch_means_teachers_may_create_and_publish() {
+        let w = world(true, None, 1);
+        assert!(crate::platform_ai::exams_enabled(&w.conn, &crypto()).unwrap(), "nothing saved = enabled");
+        let made = create_checked(&w.conn, &crypto(), &w.teacher, &exam_req("draft")).unwrap();
+        assert_eq!(update_checked(&w.conn, &crypto(), &w.teacher, &made.id, &status_patch("published")).unwrap().status, "published");
+        switch(&w, true);
+        create_checked(&w.conn, &crypto(), &w.teacher, &exam_req("published")).expect("an explicit on works too");
+    }
+
+    #[test]
+    fn switching_exams_off_blocks_creating_and_publishing_with_exams_disabled() {
+        let w = world(true, None, 1);
+        let draft = create_checked(&w.conn, &crypto(), &w.teacher, &exam_req("draft")).unwrap().id;
+        switch(&w, false);
+        let before: i64 = w.conn.query_row("SELECT count(*) FROM assessments", [], |r| r.get(0)).unwrap();
+        for status in ["draft", "published"] {
+            let e = create_checked(&w.conn, &crypto(), &w.teacher, &exam_req(status)).unwrap_err();
+            assert_eq!((e.0, code(&e).as_str()), (StatusCode::FORBIDDEN, "exams_disabled"), "creating as {status}");
+        }
+        let after: i64 = w.conn.query_row("SELECT count(*) FROM assessments", [], |r| r.get(0)).unwrap();
+        assert_eq!(after, before, "nothing was created");
+        // moving a draft to published is refused too — including by an admin using the legacy route
+        for who in [&w.teacher, &w.admin] {
+            let e = update_checked(&w.conn, &crypto(), who, &draft, &status_patch("published")).unwrap_err();
+            assert_eq!((e.0, code(&e).as_str()), (StatusCode::FORBIDDEN, "exams_disabled"), "publishing as {}", who.role);
+        }
+        assert_eq!(status_of(&w, &draft), "draft");
+        // back on: both work again
+        switch(&w, true);
+        create_checked(&w.conn, &crypto(), &w.teacher, &exam_req("published")).unwrap();
+        assert_eq!(update_checked(&w.conn, &crypto(), &w.teacher, &draft, &status_patch("published")).unwrap().status, "published");
+    }
+
+    #[test]
+    fn switching_exams_off_leaves_existing_exams_manageable() {
+        let w = world(true, None, 1);
+        let draft = create_checked(&w.conn, &crypto(), &w.teacher, &exam_req("draft")).unwrap().id;
+        let second = create_checked(&w.conn, &crypto(), &w.teacher, &exam_req("published")).unwrap().id;
+        switch(&w, false);
+        // a published exam keeps working: edits (even when the editor re-sends status "published") and students taking it
+        let edit = AssessmentReq { title: Some("عنوان جديد".into()), ..status_patch("published") };
+        assert_eq!(update_checked(&w.conn, &crypto(), &w.teacher, &w.id, &edit).unwrap().title, "عنوان جديد");
+        assert!(start_attempt(&w.conn, &w.student, &w.id, now_ms()).is_ok(), "students can still take a published exam");
+        // drafts stay editable and deletable
+        let edit_draft = AssessmentReq { title: Some("مسودة معدلة".into()), ..status_patch("draft") };
+        assert_eq!(update_checked(&w.conn, &crypto(), &w.teacher, &draft, &edit_draft).unwrap().title, "مسودة معدلة");
+        delete_assessment(&w.conn, &w.teacher, &draft).unwrap();
+        // and an admin can still moderate (unpublish) a teacher's exam that has no attempts
+        assert_eq!(update_checked(&w.conn, &crypto(), &w.admin, &second, &status_patch("draft")).unwrap().status, "draft");
+    }
+
+    #[test]
+    fn an_exam_that_students_have_sat_can_never_be_deleted() {
+        let w = world(true, None, 3);
+        let now = now_ms();
+        // without attempts: the owner can delete (audited with the attempt count) and so can an admin
+        let spare = create_assessment(&w.conn, &w.teacher, &exam_req("draft")).unwrap().id;
+        delete_assessment(&w.conn, &w.teacher, &spare).unwrap();
+        let detail: String = w.conn.query_row("SELECT detail FROM audit_log WHERE action = 'assessment_deleted' AND target_id = ?1", params![spare], |r| r.get(0)).unwrap();
+        assert_eq!(detail, "attempts=0");
+        let spare2 = create_assessment(&w.conn, &w.teacher, &exam_req("draft")).unwrap().id;
+        delete_assessment(&w.conn, &w.admin, &spare2).unwrap();
+        // an attempt in progress already counts
+        let st = start_attempt(&w.conn, &w.student, &w.id, now).unwrap();
+        for who in [&w.teacher, &w.admin] {
+            let e = delete_assessment(&w.conn, who, &w.id).unwrap_err();
+            assert_eq!((e.0, code(&e).as_str()), (StatusCode::CONFLICT, "has_attempts"), "{} / in progress", who.role);
+        }
+        // and so does a submitted one
+        submit_attempt(&w.conn, &w.student, &st.attempt_id, &ans(&[("q1", "B")]), now + 1000).unwrap();
+        for who in [&w.teacher, &w.admin] {
+            let e = delete_assessment(&w.conn, who, &w.id).unwrap_err();
+            assert_eq!((e.0, code(&e).as_str()), (StatusCode::CONFLICT, "has_attempts"), "{} / submitted", who.role);
+        }
+        let (exams, attempts): (i64, i64) = w.conn.query_row("SELECT (SELECT count(*) FROM assessments WHERE id = ?1), (SELECT count(*) FROM attempts)", params![w.id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((exams, attempts), (1, 1), "the exam, its attempt and the grade are all still there");
+        let refused: i64 = w.conn.query_row("SELECT count(*) FROM audit_log WHERE action = 'assessment_deleted' AND target_id = ?1", params![w.id], |r| r.get(0)).unwrap();
+        assert_eq!(refused, 0, "a refused delete is not recorded as a deletion");
+        // someone who owns nothing still gets 403, not a hint about attempts
+        let outsider = insert_test_user(&w.conn, "o@x.com", "teacher", "active");
+        assert_eq!(delete_assessment(&w.conn, &outsider, &w.id).unwrap_err().0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn only_the_first_publication_announces_and_published_at_is_never_overwritten() {
+        let w = world(true, None, 1);
+        assert_eq!(announcements(&w), 1, "created as published: announced once");
+        let stamp = |w: &W| -> Option<i64> { w.conn.query_row("SELECT published_at FROM assessments WHERE id = ?1", params![w.id], |r| r.get(0)).unwrap() };
+        let first = stamp(&w).expect("published_at is set by the announcement");
+        for round in 0..3 {
+            assert_eq!(update_assessment(&w.conn, &w.teacher, &w.id, &status_patch("draft")).unwrap().status, "draft");
+            assert_eq!(update_assessment(&w.conn, &w.teacher, &w.id, &status_patch("published")).unwrap().status, "published");
+            assert_eq!(announcements(&w), 1, "round {round}: publishing again does not notify again");
+            assert_eq!(stamp(&w), Some(first), "round {round}: the original publication time is kept");
+        }
+        // an exam from before published_at existed (NULL) is announced on its next publication — once
+        w.conn.execute("UPDATE assessments SET published_at = NULL WHERE id = ?1", params![w.id]).unwrap();
+        update_assessment(&w.conn, &w.teacher, &w.id, &status_patch("draft")).unwrap();
+        update_assessment(&w.conn, &w.teacher, &w.id, &status_patch("published")).unwrap();
+        assert_eq!((announcements(&w), stamp(&w).is_some()), (2, true));
+        update_assessment(&w.conn, &w.teacher, &w.id, &status_patch("draft")).unwrap();
+        update_assessment(&w.conn, &w.teacher, &w.id, &status_patch("published")).unwrap();
+        assert_eq!(announcements(&w), 2);
+        // a draft that is published later announces then, once
+        let later = create_assessment(&w.conn, &w.teacher, &exam_req("draft")).unwrap().id;
+        assert_eq!(announcements(&w), 2, "a draft announces nothing");
+        update_assessment(&w.conn, &w.teacher, &later, &status_patch("published")).unwrap();
+        assert_eq!(announcements(&w), 3);
+    }
+
+    #[test]
+    fn an_exam_students_have_started_cannot_be_pulled_back_to_a_draft() {
+        let w = world(true, None, 2);
+        // no attempts yet: back to draft is fine (and back again)
+        update_assessment(&w.conn, &w.teacher, &w.id, &status_patch("draft")).unwrap();
+        update_assessment(&w.conn, &w.teacher, &w.id, &status_patch("published")).unwrap();
+        start_attempt(&w.conn, &w.student, &w.id, now_ms()).unwrap();
+        for who in [&w.teacher, &w.admin] {
+            let e = update_assessment(&w.conn, who, &w.id, &status_patch("draft")).unwrap_err();
+            assert_eq!((e.0, code(&e).as_str()), (StatusCode::CONFLICT, "has_attempts"), "{}", who.role);
+        }
+        assert_eq!(status_of(&w, &w.id), "published", "still published");
+        // other edits keep working, including a PATCH that re-sends status "published"
+        let edit = AssessmentReq { title: Some("تعديل".into()), ..status_patch("published") };
+        assert_eq!(update_assessment(&w.conn, &w.teacher, &w.id, &edit).unwrap().title, "تعديل");
+        // a draft that already has attempts (older data) can still be edited without 409: nothing changes status
+        w.conn.execute("UPDATE assessments SET status = 'draft' WHERE id = ?1", params![w.id]).unwrap();
+        let edit = AssessmentReq { title: Some("تعديل آخر".into()), ..status_patch("draft") };
+        assert_eq!(update_assessment(&w.conn, &w.teacher, &w.id, &edit).unwrap().status, "draft");
     }
 }
 

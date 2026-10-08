@@ -25,3 +25,7 @@ export const search = (q: string) => platformFetch<SearchResults>(`/search?q=${e
 export const changePassword = (current: string, next: string) =>
   platformFetch<void>('/me/password', { body: { current, new: next } })
 export const deleteAccount = (password: string) => platformFetch<void>('/me', { method: 'DELETE', body: { password } })
+
+/** What deleting the caller's account would remove (the caller's own rows only; attempts = students' attempts on the caller's exams). */
+export interface DeletionImpact { exams: number; attempts: number; courses: number; posts: number; live: number }
+export const deletionImpact = () => platformFetch<DeletionImpact>('/me/deletion-impact')

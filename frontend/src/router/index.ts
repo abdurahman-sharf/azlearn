@@ -1,6 +1,9 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
-import { platformEnabled } from '@/lib/platformApi'
+import { platformEnabled, setUnauthorizedHandler } from '@/lib/platformApi'
+import { pendingTeacherMayEnter } from '@/utils/platformGuard'
+import { resetAdminStats } from '@/lib/adminStats'
+import { resetTeacherStats } from '@/lib/teacherStats'
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -256,6 +259,13 @@ const router = createRouter({
       meta: { title: 'Grading', requiresAuth: true, requiresActive: true, roles: ['teacher', 'admin'] },
     },
     {
+      // Teacher area home. Like the admin area, its sidebar is rendered by the app shell on every /platform page a teacher opens.
+      path: '/platform/teacher',
+      name: 'platform-teacher-home',
+      component: () => import('@/views/platform/TeacherOverviewView.vue'),
+      meta: { title: 'Overview', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+    },
+    {
       path: '/platform',
       name: 'platform-home',
       component: () => import('@/views/platform/PlatformHomeView.vue'),
@@ -295,7 +305,9 @@ const router = createRouter({
       path: '/platform/teaching',
       name: 'platform-teaching',
       component: () => import('@/views/platform/TeachingView.vue'),
-      meta: { title: 'platform-teaching', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      // pendingTeacherOk: a teacher whose account still awaits approval may already request subjects here
+      // (the server allows exactly this page's four calls for such an account, see `may_request_teaching`).
+      meta: { title: 'platform-teaching', requiresAuth: true, requiresActive: true, pendingTeacherOk: true, roles: ['teacher'] },
     },
     {
       path: '/platform/my-content',
@@ -432,11 +444,26 @@ router.beforeEach(async (to) => {
   await auth.init()
 
   if (to.meta.guestOnly) return auth.isLoggedIn ? '/platform' : true
-  if (!auth.isLoggedIn) return { path: '/auth/login', query: { redirect: to.fullPath } }
-  if (to.meta.requiresActive && auth.profile && !auth.isActive) return '/auth/pending'
+  if (!auth.isLoggedIn) return { path: '/auth/login', query: { redirect: to.fullPath, ...(auth.consumeSessionLost() ? { expired: '1' } : {}) } }
+  // An approved account has nothing to wait for any more (a reload or a bookmark of the waiting page must not strand it).
+  if (to.name === 'auth-pending' && auth.isActive) return '/platform'
+  const pendingOk = pendingTeacherMayEnter(to.meta, auth.role, auth.profile?.status)
+  if (to.meta.requiresActive && auth.profile && !auth.isActive && !pendingOk) return '/auth/pending'
   const roles = to.meta.roles as string[] | undefined
   if (roles && (!auth.role || !roles.includes(auth.role))) return '/platform'
   return true
+})
+
+// A request that carried a session the server no longer knows (expired, signed out elsewhere, suspended mid-session):
+// forget the local session and send the user to sign in again, coming back to the page they were on.
+setUnauthorizedHandler(() => {
+  useAuthStore().clearSession()
+  resetAdminStats()
+  resetTeacherStats()
+  const here = router.currentRoute.value
+  // Public pages (and the very first navigation, whose own guard redirects) stay where they are.
+  // `expired` makes the sign-in page say why the person is there (and, on an exam page, that the answers are kept).
+  if (here.meta.requiresAuth) router.replace({ path: '/auth/login', query: { redirect: here.fullPath, expired: '1' } })
 })
 
 export default router

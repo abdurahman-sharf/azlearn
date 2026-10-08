@@ -23,16 +23,16 @@ const empty = computed(() => !props.bundle.posts.length && !props.bundle.courses
         <li v-for="l in bundle.live" :key="l.id" class="card-filled p-3" :class="{ 'opacity-60': l.status === 'cancelled' }">
           <div class="flex items-start gap-2">
             <div class="flex-1 min-w-0">
-              <div class="font-bold break-words">{{ l.title }}</div>
+              <div class="font-bold break-words" dir="auto">{{ l.title }}</div>
               <div class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">
-                {{ fmt(l.starts_at) }} · {{ l.duration_min }} {{ pt('minutesShort') }} · {{ l.subject_name }} · {{ pt('by') }} {{ l.teacher_name }}
+                {{ fmt(l.starts_at) }} · <span dir="ltr" class="inline-block">{{ l.duration_min }}</span> {{ pt('minutesShort') }} · {{ l.subject_name }} · {{ pt('by') }} {{ l.teacher_name }}
               </div>
             </div>
             <span v-if="l.status === 'cancelled'" class="text-xs font-semibold px-2 py-0.5 rounded-full" style="background-color: rgb(var(--md-surface-container-high))">{{ pt('cancelled') }}</span>
           </div>
           <div class="flex flex-wrap gap-2 mt-2">
             <a v-if="l.status === 'scheduled'" :href="l.join_url" target="_blank" rel="noopener noreferrer" class="btn-tonal">{{ pt('join') }}</a>
-            <router-link v-if="showEdit" :to="`/platform/live/${l.id}/edit`" class="btn-text">{{ pt('edit') }}</router-link>
+            <router-link v-if="showEdit" :to="`/platform/live/${l.id}/edit`" class="btn-text" :aria-label="`${pt('edit')}: ${l.title}`">{{ pt('edit') }}</router-link>
           </div>
         </li>
       </ul>
@@ -43,11 +43,11 @@ const empty = computed(() => !props.bundle.posts.length && !props.bundle.courses
       <ul class="space-y-2">
         <li v-for="c in bundle.courses" :key="c.id" class="card-filled p-3 flex items-center gap-2">
           <router-link :to="`/platform/courses/${c.id}`" class="flex-1 min-w-0">
-            <div class="font-bold break-words">{{ c.title }}</div>
-            <div class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ c.lesson_count }} {{ pt('lessonsCount') }} · {{ c.subject_name }} · {{ pt('by') }} {{ c.teacher_name }}</div>
+            <div class="font-bold break-words" dir="auto">{{ c.title }}</div>
+            <div class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))"><span dir="ltr" class="inline-block">{{ c.lesson_count }}</span> {{ pt('lessonsCount') }} · {{ c.subject_name }} · {{ pt('by') }} {{ c.teacher_name }}</div>
           </router-link>
           <span v-if="showStatus" class="text-xs font-semibold px-2 py-0.5 rounded-full" style="background-color: rgb(var(--md-surface-container-high))">{{ pt(statusKey[c.status]!) }}</span>
-          <router-link v-if="showEdit" :to="`/platform/courses/${c.id}/edit`" class="btn-text">{{ pt('edit') }}</router-link>
+          <router-link v-if="showEdit" :to="`/platform/courses/${c.id}/edit`" class="btn-text" :aria-label="`${pt('edit')}: ${c.title}`">{{ pt('edit') }}</router-link>
         </li>
       </ul>
     </section>
@@ -57,12 +57,12 @@ const empty = computed(() => !props.bundle.posts.length && !props.bundle.courses
       <ul class="space-y-2">
         <li v-for="p in bundle.posts" :key="p.id" class="card-filled p-3 flex items-center gap-2">
           <router-link :to="`/platform/posts/${p.id}`" class="flex-1 min-w-0">
-            <div class="font-bold break-words">{{ p.title }}</div>
-            <div class="text-body-sm line-clamp-2" style="color: rgb(var(--md-on-surface-variant))">{{ p.excerpt }}</div>
+            <div class="font-bold break-words" dir="auto">{{ p.title }}</div>
+            <div class="text-body-sm line-clamp-2" dir="auto" style="color: rgb(var(--md-on-surface-variant))">{{ p.excerpt }}</div>
             <div class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ p.kind === 'summary' ? pt('kindSummary') : pt('kindArticle') }} · {{ p.subject_name }} · {{ pt('by') }} {{ p.teacher_name }}</div>
           </router-link>
           <span v-if="showStatus" class="text-xs font-semibold px-2 py-0.5 rounded-full" style="background-color: rgb(var(--md-surface-container-high))">{{ pt(statusKey[p.status]!) }}</span>
-          <router-link v-if="showEdit" :to="`/platform/posts/${p.id}/edit`" class="btn-text">{{ pt('edit') }}</router-link>
+          <router-link v-if="showEdit" :to="`/platform/posts/${p.id}/edit`" class="btn-text" :aria-label="`${pt('edit')}: ${p.title}`">{{ pt('edit') }}</router-link>
         </li>
       </ul>
     </section>

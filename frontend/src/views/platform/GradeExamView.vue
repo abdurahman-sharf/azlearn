@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
 import { gradeBatch, gradingSheet, type GradingQuestion, type GradingSheet } from '@/api/platformGrading'
+import PageError from '@/components/platform/PageError.vue'
 
 const pt = usePt()
 const route = useRoute()
@@ -125,5 +126,5 @@ async function save() {
       </div>
     </template>
   </div>
-  <p v-else-if="error" class="max-w-3xl mx-auto" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+  <PageError v-else-if="error" :message="error" back-to="/platform/grading" />
 </template>

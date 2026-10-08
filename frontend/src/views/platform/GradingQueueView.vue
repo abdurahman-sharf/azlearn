@@ -24,6 +24,7 @@ onMounted(async () => {
 
 <template>
   <div class="max-w-3xl mx-auto pb-12 space-y-4" data-testid="grading-queue">
+    <router-link v-if="error" to="/platform" class="text-body-sm underline">{{ pt('back') }}</router-link>
     <h1 class="text-display-sm font-bold tracking-tight">{{ pt('gdQueue') }}</h1>
     <p v-if="error" role="alert" class="text-body-md" style="color: rgb(var(--md-error))">{{ error }}</p>
     <p v-else-if="loaded && !items.length" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))" data-testid="queue-empty">{{ pt('gdQueueEmpty') }}</p>

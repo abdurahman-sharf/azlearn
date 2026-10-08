@@ -11,7 +11,6 @@ import ContentLists from '@/components/platform/ContentLists.vue'
 import { feed, type Bundle } from '@/api/platformContent'
 import { notifications, myProgress, type ProgressItem } from '@/api/platformEngage'
 import { myEnrollments, type EnrolledSubject } from '@/api/platformLearning'
-import { pendingExams } from '@/api/platformGrading'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -26,44 +25,54 @@ const unread = ref(0)
 const searchQ = ref('')
 const available = ref<AssessmentInfo[]>([])
 const progress = ref<ProgressItem[]>([])
-const gradingCount = ref(0)
+// Admins and teachers have their own home (with its own navigation); this page is the student's, so it only redirects them.
+const leaving = auth.role === 'admin' || auth.role === 'teacher'
 
 onMounted(async () => {
   if (auth.role === 'admin') { router.replace('/platform/admin'); return }
-  try {
-    unread.value = (await notifications()).unread
-  } catch { /* the bell is optional */ }
-  if (auth.role === 'teacher') {
-    try { gradingCount.value = (await pendingExams()).reduce((n, e) => n + e.pending_answers, 0) } catch { /* the badge is optional */ }
+  if (auth.role === 'teacher') { router.replace('/platform/teacher'); return }
+  notifications().then((n) => { unread.value = n.unread }).catch(() => { /* the bell is optional */ })
+  // Everyone sees the institutions of the type they registered with; students also get their learning feed. The
+  // requests run in parallel and are settled one by one: a section whose request failed reports the error, the
+  // others still show (one failing request must not blank the whole page).
+  const student = auth.role === 'student'
+  const [inst, enr, fd, prog, avail] = await Promise.allSettled([
+    listInstitutions(auth.profile?.institution_type ?? undefined),
+    student ? myEnrollments() : Promise.resolve([] as EnrolledSubject[]),
+    student ? feed() : Promise.resolve(null),
+    student ? myProgress() : Promise.resolve([] as ProgressItem[]),
+    student ? availableAssessments() : Promise.resolve([] as AssessmentInfo[]),
+  ])
+  const failures: unknown[] = []
+  const take = <T,>(r: PromiseSettledResult<T>, apply: (v: T) => void) => {
+    if (r.status === 'fulfilled') apply(r.value)
+    else failures.push(r.reason)
   }
-  try {
-    // Teachers/students see the institutions of the type they registered with.
-    institutions.value = await listInstitutions(auth.profile?.institution_type ?? undefined)
-    if (auth.role === 'student') {
-      enrolled.value = await myEnrollments()
-      feedBundle.value = await feed()
-      progress.value = await myProgress()
-      available.value = await availableAssessments()
-    }
-  } catch (e) {
-    error.value = platformErrorMessage(pt, e)
-  }
+  take(inst, (v) => { institutions.value = v })
+  take(enr, (v) => { enrolled.value = v })
+  take(fd, (v) => { if (v) feedBundle.value = v })
+  take(prog, (v) => { progress.value = v })
+  take(avail, (v) => { available.value = v })
+  if (failures.length) error.value = platformErrorMessage(pt, failures[0])
 })
 
 </script>
 
 <template>
-  <div class="max-w-3xl mx-auto pb-8">
+  <div v-if="!leaving" class="max-w-3xl mx-auto pb-8">
     <div class="flex items-center gap-3 mb-1">
       <h1 class="text-display-sm font-bold tracking-tight flex-1">{{ pt('platformHome') }}</h1>
-      <router-link to="/platform/notifications" class="btn-outlined relative" :aria-label="pt('notifications')">
+      <!-- no aria-label: the link's name is its text plus the unread count, so the count is announced -->
+      <router-link to="/platform/notifications" class="btn-outlined relative">
         {{ pt('notifications') }}
-        <span v-if="unread" data-testid="unread" class="ms-2 px-2 rounded-full text-xs font-bold" style="background-color: rgb(var(--md-primary)); color: rgb(var(--md-on-primary))">{{ unread }}</span>
+        <span v-if="unread" data-testid="unread" class="ms-2 px-2 rounded-full text-xs font-bold" style="background-color: rgb(var(--md-primary)); color: rgb(var(--md-on-primary))"><span dir="ltr" class="inline-block">{{ unread }}</span></span>
       </router-link>
     </div>
     <p class="text-body-lg mb-6" style="color: rgb(var(--md-on-surface-variant))">
       {{ pt('welcome') }} {{ auth.profile?.full_name }}
     </p>
+
+    <p v-if="error" class="text-body-sm mb-4" role="alert" style="color: rgb(var(--md-error))" data-testid="home-error">{{ error }}</p>
 
     <template v-if="auth.role !== 'admin'">
       <form class="mb-4" @submit.prevent="router.push({ path: '/platform/search', query: { q: searchQ } })">
@@ -71,9 +80,6 @@ onMounted(async () => {
       </form>
       <nav class="flex flex-wrap gap-2 mb-6" :aria-label="pt('quickLinks')">
         <router-link to="/platform/teachers" class="btn-tonal">{{ pt('browseTeachers') }}</router-link>
-        <router-link v-if="auth.role === 'teacher'" to="/platform/teaching" class="btn-tonal">{{ pt('myTeaching') }}</router-link>
-        <router-link v-if="auth.role === 'teacher'" to="/platform/my-content" class="btn-filled">{{ pt('myContent') }}</router-link>
-        <router-link v-if="auth.role === 'teacher'" to="/platform/grading" class="btn-tonal" data-testid="home-grading">{{ pt('gdTeacherLink') }}<span v-if="gradingCount" class="ms-2 px-2 rounded-full text-xs font-bold" style="background-color: rgb(var(--md-primary)); color: rgb(var(--md-on-primary))" data-testid="home-grading-n">{{ gradingCount }}</span></router-link>
         <router-link to="/platform/profile" class="btn-outlined">{{ pt('myProfile') }}</router-link>
         <router-link to="/platform/account" class="btn-outlined">{{ pt('accountSettings') }}</router-link>
       </nav>
@@ -118,8 +124,7 @@ onMounted(async () => {
 
       <section class="mb-6">
         <h2 class="text-title-md font-bold mb-3">{{ pt('yourInstitutions') }}</h2>
-        <p v-if="error" class="text-body-sm" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
-        <p v-else-if="!institutions.length" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))">{{ pt('noInstitutions') }}</p>
+        <p v-if="!institutions.length && !error" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))">{{ pt('noInstitutions') }}</p>
         <ul class="space-y-3">
           <li v-for="i in institutions" :key="i.id">
             <router-link :to="`/platform/institutions/${i.id}`" class="card-filled block p-4">

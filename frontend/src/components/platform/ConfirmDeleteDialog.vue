@@ -4,7 +4,8 @@ import { usePt } from '@/i18n/platform'
 import { useDialog } from '@/composables/useDialog'
 
 // Delete confirmation that says exactly what goes away. When `confirmName` is given (the item holds exam attempts)
-// the admin must type it first, like deleting an exam that has attempts.
+// the user must type it first, like deleting an exam that has attempts. `confirmKind="email"` is for typing an e-mail
+// address (account deletion): its own prompt, left-to-right, and case does not matter.
 const props = defineProps<{
   title: string
   message: string
@@ -12,6 +13,7 @@ const props = defineProps<{
   /** what survives the deletion, e.g. the subjects of a deleted level */
   kept?: string
   confirmName?: string
+  confirmKind?: 'name' | 'email'
   busy?: boolean
   error?: string
 }>()
@@ -22,7 +24,9 @@ const open = ref(true)
 const panel = ref<HTMLElement | null>(null)
 useDialog(open, panel, () => emit('close'))
 const typed = ref('')
-const allowed = computed(() => !props.confirmName || typed.value.trim() === props.confirmName.trim())
+const isEmail = computed(() => props.confirmKind === 'email')
+const norm = (v: string) => (isEmail.value ? v.trim().toLowerCase() : v.trim())
+const allowed = computed(() => !props.confirmName || norm(typed.value) === norm(props.confirmName))
 </script>
 
 <template>
@@ -37,8 +41,8 @@ const allowed = computed(() => !props.confirmName || typed.value.trim() === prop
       </ul>
       <p v-if="props.kept" class="text-body-sm" style="color: rgb(var(--md-on-surface))" data-testid="confirm-kept">{{ props.kept }}</p>
       <label v-if="props.confirmName" class="block">
-        <span class="text-label-lg">{{ pt('stcTypeName') }} <b dir="auto" class="inline-block">{{ props.confirmName }}</b></span>
-        <input v-model="typed" class="input-outlined w-full mt-1" autocomplete="off" data-autofocus data-testid="confirm-name" />
+        <span class="text-label-lg">{{ isEmail ? pt('delTypeEmail') : pt('stcTypeName') }} <b :dir="isEmail ? 'ltr' : 'auto'" class="inline-block">{{ props.confirmName }}</b></span>
+        <input v-model="typed" class="input-outlined w-full mt-1" :dir="isEmail ? 'ltr' : undefined" autocomplete="off" data-autofocus data-testid="confirm-name" />
       </label>
       <p v-if="props.error" role="alert" class="text-body-sm font-semibold" style="color: rgb(var(--md-error))">{{ props.error }}</p>
       <div class="flex gap-2 justify-end">

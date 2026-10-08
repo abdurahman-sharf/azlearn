@@ -45,7 +45,7 @@ export const listUsers = (f: { status?: string; role?: string; q?: string; limit
   platformFetch<Profile[]>(`/admin/users${qs({ ...f, limit: f.limit?.toString(), offset: f.offset?.toString() })}`)
 export const updateUser = (
   id: string,
-  patch: { role?: string; status?: string; status_reason?: string; full_name?: string; password?: string },
+  patch: { role?: string; status?: string; status_reason?: string; full_name?: string; password?: string; institution_type?: InstitutionType },
 ) => platformFetch<Profile>(`/admin/users/${id}`, { method: 'PATCH', body: patch })
 
 export const listInstitutions = (type?: InstitutionType) => platformFetch<Institution[]>(`/institutions${qs({ type })}`)

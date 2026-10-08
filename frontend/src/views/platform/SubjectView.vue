@@ -8,6 +8,7 @@ import { subjectAssessments, type AssessmentInfo } from '@/api/platformExams'
 import ContentLists from '@/components/platform/ContentLists.vue'
 import { subjectContent, type Bundle } from '@/api/platformContent'
 import { getSubject, enroll, unenroll, myTeaching, requestTeaching, type SubjectPage, type Teaching } from '@/api/platformLearning'
+import PageError from '@/components/platform/PageError.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -25,10 +26,17 @@ const teachingState = computed(() => mine.value?.status ?? null)
 async function load() {
   error.value = ''
   try {
-    subject.value = await getSubject(id)
-    content.value = await subjectContent(id)
-    assessments.value = await subjectAssessments(id)
-    if (auth.role === 'teacher') mine.value = (await myTeaching()).find(t => t.subject_id === id) ?? null
+    // independent requests: wait for them together
+    const [sub, cont, asm, teaching] = await Promise.all([
+      getSubject(id),
+      subjectContent(id),
+      subjectAssessments(id),
+      auth.role === 'teacher' ? myTeaching() : Promise.resolve(null),
+    ])
+    subject.value = sub
+    content.value = cont
+    assessments.value = asm
+    if (teaching) mine.value = teaching.find(t => t.subject_id === id) ?? null
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
   }
@@ -50,9 +58,9 @@ onMounted(load)
 <template>
   <div v-if="subject" class="max-w-3xl mx-auto pb-8">
     <router-link :to="`/platform/institutions/${subject.institution_id}`" class="text-body-sm underline">{{ subject.institution_name }}</router-link>
-    <h1 class="text-display-sm font-bold tracking-tight mt-3">{{ subject.name_ar }}</h1>
+    <h1 class="text-display-sm font-bold tracking-tight mt-3" dir="auto">{{ subject.name_ar }}</h1>
     <p v-if="subject.path.length" class="text-body-sm mb-1" style="color: rgb(var(--md-on-surface-variant))">{{ subject.path.join(' ‹ ') }}</p>
-    <p class="text-body-sm mb-4" style="color: rgb(var(--md-on-surface-variant))">{{ subject.enrolled_count }} {{ pt('enrolledCount') }}</p>
+    <p class="text-body-sm mb-4" style="color: rgb(var(--md-on-surface-variant))"><span dir="ltr" class="inline-block">{{ subject.enrolled_count }}</span> {{ pt('enrolledCount') }}</p>
 
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
 
@@ -87,11 +95,11 @@ onMounted(load)
     <ul class="space-y-3">
       <li v-for="t in subject.teachers" :key="t.id">
         <router-link :to="`/platform/teachers/${t.id}`" class="card-filled block p-4">
-          <div class="font-bold">{{ t.full_name }}</div>
-          <div v-if="t.bio" class="text-body-sm line-clamp-2" style="color: rgb(var(--md-on-surface-variant))">{{ t.bio }}</div>
+          <div class="font-bold" dir="auto">{{ t.full_name }}</div>
+          <div v-if="t.bio" class="text-body-sm line-clamp-2" dir="auto" style="color: rgb(var(--md-on-surface-variant))">{{ t.bio }}</div>
         </router-link>
       </li>
     </ul>
   </div>
-  <p v-else-if="error" class="max-w-3xl mx-auto" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+  <PageError v-else-if="error" :message="error" />
 </template>

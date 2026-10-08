@@ -62,13 +62,15 @@ pub async fn list_users_handler(
     list_users(&conn, &f).map(Json)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct UserPatch {
     role: Option<String>,
     status: Option<String>,
     status_reason: Option<String>,
     full_name: Option<String>,
     password: Option<String>,
+    /// `school` | `institute` | `university` (phase 3-1: an admin can correct the kind of institution a user named).
+    institution_type: Option<String>,
 }
 
 /// Applies an admin edit. `password_hash` is the already-hashed `patch.password`, if any.
@@ -101,6 +103,10 @@ fn update_user(conn: &Connection, actor: &User, id: &str, patch: &UserPatch, pas
         }
         None => target.full_name.clone(),
     };
+    let institution_type = match &patch.institution_type {
+        Some(t) => Some(crate::platform_learning::valid_institution_type(t)?.to_string()),
+        None => target.institution_type.clone(),
+    };
     let reason = if status == "rejected" || status == "suspended" {
         let r = patch.status_reason.clone().or(target.status_reason.clone()).unwrap_or_default();
         let r = r.trim().to_string();
@@ -113,15 +119,17 @@ fn update_user(conn: &Connection, actor: &User, id: &str, patch: &UserPatch, pas
     };
 
     conn.execute(
-        "UPDATE users SET role = ?1, status = ?2, status_reason = ?3, full_name = ?4 WHERE id = ?5",
-        params![role, status, reason, full_name, id],
+        "UPDATE users SET role = ?1, status = ?2, status_reason = ?3, full_name = ?4, institution_type = ?5 WHERE id = ?6",
+        params![role, status, reason, full_name, institution_type, id],
     )
     .map_err(db_err)?;
     if let Some(h) = password_hash {
         conn.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![h, id]).map_err(db_err)?;
     }
-    // Force re-login whenever access or credentials change.
-    if status != "active" || role != target.role || password_hash.is_some() {
+    // Force re-login whenever access or credentials change: the role changes, the password is reset, or the account
+    // *moves* to a non-active status. An edit that leaves a pending/rejected account where it is (a corrected name or
+    // institution type) must not sign the person out — a pending teacher's waiting page relies on its session.
+    if role != target.role || password_hash.is_some() || (status != target.status && status != "active") {
         conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![id]).map_err(db_err)?;
     }
     if role != target.role || status != target.status {
@@ -131,6 +139,15 @@ fn update_user(conn: &Connection, actor: &User, id: &str, patch: &UserPatch, pas
             id,
             "user_role_status_changed",
             &format!("{}/{} -> {}/{}", target.role, target.status, role, status),
+        );
+    }
+    if institution_type != target.institution_type {
+        audit(
+            conn,
+            &actor.id,
+            id,
+            "user_institution_type_changed",
+            &format!("{} -> {}", target.institution_type.as_deref().unwrap_or("-"), institution_type.as_deref().unwrap_or("-")),
         );
     }
     if password_hash.is_some() {
@@ -229,14 +246,15 @@ pub struct TypeFilter {
     kind_type: Option<String>,
 }
 
-/// Any active signed-in user may browse institutions; admins also see inactive ones.
+/// Any active signed-in user (and a teacher still awaiting approval, who has to find subjects to ask for) may browse
+/// institutions; admins also see inactive ones.
 pub async fn list_institutions_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(f): Query<TypeFilter>,
 ) -> Res<Json<Vec<Institution>>> {
     let user = authenticate(&state, &headers)?;
-    if user.status != "active" {
+    if !crate::platform_learning::may_browse_catalog(&user) {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
     let all = user.role == "admin";
@@ -267,7 +285,7 @@ pub async fn structure_handler(
     Path(id): Path<String>,
 ) -> Res<Json<Structure>> {
     let user = authenticate(&state, &headers)?;
-    if user.status != "active" {
+    if !crate::platform_learning::may_browse_catalog(&user) {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
     let all = user.role == "admin";
@@ -657,11 +675,11 @@ mod tests {
         let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
         let teacher = insert_test_user(&conn, "t@x.com", "teacher", "pending");
         conn.execute("INSERT INTO sessions VALUES ('h', ?1, 0, 9999999999999)", params![teacher.id]).unwrap();
-        let ok = update_user(&conn, &admin, &teacher.id, &UserPatch { role: None, status: Some("active".into()), status_reason: None, full_name: None, password: None }, None).unwrap();
+        let ok = update_user(&conn, &admin, &teacher.id, &UserPatch { status: Some("active".into()), ..Default::default() }, None).unwrap();
         assert_eq!(ok.status, "active");
         let sessions = || -> i64 { conn.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0)).unwrap() };
         assert_eq!(sessions(), 1, "approval keeps the teacher signed in");
-        let rej = update_user(&conn, &admin, &teacher.id, &UserPatch { role: None, status: Some("rejected".into()), status_reason: Some("وثائق ناقصة".into()), full_name: None, password: None }, None).unwrap();
+        let rej = update_user(&conn, &admin, &teacher.id, &UserPatch { status: Some("rejected".into()), status_reason: Some("وثائق ناقصة".into()), ..Default::default() }, None).unwrap();
         assert_eq!(rej.status_reason.as_deref(), Some("وثائق ناقصة"));
         assert_eq!(sessions(), 0, "rejection signs the user out");
         let audit_n: i64 = conn.query_row("SELECT count(*) FROM audit_log", [], |r| r.get(0)).unwrap();
@@ -672,12 +690,74 @@ mod tests {
     fn admin_cannot_change_own_role_or_status_and_invalid_values_rejected() {
         let conn = create_test_db();
         let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
-        let own = |role: Option<&str>, status: Option<&str>| UserPatch { role: role.map(Into::into), status: status.map(Into::into), status_reason: None, full_name: None, password: None };
+        let own = |role: Option<&str>, status: Option<&str>| UserPatch { role: role.map(Into::into), status: status.map(Into::into), ..Default::default() };
         assert_eq!(update_user(&conn, &admin, &admin.id, &own(Some("student"), None), None).unwrap_err().0, StatusCode::BAD_REQUEST);
         assert_eq!(update_user(&conn, &admin, &admin.id, &own(None, Some("suspended")), None).unwrap_err().0, StatusCode::BAD_REQUEST);
         let other = insert_test_user(&conn, "o@x.com", "student", "active");
         assert_eq!(update_user(&conn, &admin, &other.id, &own(Some("god"), None), None).unwrap_err().0, StatusCode::BAD_REQUEST);
         assert_eq!(update_user(&conn, &admin, "nope", &own(None, None), None).unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn admin_can_correct_a_users_institution_type_with_validation_and_an_audit_row() {
+        let conn = create_test_db();
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        let teacher = insert_test_user(&conn, "t@x.com", "teacher", "pending");
+        let inst = |c: &Connection| -> Option<String> { c.query_row("SELECT institution_type FROM users WHERE id = ?1", params![teacher.id], |r| r.get(0)).unwrap() };
+        let audits = |c: &Connection| -> i64 { c.query_row("SELECT count(*) FROM audit_log WHERE action = 'user_institution_type_changed'", [], |r| r.get(0)).unwrap() };
+        let set = |v: &str| UserPatch { institution_type: Some(v.into()), ..Default::default() };
+
+        let u = update_user(&conn, &admin, &teacher.id, &set("institute"), None).unwrap();
+        assert_eq!((u.institution_type.as_deref(), inst(&conn).as_deref(), audits(&conn)), (Some("institute"), Some("institute"), 1));
+        let detail: String = conn.query_row("SELECT detail FROM audit_log WHERE action = 'user_institution_type_changed'", [], |r| r.get(0)).unwrap();
+        assert_eq!(detail, "- -> institute");
+        // the same value again is not a change; a real change is audited with both values
+        update_user(&conn, &admin, &teacher.id, &set("institute"), None).unwrap();
+        assert_eq!(audits(&conn), 1);
+        update_user(&conn, &admin, &teacher.id, &set("university"), None).unwrap();
+        let last: String = conn.query_row("SELECT detail FROM audit_log WHERE action = 'user_institution_type_changed' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!((audits(&conn), last.as_str()), (2, "institute -> university"));
+        // invalid values are refused and change nothing — not even the other fields of the same patch
+        for bad_value in ["college", "", "University"] {
+            let patch = UserPatch { institution_type: Some(bad_value.into()), full_name: Some("اسم آخر".into()), status: Some("active".into()), ..Default::default() };
+            let e = update_user(&conn, &admin, &teacher.id, &patch, None).unwrap_err();
+            assert_eq!((e.0, e.1.contains("invalid_type")), (StatusCode::BAD_REQUEST, true), "{bad_value:?}");
+        }
+        let (name, status): (String, String) = conn.query_row("SELECT full_name, status FROM users WHERE id = ?1", params![teacher.id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((name.as_str(), status.as_str(), inst(&conn).as_deref(), audits(&conn)), ("T", "pending", Some("university"), 2));
+        // a patch without the field leaves it as it was
+        update_user(&conn, &admin, &teacher.id, &UserPatch { full_name: Some("معلم".into()), ..Default::default() }, None).unwrap();
+        assert_eq!((inst(&conn).as_deref(), audits(&conn)), (Some("university"), 2));
+    }
+
+    #[test]
+    fn editing_an_account_that_stays_pending_does_not_sign_it_out_but_real_access_changes_do() {
+        let conn = create_test_db();
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        let teacher = insert_test_user(&conn, "t@x.com", "teacher", "pending");
+        let sessions = |c: &Connection| -> i64 { c.query_row("SELECT count(*) FROM sessions WHERE user_id = ?1", params![teacher.id], |r| r.get(0)).unwrap() };
+        let sign_in = |c: &Connection| c.execute("INSERT OR REPLACE INTO sessions VALUES ('h', ?1, 0, 9999999999999)", params![teacher.id]).unwrap();
+        sign_in(&conn);
+
+        // a corrected institution type / name / reason-less re-save of the same status keeps the waiting page alive
+        update_user(&conn, &admin, &teacher.id, &UserPatch { institution_type: Some("school".into()), ..Default::default() }, None).unwrap();
+        update_user(&conn, &admin, &teacher.id, &UserPatch { full_name: Some("معلم جديد".into()), ..Default::default() }, None).unwrap();
+        update_user(&conn, &admin, &teacher.id, &UserPatch { status: Some("pending".into()), ..Default::default() }, None).unwrap();
+        assert_eq!(sessions(&conn), 1, "pending stays pending: still signed in");
+
+        // credentials, role and a move to a non-active status all still force a new sign-in
+        update_user(&conn, &admin, &teacher.id, &UserPatch::default(), Some("new-hash")).unwrap();
+        assert_eq!(sessions(&conn), 0, "password reset");
+        sign_in(&conn);
+        update_user(&conn, &admin, &teacher.id, &UserPatch { role: Some("student".into()), ..Default::default() }, None).unwrap();
+        assert_eq!(sessions(&conn), 0, "role change");
+        sign_in(&conn);
+        update_user(&conn, &admin, &teacher.id, &UserPatch { status: Some("suspended".into()), ..Default::default() }, None).unwrap();
+        assert_eq!(sessions(&conn), 0, "moved to suspended");
+        // an edit that leaves the (already non-active) status alone is not an access change either
+        sign_in(&conn);
+        update_user(&conn, &admin, &teacher.id, &UserPatch { full_name: Some("اسم".into()), ..Default::default() }, None).unwrap();
+        assert_eq!(sessions(&conn), 1, "an edit that changes no access leaves a session alone");
     }
 
     #[test]

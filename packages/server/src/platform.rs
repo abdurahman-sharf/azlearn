@@ -401,9 +401,9 @@ pub fn lock(state: &AppState) -> Res<std::sync::MutexGuard<'_, Connection>> {
     state.platform.conn.lock().map_err(db_err)
 }
 
-/// Signed-in user whose account is active (not pending/rejected/suspended).
-pub fn require_active(state: &AppState, headers: &HeaderMap) -> Res<User> {
-    let user = authenticate(state, headers)?;
+/// An already-authenticated user whose account is active (not pending/rejected/suspended).
+/// The pure half of [`require_active`], so the rule can be tested without a request.
+pub fn ensure_active(user: User) -> Res<User> {
     if user.status == "active" {
         Ok(user)
     } else {
@@ -411,13 +411,23 @@ pub fn require_active(state: &AppState, headers: &HeaderMap) -> Res<User> {
     }
 }
 
-pub fn require_role(state: &AppState, headers: &HeaderMap, role: &str) -> Res<User> {
-    let user = require_active(state, headers)?;
+/// An already-authenticated, active user holding `role` (the pure half of [`require_role`]).
+pub fn ensure_role(user: User, role: &str) -> Res<User> {
+    let user = ensure_active(user)?;
     if user.role == role {
         Ok(user)
     } else {
         Err(err(StatusCode::FORBIDDEN, "forbidden"))
     }
+}
+
+/// Signed-in user whose account is active (not pending/rejected/suspended).
+pub fn require_active(state: &AppState, headers: &HeaderMap) -> Res<User> {
+    ensure_active(authenticate(state, headers)?)
+}
+
+pub fn require_role(state: &AppState, headers: &HeaderMap, role: &str) -> Res<User> {
+    ensure_role(authenticate(state, headers)?, role)
 }
 
 pub fn require_admin(state: &AppState, headers: &HeaderMap) -> Res<User> {

@@ -5,6 +5,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useI18nStore } from '@/stores/i18n'
 import { usePt, platformErrorMessage, type PlatformKey } from '@/i18n/platform'
 import { attemptsTable, downloadExport, examAnalytics, type Analytics, type ResultFilter, type SortKey, type StudentRow } from '@/api/platformGrading'
+import PageError from '@/components/platform/PageError.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -181,5 +182,5 @@ const SORTS: { key: SortKey; label: PlatformKey }[] = [
     </section>
     <span v-if="auth.role === 'admin' && a.tab_leaves_total" class="text-body-sm" data-testid="leaves-total">{{ pt('rsLeavesTotal') }}: <span dir="ltr" class="inline-block">{{ a.tab_leaves_total }}</span> ({{ a.tab_leave_students }} {{ pt('rsStudentsCount') }})</span>
   </div>
-  <p v-else-if="error" class="max-w-3xl mx-auto" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+  <PageError v-else-if="error" :message="error" />
 </template>

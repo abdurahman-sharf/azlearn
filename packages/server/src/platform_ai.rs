@@ -133,8 +133,16 @@ pub fn read_settings(conn: &Connection, crypto: &settings::Crypto, env: &Env) ->
         },
         cap_platform: int_setting(conn, crypto, K_CAP_PLATFORM, DEFAULT_CAP_PLATFORM)?,
         cap_admin: int_setting(conn, crypto, K_CAP_ADMIN, DEFAULT_CAP_ADMIN)?,
-        teachers_can_create_exams: settings::get(conn, crypto, K_TEACHERS_EXAMS)?.as_deref() == Some("1"),
+        teachers_can_create_exams: exams_enabled(conn, crypto)?,
     })
+}
+
+/// May teachers create and publish exams? An unset setting means **enabled** (platforms that ran before this
+/// switch was enforced keep working); only the explicit false value (`"0"`, written by `apply_settings`) turns
+/// it off. A stored value that is neither is read as enabled rather than silently locking every teacher out.
+pub fn exams_enabled(conn: &Connection, crypto: &settings::Crypto) -> Res<bool> {
+    let off = matches!(settings::get(conn, crypto, K_TEACHERS_EXAMS)?.as_deref().map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false"));
+    Ok(!off)
 }
 
 #[derive(Deserialize, Default)]
@@ -582,6 +590,35 @@ mod tests {
         let u = usage(&conn, &cx(), &a.id, now).unwrap();
         assert_eq!((u.days.len(), u.days[0].day, u.days[0].calls, u.admins_today.len(), u.admins_today[0].calls), (2, 3, 1, 1, 1));
         assert_eq!(u.resets_at, 4 * DAY_MS);
+    }
+
+    #[test]
+    fn teacher_exams_are_enabled_unless_explicitly_switched_off() {
+        let conn = create_test_db();
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        let env = Env::default();
+        // never configured: the settings page and the enforcement both say "on"
+        assert!(exams_enabled(&conn, &cx()).unwrap());
+        assert!(read_settings(&conn, &cx(), &env).unwrap().teachers_can_create_exams, "unset is shown as enabled");
+        // saving other settings does not touch it
+        apply_settings(&conn, &cx(), &admin.id, &SettingsReq { cap_admin: Some(5), ..req() }).unwrap();
+        assert!(exams_enabled(&conn, &cx()).unwrap());
+        // off, on, off again
+        apply_settings(&conn, &cx(), &admin.id, &SettingsReq { teachers_can_create_exams: Some(false), ..req() }).unwrap();
+        assert!(!exams_enabled(&conn, &cx()).unwrap());
+        assert!(!read_settings(&conn, &cx(), &env).unwrap().teachers_can_create_exams);
+        apply_settings(&conn, &cx(), &admin.id, &SettingsReq { teachers_can_create_exams: Some(true), ..req() }).unwrap();
+        assert!(exams_enabled(&conn, &cx()).unwrap());
+        assert!(read_settings(&conn, &cx(), &env).unwrap().teachers_can_create_exams);
+        apply_settings(&conn, &cx(), &admin.id, &SettingsReq { teachers_can_create_exams: Some(false), ..req() }).unwrap();
+        // only the explicit false value turns it off: an odd stored value never locks every teacher out
+        for odd in ["", "yes", "2", "garbage"] {
+            conn.execute("UPDATE settings SET value = ?1 WHERE key = 'teachers.can_create_exams'", params![odd]).unwrap();
+            assert!(exams_enabled(&conn, &cx()).unwrap(), "{odd:?}");
+        }
+        // clearing the row (back to unset) is "on" as well
+        conn.execute("DELETE FROM settings WHERE key = 'teachers.can_create_exams'", []).unwrap();
+        assert!(exams_enabled(&conn, &cx()).unwrap());
     }
 
     #[test]

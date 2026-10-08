@@ -1,4 +1,5 @@
 import { platformFetch } from '@/lib/platformApi'
+import type { InstitutionType } from '@/stores/auth'
 
 export interface Teaching {
   teacher_id: string
@@ -8,6 +9,8 @@ export interface Teaching {
   institution_id: string
   institution_name: string
   status: 'pending' | 'approved' | 'rejected'
+  /** only on the admin's list: the teacher's own account status (a request can come from a still-pending account) */
+  teacher_status?: 'active' | 'pending' | 'rejected' | 'suspended'
 }
 export interface TeacherCard {
   id: string
@@ -45,7 +48,7 @@ export interface Placement {
   unit_id: string | null
 }
 
-export const updateProfile = (b: { full_name?: string; bio?: string }) =>
+export const updateProfile = (b: { full_name?: string; bio?: string; institution_type?: InstitutionType }) =>
   platformFetch<void>('/me/profile', { method: 'PATCH', body: b })
 
 export const getPlacement = () => platformFetch<Placement | null>('/me/placement')

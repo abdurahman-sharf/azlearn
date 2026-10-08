@@ -17,6 +17,7 @@ mod platform_reminders;
 mod platform_settings;
 mod platform_stats;
 mod platform_learning;
+mod platform_teacher;
 mod relay;
 mod routes;
 mod security_headers;
@@ -237,7 +238,9 @@ async fn main() {
         .route("/api/platform/admin/audit", get(platform_ops::audit_handler))
         .route("/api/platform/search", get(platform_ops::search_handler))
         .route("/api/platform/me/password", post(platform_ops::change_password_handler))
+        .route("/api/platform/me/deletion-impact", get(platform_ops::deletion_impact_handler))
         .route("/api/platform/me", delete(platform_ops::delete_account_handler))
+        .route("/api/platform/teacher/stats", get(platform_teacher::stats_handler))
         .route("/api/platform/public/config", get(platform_public::public_config_handler))
         .route("/api/platform/public/logo", get(platform_public::logo_handler))
         .route("/api/platform/public/stats", get(platform_stats::public_stats_handler))

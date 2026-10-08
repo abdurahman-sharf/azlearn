@@ -6,6 +6,8 @@ import { useI18nStore } from '@/stores/i18n'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
 import ReportButton from '@/components/platform/ReportButton.vue'
 import { getAssessment, updateAssessment, deleteAssessment, type AssessmentDetail } from '@/api/platformExams'
+import PageError from '@/components/platform/PageError.vue'
+import { PlatformError } from '@/lib/platformApi'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -26,12 +28,21 @@ async function load() {
     error.value = platformErrorMessage(pt, e)
   }
 }
+// Students have started the exam: this page's Unpublish/Delete would be refused (409 has_attempts) for everyone, admins
+// included — closing or archiving it is done from the admin exams screen. Also set when the server says so after the
+// page was loaded (a student started in the meantime).
+const started = ref(false)
+const hasStarted = computed(() => started.value || (a.value?.attempt_count ?? 0) > 0)
+function fail(e: unknown) {
+  if (e instanceof PlatformError && e.code === 'has_attempts') started.value = true
+  error.value = platformErrorMessage(pt, e)
+}
 async function unpublish() {
-  try { await updateAssessment(id, { status: 'draft' }); await load() } catch (e) { error.value = platformErrorMessage(pt, e) }
+  try { await updateAssessment(id, { status: 'draft' }); await load() } catch (e) { fail(e) }
 }
 async function remove() {
   if (!window.confirm(pt('confirmDelete'))) return
-  try { await deleteAssessment(id); router.replace('/platform') } catch (e) { error.value = platformErrorMessage(pt, e) }
+  try { await deleteAssessment(id); router.replace('/platform') } catch (e) { fail(e) }
 }
 onMounted(load)
 </script>
@@ -39,13 +50,13 @@ onMounted(load)
 <template>
   <div v-if="a" class="max-w-3xl mx-auto pb-8">
     <router-link :to="`/platform/subjects/${a.subject_id}`" class="text-body-sm underline">{{ a.subject_name }}</router-link>
-    <h1 class="text-display-sm font-bold tracking-tight mt-3 break-words">{{ a.title }}</h1>
+    <h1 class="text-display-sm font-bold tracking-tight mt-3 break-words" dir="auto">{{ a.title }}</h1>
     <p class="text-body-sm mb-2" style="color: rgb(var(--md-on-surface-variant))">
       {{ pt('by') }} {{ a.teacher_name }} · {{ a.question_count }} {{ pt('questionsCount') }} · {{ a.total_points }} {{ pt('points') }}
       <template v-if="a.duration_min"> · {{ a.duration_min }} {{ pt('minutesShort') }}</template>
       <template v-if="a.status === 'draft'"> · {{ pt('statusDraft') }}</template>
     </p>
-    <p v-if="a.description" class="text-body-lg mb-3 whitespace-pre-line">{{ a.description }}</p>
+    <p v-if="a.description" class="text-body-lg mb-3 whitespace-pre-line" dir="auto">{{ a.description }}</p>
     <p v-if="a.opens_at || a.closes_at" class="text-body-sm mb-3">
       <template v-if="a.opens_at">{{ pt('opensAt').replace(/\s*\(.*\)/, '') }}: {{ fmt(a.opens_at) }}</template>
       <template v-if="a.closes_at"> · {{ pt('closesAt').replace(/\s*\(.*\)/, '') }}: {{ fmt(a.closes_at) }}</template>
@@ -85,10 +96,14 @@ onMounted(load)
       <router-link :to="`/platform/assessments/${a.id}/results`" class="btn-filled">{{ pt('results') }} ({{ a.attempt_count }})</router-link>
       <router-link v-if="isOwner" :to="`/platform/assessments/${a.id}/edit`" class="btn-outlined">{{ pt('edit') }}</router-link>
       <template v-if="auth.role === 'admin'">
-        <button v-if="a.status === 'published'" class="btn-outlined" @click="unpublish">{{ pt('unpublish') }}</button>
-        <button class="btn-outlined" @click="remove">{{ pt('del') }}</button>
+        <template v-if="!hasStarted">
+          <button v-if="a.status === 'published'" class="btn-outlined" data-testid="exam-unpublish" @click="unpublish">{{ pt('unpublish') }}</button>
+          <button class="btn-outlined" data-testid="exam-delete" @click="remove">{{ pt('del') }}</button>
+        </template>
+        <router-link v-else to="/platform/admin/exams" class="btn-outlined" data-testid="exam-open-admin">{{ pt('openAdminExams') }}</router-link>
       </template>
     </div>
+    <p v-if="auth.role === 'admin' && hasStarted" class="text-body-sm mt-2" data-testid="exam-admin-hint" style="color: rgb(var(--md-on-surface-variant))">{{ pt('adminExamsHint') }}</p>
   </div>
-  <p v-else-if="error" class="max-w-3xl mx-auto" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+  <PageError v-else-if="error" :message="error" />
 </template>

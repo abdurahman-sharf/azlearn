@@ -1,6 +1,7 @@
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { resetAdminStats } from '@/lib/adminStats'
+import { resetTeacherStats } from '@/lib/teacherStats'
 
 /**
  * Signs out and sends the user to the landing page. The session must be gone before navigating: the router's `home`
@@ -13,6 +14,7 @@ export function useSignOut() {
   return async () => {
     await auth.signOut()
     resetAdminStats()
+    resetTeacherStats()
     try { localStorage.removeItem('exameow-admin-subject') } catch { /* storage unavailable */ }
     await router.replace('/')
   }

@@ -9,6 +9,7 @@ import { useAuthStore } from '@/stores/auth'
 import { usePt } from '@/i18n/platform'
 import BrandMark from '@/components/platform/BrandMark.vue'
 import AdminSidebar from '@/components/platform/AdminSidebar.vue'
+import TeacherSidebar from '@/components/platform/TeacherSidebar.vue'
 import LandingNav from './LandingNav.vue'
 import { isTauri, isMacOS, isWindows, isLinux } from '@/utils/platform'
 import TitleBar from './TitleBar.vue'
@@ -34,9 +35,15 @@ const brand = useBrandingStore()
 const auth = useAuthStore()
 const pt = usePt()
 
-// Admin frame: on every /platform page an admin opens, the admin navigation sits beside <main> (not inside it, so the
-// skip link still bypasses it and there is a single main landmark). The router guards have awaited auth.init() by now.
-const adminFrame = computed(() => platformEnabled && auth.role === 'admin' && /^\/platform(\/|$)/.test(route.path))
+// Role frame: on every /platform page an admin or a teacher opens, that role's navigation sits beside <main> (not inside
+// it, so the skip link still bypasses it and there is a single main landmark). The router guards have awaited
+// auth.init() by now. Admins keep the legacy practice/generate/search/mine tabs; teachers get the sidebar INSTEAD of
+// them (their one link to the local question bank lives in the sidebar), so those tabs, the mobile bottom bar and the
+// GitHub button are hidden for them here.
+const inPlatform = computed(() => platformEnabled && /^\/platform(\/|$)/.test(route.path))
+const adminFrame = computed(() => inPlatform.value && auth.role === 'admin')
+const teacherFrame = computed(() => inPlatform.value && auth.role === 'teacher' && auth.isActive)
+const roleFrame = computed(() => adminFrame.value || teacherFrame.value)
 // Landing header: routes flagged `landingHeader` show the landing menu instead of the practice/generate/search links.
 const landing = computed(() => platformEnabled && route.meta.landingHeader === true)
 const mainEl = ref<HTMLElement | null>(null)
@@ -146,7 +153,7 @@ const headerStyle = {
         <LandingNav v-if="landing" mode="top" />
 
         <!-- Desktop Nav — Pixel Segmented sliding pill navigation -->
-        <div v-else class="hidden sm:flex items-center" :class="isDesktopTauri ? '' : 'ml-6'">
+        <div v-else-if="!teacherFrame" class="hidden sm:flex items-center" :class="isDesktopTauri ? '' : 'ml-6'">
           <nav
             :aria-label="headerName"
             class="relative flex items-center p-1 rounded-full gap-0.5 shadow-sm"
@@ -185,7 +192,7 @@ const headerStyle = {
             <router-link to="/auth/register" class="btn-filled !px-4 !py-2 text-sm" data-testid="header-register">{{ pt('register') }}</router-link>
           </template>
           <button
-            v-if="!landing"
+            v-if="!landing && !teacherFrame"
             class="btn-icon"
             @click="openGitHub"
             title="GitHub"
@@ -216,14 +223,15 @@ const headerStyle = {
     <!-- ====== Main Content ====== -->
     <div
       class="flex-1 mx-auto w-full px-3 sm:px-6 py-4 sm:py-7"
-      :class="adminFrame ? 'max-w-[90rem] flex flex-col md:flex-row md:items-start gap-3 md:gap-8' : 'max-w-5xl xl:max-w-6xl'"
-      :data-testid="adminFrame ? 'admin-shell' : undefined"
+      :class="roleFrame ? 'max-w-[90rem] flex flex-col md:flex-row md:items-start gap-3 md:gap-8' : 'max-w-5xl xl:max-w-6xl'"
+      :data-testid="adminFrame ? 'admin-shell' : teacherFrame ? 'teacher-shell' : undefined"
     >
       <AdminSidebar v-if="adminFrame" />
-      <main id="main-content" ref="mainEl" tabindex="-1" class="focus:outline-none" :class="adminFrame ? 'min-w-0 w-full md:flex-1' : ''">
+      <TeacherSidebar v-else-if="teacherFrame" />
+      <main id="main-content" ref="mainEl" tabindex="-1" class="focus:outline-none" :class="roleFrame ? 'min-w-0 w-full md:flex-1' : ''">
         <router-view v-slot="{ Component }">
-          <!-- no page animation inside the admin frame: the sidebar stays put and every click is instant -->
-          <transition :name="adminFrame ? 'none' : 'slide-up'" mode="out-in">
+          <!-- no page animation inside a role frame: the sidebar stays put and every click is instant -->
+          <transition :name="roleFrame ? 'none' : 'slide-up'" mode="out-in">
             <component :is="Component" />
           </transition>
         </router-view>
@@ -233,7 +241,7 @@ const headerStyle = {
     <!-- ====== Bottom Navigation Bar (Mobile Pixel M3) ====== -->
     <LandingNav v-if="landing" mode="bottom" />
     <nav
-      v-else
+      v-else-if="!teacherFrame"
       :aria-label="headerName"
       class="sm:hidden sticky bottom-0 z-30 safe-bottom"
       :style="{

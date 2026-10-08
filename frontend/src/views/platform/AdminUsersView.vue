@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { useAuthStore, type Profile } from '@/stores/auth'
+import { useAuthStore, type InstitutionType, type Profile } from '@/stores/auth'
 import { usePt, platformErrorMessage, type PlatformKey } from '@/i18n/platform'
 import { listUsers, updateUser } from '@/api/platformAdmin'
 
@@ -27,6 +27,7 @@ const statusKey: Record<string, PlatformKey> = {
   active: 'statusActive', pending: 'statusPending', rejected: 'statusRejected', suspended: 'statusSuspended',
 }
 const typeKey: Record<string, PlatformKey> = { school: 'typeSchool', institute: 'typeInstitute', university: 'typeUniversity' }
+const TYPES: InstitutionType[] = ['school', 'institute', 'university']
 
 async function load() {
   loading.value = true
@@ -133,6 +134,18 @@ onMounted(load)
               <option v-for="r in ROLES" :key="r" :value="r">{{ pt(roleKey[r]!) }}</option>
             </select>
           </template>
+          <!-- the institution type is chosen at sign-up; the admin can correct a wrong one -->
+          <select
+            v-if="u.role === 'student' || u.role === 'teacher'"
+            :value="u.institution_type ?? ''"
+            class="input-outlined !py-2"
+            :aria-label="`${pt('institutionType')}: ${u.full_name}`"
+            :data-testid="'user-type-' + u.id"
+            @change="apply(u, { institution_type: ($event.target as HTMLSelectElement).value as InstitutionType })"
+          >
+            <option v-if="!u.institution_type" value="" disabled>—</option>
+            <option v-for="t in TYPES" :key="t" :value="t">{{ pt(typeKey[t]!) }}</option>
+          </select>
           <button class="btn-text" @click="resetPassword(u)">{{ pt('resetPassword') }}</button>
         </div>
       </li>

@@ -8,6 +8,7 @@ import { courseProgress, setLessonDone } from '@/api/platformEngage'
 import { getSubject } from '@/api/platformLearning'
 import ReportButton from '@/components/platform/ReportButton.vue'
 import { getCourse, updateCourse, deleteCourse, type CourseDetail, type Lesson } from '@/api/platformContent'
+import PageError from '@/components/platform/PageError.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -71,12 +72,12 @@ onMounted(load)
 <template>
   <div v-if="course" class="max-w-3xl mx-auto pb-8">
     <router-link :to="`/platform/subjects/${course.subject_id}`" class="text-body-sm underline">{{ course.subject_name }}</router-link>
-    <h1 class="text-display-sm font-bold tracking-tight mt-3 break-words">{{ course.title }}</h1>
+    <h1 class="text-display-sm font-bold tracking-tight mt-3 break-words" dir="auto">{{ course.title }}</h1>
     <p class="text-body-sm mb-2" style="color: rgb(var(--md-on-surface-variant))">
       {{ pt('by') }} <router-link :to="`/platform/teachers/${course.teacher_id}`" class="underline">{{ course.teacher_name }}</router-link>
       · {{ course.lesson_count }} {{ pt('lessonsCount') }}<template v-if="course.status === 'draft'"> · {{ pt('statusDraft') }}</template>
     </p>
-    <p v-if="course.description" class="text-body-lg mb-4 whitespace-pre-line">{{ course.description }}</p>
+    <p v-if="course.description" class="text-body-lg mb-4 whitespace-pre-line" dir="auto">{{ course.description }}</p>
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
 
     <!-- Player: embeds only server-computed provider URLs; anything else is an external link. -->
@@ -99,7 +100,7 @@ onMounted(load)
         <p class="text-body-sm mb-2">{{ pt('externalVideo') }}</p>
         <a :href="current.video_url" target="_blank" rel="noopener noreferrer" class="btn-tonal">{{ pt('openLink') }}</a>
       </div>
-      <p v-if="current.description" class="text-body-lg mt-3 whitespace-pre-line">{{ current.description }}</p>
+      <p v-if="current.description" class="text-body-lg mt-3 whitespace-pre-line" dir="auto">{{ current.description }}</p>
       <button v-if="enrolled" class="mt-3" :class="done.has(current.id) ? 'btn-outlined' : 'btn-filled'" @click="toggleDone(current)">
         {{ done.has(current.id) ? pt('markUndone') : pt('markDone') }}
       </button>
@@ -135,5 +136,5 @@ onMounted(load)
       </template>
     </div>
   </div>
-  <p v-else-if="error" class="max-w-3xl mx-auto" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+  <PageError v-else-if="error" :message="error" />
 </template>

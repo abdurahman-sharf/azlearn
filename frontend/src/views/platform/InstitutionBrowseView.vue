@@ -5,6 +5,7 @@ import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage, type PlatformKey } from '@/i18n/platform'
 import { getStructure, type Structure, type Unit, type UnitKind } from '@/api/platformAdmin'
 import { getPlacement, setPlacement, type Placement } from '@/api/platformLearning'
+import PageError from '@/components/platform/PageError.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -87,5 +88,5 @@ onMounted(load)
       </div>
     </div>
   </div>
-  <p v-else-if="error" class="max-w-3xl mx-auto" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+  <PageError v-else-if="error" :message="error" />
 </template>

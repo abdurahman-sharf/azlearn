@@ -65,7 +65,7 @@ watch(() => props.targetId, load)
       <div class="flex gap-1" role="radiogroup" :aria-label="pt('yourRating')">
         <button v-for="n in 5" :key="n" type="button" role="radio" :aria-checked="rating === n" :aria-label="`${n}`" class="text-2xl leading-none px-1" :style="{ color: n <= rating ? 'rgb(var(--md-primary))' : 'rgb(var(--md-outline))' }" @click="rating = n">★</button>
       </div>
-      <textarea v-model="comment" maxlength="1000" rows="2" :placeholder="pt('yourComment')" class="input-outlined w-full"></textarea>
+      <textarea v-model="comment" maxlength="1000" rows="2" dir="auto" :placeholder="pt('yourComment')" class="input-outlined w-full"></textarea>
       <p v-if="error" class="text-body-sm" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
       <button type="submit" class="btn-filled">{{ pt('submitReview') }}</button>
     </form>
@@ -79,10 +79,10 @@ watch(() => props.targetId, load)
           <span class="font-semibold">{{ r.student_name }}</span>
           <span aria-hidden="true" style="color: rgb(var(--md-primary))">{{ stars(r.rating) }}</span>
           <span class="sr-only">{{ r.rating }}/5</span>
-          <button v-if="r.mine || auth.role === 'admin'" class="btn-text ms-auto" @click="remove(r.id)">{{ pt('deleteReview') }}</button>
+          <button v-if="r.mine || auth.role === 'admin'" class="btn-text ms-auto" :aria-label="`${pt('deleteReview')}: ${r.student_name}`" @click="remove(r.id)">{{ pt('deleteReview') }}</button>
         </div>
         <!-- plain text only -->
-        <p v-if="r.comment" class="text-body-lg whitespace-pre-line break-words">{{ r.comment }}</p>
+        <p v-if="r.comment" class="text-body-lg whitespace-pre-line break-words" dir="auto">{{ r.comment }}</p>
       </li>
     </ul>
   </section>
