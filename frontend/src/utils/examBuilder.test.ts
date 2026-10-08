@@ -33,6 +33,15 @@ eq(validateQuestion(q({ type: 'short_answer' as Question['type'], options: [], a
 eq(validateQuestion(q({ score: 101 })), 'score', 'score too high')
 eq(validateQuestion(q({ type: 'true_false' as Question['type'], options: [], answer: 'True' })), null, 'tf accepted before normalising')
 
+// size limits mirror the server's (answer 2000, analysis 6000, option 1000), so an import reports them per row
+eq(validateQuestion(q({ analysis: 'ش'.repeat(6000) })), null, 'analysis at the limit')
+eq(validateQuestion(q({ analysis: 'ش'.repeat(6001) })), 'length', 'analysis too long')
+eq(validateQuestion(q({ options: ['a', 'x'.repeat(1001)] })), 'length', 'option too long')
+eq(validateQuestion(q({ type: 'short_answer' as Question['type'], options: [], answer: 'ج'.repeat(2001) })), 'length', 'reference answer too long')
+eq(validateQuestion(q({ type: 'short_answer' as Question['type'], options: [], answer: 'ج'.repeat(2000) })), null, 'reference answer at the limit')
+eq(validateQuestion(q({ options: Array.from({ length: 11 }, () => 'a') })), 'options', 'more than ten options')
+eq(validateQuestion(q({ type: 'short_answer' as Question['type'], options: ['x'.repeat(5000)], answer: 'ج' })), null, 'options of a written question are ignored')
+
 // AI output becomes clean exam questions
 let n = 0
 const adopted = adoptQuestions(
@@ -47,6 +56,14 @@ const adopted = adoptQuestions(
 eq(adopted.map((a) => a.id), ['q1', 'q2', 'q3'], 'fresh unique ids (AI ids can collide across batches)')
 eq([adopted[0]!.answer, adopted[1]!.answer, adopted[2]!.answer], ['B', 'AC', 'A'], 'answers normalised')
 eq(adopted[2]!.options, ['صحيح', 'خطأ'], 'default true/false options')
+const written = adoptQuestions(
+  [
+    { id: 'a', type: 'fill_blank', stem: 'عاصمة مصر _____', options: ['القاهرة', 'مصر'], answer: 'القاهرة|مصر', analysis: '' } as Question,
+    { id: 'b', type: 'short_answer', stem: 'اشرح', options: ['x'], answer: 'نموذج', analysis: '' } as Question,
+  ],
+  () => `w${++n}`,
+)
+eq(written.map((w) => w.options), [[], []], 'fill-blank alternatives live in the answer, not as lettered options')
 eq([adopted[1]!.chapter, adopted[1]!.difficulty, adopted[1]!.src, adopted[0]!.score], ['الوحدة 1', 'hard', 'bank-9', 1], 'metadata kept, default score 1')
 
 eq(totals([q({ score: 2 }), q({ score: 0.5, type: 'fill_blank' as Question['type'] }), q({})]), { points: 3.5, byType: { single_choice: 2, fill_blank: 1 } }, 'totals')

@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_attempts_assess ON attempts(assessment_id, student_id);
 CREATE INDEX IF NOT EXISTS idx_attempts_student ON attempts(student_id, started_at);
+-- statistics count submitted attempts per exam (platform_stats); a partial index keeps that an index-only scan
+CREATE INDEX IF NOT EXISTS idx_attempts_submitted ON attempts(assessment_id) WHERE status = 'submitted';
 ";
 
 

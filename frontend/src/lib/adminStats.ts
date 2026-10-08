@@ -6,6 +6,11 @@ import { adminStats, type Stats } from '@/api/platformOps'
 const stats = ref<Stats | null>(null)
 let inflight: Promise<void> | null = null
 
+/** Forgets the numbers (called on sign-out so the next account never sees a stale badge). */
+export function resetAdminStats() {
+  stats.value = null
+}
+
 export function useAdminStats() {
   const refresh = () => {
     inflight ??= adminStats()

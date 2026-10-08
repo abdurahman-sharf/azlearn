@@ -51,12 +51,12 @@ mod tests {
 
     #[test]
     fn only_the_listed_platform_paths_are_public() {
-        for p in ["/api/platform/register", "/api/platform/login", "/api/platform/logout", "/api/platform/public/config", "/api/platform/public/logo", "/api/platform/public/legal/privacy"] {
+        for p in ["/api/platform/register", "/api/platform/login", "/api/platform/logout", "/api/platform/public/config", "/api/platform/public/logo", "/api/platform/public/stats", "/api/platform/public/legal/privacy"] {
             assert!(is_public(p), "{p}");
         }
         for p in [
             "/api/platform/me", "/api/platform/admin/users", "/api/platform/registers", "/api/platform/register/x", "/api/platform/login/x",
-            "/api/platform/publicity", "/api/platform/public", "/api/platform/admin/public/config", "/api/platform/files/x", "/api/platform/",
+            "/api/platform/publicity", "/api/platform/public", "/api/platform/admin/public/config", "/api/platform/admin/stats/institutions", "/api/platform/admin/stats/subjects", "/api/platform/files/x", "/api/platform/",
         ] {
             assert!(!is_public(p), "{p}");
         }

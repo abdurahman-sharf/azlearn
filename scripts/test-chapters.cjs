@@ -16,7 +16,7 @@ require.extensions['.ts'] = (module, filename) => {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText, filename)
 }
-for (const name of ['chapters', 'practiceFilter', 'questionMetadata', 'importParser']) {
+for (const name of ['chapters', 'practiceFilter', 'questionMetadata', 'importParser', 'arabicImport', 'structureTree', 'examBuilder']) {
   require(path.join(root, `frontend/src/utils/${name}.test.ts`))
 }
 const direct = require(path.join(root, 'frontend/src/utils/aiClient.ts'))
@@ -38,6 +38,7 @@ for (const analysis of [parser.analyzeCSV(exporter.generateCsvContent(questions)
   assert.deepEqual(groupChapters(parser.parseWithMapping(analysis, analysis.mapping, 'test')), groupChapters(questions))
 }
 async function testTransport() {
+  await require(path.join(root, 'frontend/src/utils/examImport.test.ts')).done
   const originalFetch = global.fetch
   let requests = 0
   global.fetch = async (_url, request) => {

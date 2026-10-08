@@ -15,6 +15,7 @@ mod platform_ops;
 mod platform_public;
 mod platform_reminders;
 mod platform_settings;
+mod platform_stats;
 mod platform_learning;
 mod relay;
 mod routes;
@@ -227,6 +228,8 @@ async fn main() {
         .route("/api/platform/admin/reports", get(platform_ops::list_reports_handler))
         .route("/api/platform/admin/reports/{id}", axum::routing::patch(platform_ops::resolve_report_handler))
         .route("/api/platform/admin/stats", get(platform_ops::stats_handler))
+        .route("/api/platform/admin/stats/institutions", get(platform_stats::institutions_stats_handler))
+        .route("/api/platform/admin/stats/subjects", get(platform_stats::subjects_stats_handler))
         .route("/api/platform/admin/backup", post(platform_backup::create_handler))
         .route("/api/platform/admin/backups", get(platform_backup::list_handler))
         .route("/api/platform/admin/backups/{id}", get(platform_backup::download_handler))
@@ -237,6 +240,7 @@ async fn main() {
         .route("/api/platform/me", delete(platform_ops::delete_account_handler))
         .route("/api/platform/public/config", get(platform_public::public_config_handler))
         .route("/api/platform/public/logo", get(platform_public::logo_handler))
+        .route("/api/platform/public/stats", get(platform_stats::public_stats_handler))
         .route("/api/platform/public/legal/{slug}", get(platform_public::legal_get_handler))
         .route("/api/platform/admin/settings", get(platform_ai::get_settings_handler).put(platform_ai::put_settings_handler))
         .route("/api/platform/admin/settings/ai/test", post(platform_ai::test_handler))

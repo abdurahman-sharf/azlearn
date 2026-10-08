@@ -36,6 +36,8 @@ pub struct PlatformState {
     /// Set while a backup is being written: only one at a time.
     pub backup_busy: std::sync::atomic::AtomicBool,
     pub started_at: i64,
+    /// Short-lived memo of the public landing-page counters (phase 2-1).
+    pub public_stats: crate::platform_stats::StatsCache,
 }
 
 impl PlatformState {
@@ -52,6 +54,7 @@ impl PlatformState {
             backup: crate::platform_backup::BackupConfig::default(),
             backup_busy: std::sync::atomic::AtomicBool::new(false),
             started_at: 0,
+            public_stats: Default::default(),
         }
     }
 }
@@ -169,6 +172,7 @@ pub fn init_db(layout: &crate::platform_backup::Layout) -> Result<PlatformState,
         backup: crate::platform_backup::BackupConfig::from_env(),
         backup_busy: std::sync::atomic::AtomicBool::new(false),
         started_at: now_ms(),
+        public_stats: Default::default(),
     })
 }
 
