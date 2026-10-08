@@ -234,6 +234,12 @@ const router = createRouter({
           component: () => import('@/views/platform/AdminAuditView.vue'),
           meta: { title: 'platform-admin-audit', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
+        {
+          path: 'system',
+          name: 'platform-admin-system',
+          component: () => import('@/views/platform/AdminSystemView.vue'),
+          meta: { title: 'System status', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+        },
       ],
     },
     {

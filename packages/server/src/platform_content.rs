@@ -1268,7 +1268,8 @@ mod tests {
         w.conn.execute("DELETE FROM subjects WHERE id = 's1'", []).unwrap();
         let n: i64 = w.conn.query_row("SELECT count(*) FROM posts", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0, "posts cascade with the subject");
-        let state = crate::platform::PlatformState { conn: std::sync::Mutex::new(w.conn), files_dir: std::env::temp_dir(), crypto: crate::platform_settings::Crypto::for_tests() };
+        let mut state = crate::platform::PlatformState::for_tests(w.conn);
+        state.files_dir = std::env::temp_dir();
         purge_orphan_files(&state);
         let files: i64 = state.conn.lock().unwrap().query_row("SELECT count(*) FROM files", [], |r| r.get(0)).unwrap();
         assert_eq!(files, 0);

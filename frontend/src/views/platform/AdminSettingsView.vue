@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useBrandingStore } from '@/stores/branding'
 import { useI18nStore } from '@/stores/i18n'
 import { usePt, platformErrorMessage, type PlatformKey } from '@/i18n/platform'
+import BackupPanel from '@/components/platform/BackupPanel.vue'
 import {
   aiUsage, deleteLogo, getLegal, getSettings, saveBranding, saveLegal, saveSettings, testAi, uploadLogo,
   type Settings, type TestResult, type Usage,
@@ -238,6 +239,16 @@ onMounted(async () => {
           <button class="btn-filled" :disabled="busy === 'teachers'" data-testid="teachers-save" @click="saveTeachers">{{ pt('save') }}</button>
           <p v-if="msg.teachers" role="status" class="text-body-sm" data-testid="teachers-msg">{{ msg.teachers.text }}</p>
         </div>
+      </section>
+
+      <!-- Backup (full management lives on the system-status page) -->
+      <section class="card-filled p-5 space-y-3" data-testid="sec-backup">
+        <div>
+          <h2 class="text-title-md font-bold">{{ pt('bkTitle') }}</h2>
+          <p class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ pt('bkDesc') }}</p>
+        </div>
+        <BackupPanel compact />
+        <router-link to="/platform/admin/system" class="inline-block text-body-md underline" data-testid="backup-manage">{{ pt('bkManage') }}</router-link>
       </section>
 
       <!-- Legal -->

@@ -1690,6 +1690,7 @@ mod migration_tests {
         assert_eq!(one::<String>(&c, "PRAGMA integrity_check"), "ok");
         assert_eq!(one::<i64>(&c, "PRAGMA foreign_keys"), 1, "foreign keys are back ON after the swap");
         assert!(tables(&c).contains(&"settings".to_string()));
+        assert!(tables(&c).contains(&"backups".to_string()) && tables(&c).contains(&"exam_reminders".to_string()), "phase 1-8/1-9 tables are created on upgrade");
         assert!(!tables(&c).contains(&"assessments_new".to_string()), "no leftover temp table");
         // phase 1-8: old exams count as announced long ago, the reminder table starts empty, and a sweep over
         // the migrated data neither fails nor invents notifications for finished exams

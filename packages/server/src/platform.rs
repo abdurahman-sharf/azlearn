@@ -30,6 +30,30 @@ pub struct PlatformState {
     /// Encrypts secrets stored in the `settings` table (AI key, SMTP password); read from phase 1-3.
     #[allow(dead_code)]
     pub crypto: crate::platform_settings::Crypto,
+    /// Where the database, key, attachments and backups live (phase 1-9).
+    pub layout: crate::platform_backup::Layout,
+    pub backup: crate::platform_backup::BackupConfig,
+    /// Set while a backup is being written: only one at a time.
+    pub backup_busy: std::sync::atomic::AtomicBool,
+    pub started_at: i64,
+}
+
+impl PlatformState {
+    /// A state over an in-memory connection with its own scratch directories (tests only).
+    #[cfg(test)]
+    pub fn for_tests(conn: Connection) -> Self {
+        let root = std::env::temp_dir().join(format!("exameow-test-{}", new_id()));
+        let layout = crate::platform_backup::Layout { db_path: root.join("platform.db"), files_dir: root.join("files"), key_file: root.join("platform.key"), backup_dir: root.join("backups") };
+        PlatformState {
+            conn: Mutex::new(conn),
+            files_dir: layout.files_dir.clone(),
+            crypto: crate::platform_settings::Crypto::for_tests(),
+            layout,
+            backup: crate::platform_backup::BackupConfig::default(),
+            backup_busy: std::sync::atomic::AtomicBool::new(false),
+            started_at: 0,
+        }
+    }
 }
 
 const SCHEMA: &str = "
@@ -103,7 +127,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 /// Applies the core schema plus every feature module's schema (all idempotent).
 pub fn apply_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-    for extra in [crate::platform_learning::SCHEMA, crate::platform_content::SCHEMA, crate::platform_engage::SCHEMA, crate::platform_exams::SCHEMA, crate::platform_ops::SCHEMA, crate::platform_settings::SCHEMA, crate::platform_ai::SCHEMA, crate::platform_bank::SCHEMA, crate::platform_reminders::SCHEMA] {
+    for extra in [crate::platform_learning::SCHEMA, crate::platform_content::SCHEMA, crate::platform_engage::SCHEMA, crate::platform_exams::SCHEMA, crate::platform_ops::SCHEMA, crate::platform_settings::SCHEMA, crate::platform_ai::SCHEMA, crate::platform_bank::SCHEMA, crate::platform_reminders::SCHEMA, crate::platform_backup::SCHEMA] {
         conn.execute_batch(extra).map_err(|e| e.to_string())?;
     }
     crate::platform_exams::migrate(conn)?;
@@ -130,13 +154,22 @@ pub fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl:
     Ok(())
 }
 
-pub fn init_db(path: &str, files_dir: &str, key_file: &str) -> Result<PlatformState, String> {
-    std::fs::create_dir_all(files_dir).map_err(|e| format!("cannot create {files_dir}: {e}"))?;
-    let crypto = crate::platform_settings::Crypto::from_key_file(std::path::Path::new(key_file))?;
-    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+pub fn init_db(layout: &crate::platform_backup::Layout) -> Result<PlatformState, String> {
+    let files_dir = &layout.files_dir;
+    std::fs::create_dir_all(files_dir).map_err(|e| format!("cannot create {}: {e}", files_dir.display()))?;
+    let crypto = crate::platform_settings::Crypto::from_key_file(&layout.key_file)?;
+    let conn = Connection::open(&layout.db_path).map_err(|e| e.to_string())?;
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
     apply_schema(&conn)?;
-    Ok(PlatformState { conn: Mutex::new(conn), files_dir: files_dir.into(), crypto })
+    Ok(PlatformState {
+        conn: Mutex::new(conn),
+        files_dir: files_dir.clone(),
+        crypto,
+        layout: layout.clone(),
+        backup: crate::platform_backup::BackupConfig::from_env(),
+        backup_busy: std::sync::atomic::AtomicBool::new(false),
+        started_at: now_ms(),
+    })
 }
 
 pub fn cleanup_expired(state: &PlatformState) {
@@ -593,9 +626,9 @@ mod tests {
 
     #[test]
     fn bootstrap_creates_admin_once() {
-        let state = PlatformState { conn: Mutex::new(db()), files_dir: std::env::temp_dir(), crypto: crate::platform_settings::Crypto::for_tests() };
+        let state = PlatformState::for_tests(db());
         assert!(bootstrap_admin(&state, "Root@x.com", "password123").unwrap());
         assert!(!bootstrap_admin(&state, "other@x.com", "password123").unwrap());
-        assert!(bootstrap_admin(&PlatformState { conn: Mutex::new(db()), files_dir: std::env::temp_dir(), crypto: crate::platform_settings::Crypto::for_tests() }, "r@x.com", "short").is_err());
+        assert!(bootstrap_admin(&PlatformState::for_tests(db()), "r@x.com", "short").is_err());
     }
 }

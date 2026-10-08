@@ -1,6 +1,7 @@
 mod platform;
 mod platform_admin;
 mod platform_ai;
+mod platform_backup;
 mod platform_bank;
 mod platform_exam_admin;
 mod platform_grading;
@@ -29,27 +30,21 @@ use axum::http::{header, HeaderValue};
 
 #[tokio::main]
 async fn main() {
+    // `exameow-server restore <backup.zip> [--yes]`: offline restore, then exit (the server must be stopped)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("restore") {
+        std::process::exit(platform_backup::cli_restore(&args[1..]));
+    }
     let config_store = ConfigStore::new("ExameowServer").unwrap_or_else(|_| {
         eprintln!("Warning: could not init config store, using transient store");
         ConfigStore::new("ExameowServerTransient").unwrap()
     });
     let db_path = std::env::var("EXAM_DB_PATH").unwrap_or_else(|_| "./exameow.db".to_string());
     let relay = relay::init_db(&db_path).unwrap_or_else(|e| panic!("failed to init exam db at {db_path}: {e}"));
-    let platform_db_path =
-        std::env::var("PLATFORM_DB_PATH").unwrap_or_else(|_| "./exameow-platform.db".to_string());
-    let platform_files_dir =
-        std::env::var("PLATFORM_FILES_DIR").unwrap_or_else(|_| "./platform-files".to_string());
-    // Master key for encrypted settings: next to the DB unless PLATFORM_KEY_FILE says otherwise.
-    let platform_key_file = std::env::var("PLATFORM_KEY_FILE").unwrap_or_else(|_| {
-        std::path::Path::new(&platform_db_path)
-            .parent()
-            .map(|d| d.join("platform.key"))
-            .unwrap_or_else(|| "platform.key".into())
-            .to_string_lossy()
-            .into_owned()
-    });
-    let platform = platform::init_db(&platform_db_path, &platform_files_dir, &platform_key_file)
-        .unwrap_or_else(|e| panic!("failed to init platform db at {platform_db_path}: {e}"));
+    let layout = platform_backup::Layout::from_env();
+    let platform = platform::init_db(&layout)
+        .unwrap_or_else(|e| panic!("failed to init platform db at {}: {e}", layout.db_path.display()));
+    platform_backup::startup(&platform);
     let non_empty = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     match (non_empty("PLATFORM_ADMIN_EMAIL"), non_empty("PLATFORM_ADMIN_PASSWORD")) {
         (Some(email), Some(password)) => match platform::bootstrap_admin(&platform, &email, &password) {
@@ -82,6 +77,9 @@ async fn main() {
                 platform_content::purge_orphan_files(&state.platform);
                 platform_engage::purge_old_notifications(&state.platform);
                 platform_exams::settle_overdue(&state.platform);
+                // tonight's backup (phase 1-9): also fires on the first tick after a start if the last slot was missed
+                let st = state.clone();
+                let _ = tokio::task::spawn_blocking(move || platform_backup::run_nightly(&st.platform, relay::now_ms())).await;
             }
         });
     }
@@ -215,6 +213,10 @@ async fn main() {
         .route("/api/platform/admin/reports", get(platform_ops::list_reports_handler))
         .route("/api/platform/admin/reports/{id}", axum::routing::patch(platform_ops::resolve_report_handler))
         .route("/api/platform/admin/stats", get(platform_ops::stats_handler))
+        .route("/api/platform/admin/backup", post(platform_backup::create_handler))
+        .route("/api/platform/admin/backups", get(platform_backup::list_handler))
+        .route("/api/platform/admin/backups/{id}", get(platform_backup::download_handler))
+        .route("/api/platform/admin/system", get(platform_backup::system_handler))
         .route("/api/platform/admin/audit", get(platform_ops::audit_handler))
         .route("/api/platform/search", get(platform_ops::search_handler))
         .route("/api/platform/me/password", post(platform_ops::change_password_handler))

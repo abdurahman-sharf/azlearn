@@ -242,6 +242,8 @@ pub struct Stats {
     subjects: i64,
     content: serde_json::Value,
     attempts_submitted: i64,
+    /// Active warnings of the system-status page (backups, disk); filled in by the handler.
+    system_warnings: i64,
 }
 
 fn count(conn: &Connection, sql: &str) -> Res<i64> {
@@ -279,12 +281,17 @@ fn stats(conn: &Connection, now: i64) -> Res<Stats> {
             "assessments": count(conn, "SELECT count(*) FROM assessments WHERE status = 'published'")?,
         }),
         attempts_submitted: count(conn, "SELECT count(*) FROM attempts WHERE status = 'submitted'")?,
+        system_warnings: 0,
     })
 }
 
 pub async fn stats_handler(State(s): State<Arc<AppState>>, h: HeaderMap) -> Res<Json<Stats>> {
     require_admin(&s, &h)?;
-    stats(&*lock(&s)?, now_ms()).map(Json)
+    let now = now_ms();
+    let mut st = stats(&*lock(&s)?, now)?;
+    let state = s.clone();
+    st.system_warnings = tokio::task::spawn_blocking(move || crate::platform_backup::warning_count(&state.platform, now)).await.unwrap_or(0);
+    Ok(Json(st))
 }
 
 #[derive(Serialize, Debug)]

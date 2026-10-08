@@ -1452,6 +1452,7 @@ dependencies = [
  "base64 0.22.1",
  "csv",
  "exameow-core",
+ "libc",
  "rand 0.8.7",
  "ring",
  "rusqlite",
@@ -1460,9 +1461,11 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower-http",
  "url",
  "uuid",
+ "zip 2.4.2",
 ]
 
 [[package]]
