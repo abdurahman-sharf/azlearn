@@ -130,7 +130,7 @@ const OPEN_ENDED_LIMIT_MS: i64 = 24 * 3_600_000;
 // ───────── grading ─────────
 
 /// Arabic-aware comparison form: strips diacritics/tatweel, unifies alef/yeh variants, lowercases.
-fn norm_text(s: &str) -> String {
+pub(crate) fn norm_text(s: &str) -> String {
     s.trim()
         .chars()
         .filter(|c| !matches!(*c as u32, 0x064B..=0x065F | 0x0670 | 0x0640))
@@ -215,6 +215,24 @@ fn grade_all(questions: &[Question], answers: &HashMap<String, String>) -> (Vec<
 
 // ───────── validation ─────────
 
+/// Shape checks shared by exams and the question bank (ids and uniqueness are the caller's business).
+pub(crate) fn validate_question(q: &Question) -> Res<()> {
+    if q.stem.trim().is_empty() || q.stem.chars().count() > 3000 || q.answer.trim().is_empty() || q.answer.chars().count() > 2000 {
+        return Err(bad("invalid_question"));
+    }
+    if q.analysis.chars().count() > 6000 || q.options.len() > 10 || q.options.iter().any(|o| o.chars().count() > 1000) {
+        return Err(bad("invalid_question"));
+    }
+    let needs_options = matches!(q.qtype, QuestionType::SingleChoice | QuestionType::MultiChoice);
+    if needs_options && q.options.len() < 2 {
+        return Err(bad("invalid_question"));
+    }
+    if q.score.map_or(false, |s| !s.is_finite() || !(0.0..=100.0).contains(&s)) {
+        return Err(bad("invalid_question"));
+    }
+    Ok(())
+}
+
 fn validate_questions(qs: &[Question]) -> Res<()> {
     if qs.is_empty() || qs.len() > MAX_QUESTIONS {
         return Err(bad("invalid_question_count"));
@@ -225,19 +243,7 @@ fn validate_questions(qs: &[Question]) -> Res<()> {
         if !id_ok || !seen.insert(q.id.clone()) {
             return Err(bad("invalid_question_id"));
         }
-        if q.stem.trim().is_empty() || q.stem.chars().count() > 3000 || q.answer.trim().is_empty() || q.answer.chars().count() > 2000 {
-            return Err(bad("invalid_question"));
-        }
-        if q.analysis.chars().count() > 6000 || q.options.len() > 10 || q.options.iter().any(|o| o.chars().count() > 1000) {
-            return Err(bad("invalid_question"));
-        }
-        let needs_options = matches!(q.qtype, QuestionType::SingleChoice | QuestionType::MultiChoice);
-        if needs_options && q.options.len() < 2 {
-            return Err(bad("invalid_question"));
-        }
-        if q.score.map_or(false, |s| !s.is_finite() || !(0.0..=100.0).contains(&s)) {
-            return Err(bad("invalid_question"));
-        }
+        validate_question(q)?;
     }
     Ok(())
 }

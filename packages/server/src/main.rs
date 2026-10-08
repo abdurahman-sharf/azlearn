@@ -1,6 +1,7 @@
 mod platform;
 mod platform_admin;
 mod platform_ai;
+mod platform_bank;
 mod platform_content;
 mod platform_engage;
 mod platform_exams;
@@ -205,6 +206,11 @@ async fn main() {
         .route("/api/platform/admin/settings/ai/test", post(platform_ai::test_handler))
         .route("/api/platform/admin/ai/usage", get(platform_ai::usage_handler))
         .route("/api/platform/admin/ai/generate", post(platform_ai::generate_handler).layer(platform_ai::upload_limit()))
+        .route("/api/platform/admin/bank", get(platform_bank::list_handler).post(platform_bank::create_handler))
+        .route("/api/platform/admin/bank/facets", get(platform_bank::facets_handler))
+        .route("/api/platform/admin/bank/bulk", post(platform_bank::bulk_handler))
+        .route("/api/platform/admin/bank/import", post(platform_bank::import_handler).layer(platform_bank::import_limit()))
+        .route("/api/platform/admin/bank/{id}", axum::routing::patch(platform_bank::update_handler))
         .route("/api/platform/admin/branding", axum::routing::put(platform_public::set_branding_handler))
         .route(
             "/api/platform/admin/branding/logo",

@@ -18,6 +18,7 @@ watch(() => route.path, refresh)
 interface Item { to: string; label: PlatformKey; badge?: number; exact?: boolean; testid: string }
 const items = computed<Item[]>(() => [
   { to: '/platform/admin', label: 'adminOverview', exact: true, testid: 'nav-overview' },
+  { to: '/platform/admin/bank', label: 'bankTitle', testid: 'nav-bank' },
   { to: '/platform/admin/users', label: 'adminUsers', badge: stats.value?.pending_teachers, testid: 'nav-users' },
   { to: '/platform/admin/teaching', label: 'adminTeaching', badge: stats.value?.pending_teaching, testid: 'nav-teaching' },
   { to: '/platform/admin/institutions', label: 'adminInstitutions', testid: 'nav-institutions' },
