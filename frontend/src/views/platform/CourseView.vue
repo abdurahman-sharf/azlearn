@@ -9,6 +9,7 @@ import { getSubject } from '@/api/platformLearning'
 import ReportButton from '@/components/platform/ReportButton.vue'
 import { getCourse, updateCourse, deleteCourse, type CourseDetail, type Lesson } from '@/api/platformContent'
 import PageError from '@/components/platform/PageError.vue'
+import ConfirmDeleteDialog from '@/components/platform/ConfirmDeleteDialog.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -62,9 +63,22 @@ async function toggleDone(l: Lesson) {
 async function unpublish() {
   try { await updateCourse(id, { status: 'draft' }); await load() } catch (e) { error.value = platformErrorMessage(pt, e) }
 }
+const deleting = ref(false)
+const deleteBusy = ref(false)
+const deleteError = ref('')
 async function remove() {
-  if (!window.confirm(pt('confirmDelete'))) return
-  try { await deleteCourse(id); router.replace('/platform') } catch (e) { error.value = platformErrorMessage(pt, e) }
+  if (deleteBusy.value) return
+  deleteBusy.value = true
+  deleteError.value = ''
+  try {
+    await deleteCourse(id)
+    deleting.value = false
+    await router.replace('/platform')
+  } catch (e) {
+    deleteError.value = platformErrorMessage(pt, e)
+  } finally {
+    deleteBusy.value = false
+  }
 }
 onMounted(load)
 </script>
@@ -132,9 +146,21 @@ onMounted(load)
       <router-link v-if="auth.profile?.id === course.teacher_id" :to="`/platform/courses/${course.id}/edit`" class="btn-outlined">{{ pt('edit') }}</router-link>
       <template v-if="auth.role === 'admin'">
         <button v-if="course.status === 'published'" class="btn-outlined" @click="unpublish">{{ pt('unpublish') }}</button>
-        <button class="btn-outlined" @click="remove">{{ pt('del') }}</button>
+        <button class="btn-outlined" data-testid="course-admin-delete" @click="deleteError = ''; deleting = true">{{ pt('del') }}</button>
       </template>
     </div>
+    <ConfirmDeleteDialog
+      v-if="deleting"
+      :title="`${pt('del')}: ${course.title}`"
+      :message="course.status === 'published' ? `${pt('edDeleteCourseMsg')} ${pt('edDeletePublished')}` : pt('edDeleteCourseMsg')"
+      :counts="[{ label: pt('lessonsCount'), value: course.lessons.length }]"
+      :kept="pt('edDeleteCourseKept')"
+      :confirm-name="course.status === 'published' ? course.title : undefined"
+      :busy="deleteBusy"
+      :error="deleteError"
+      @confirm="remove"
+      @close="deleting = false"
+    />
   </div>
   <PageError v-else-if="error" :message="error" />
 </template>

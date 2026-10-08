@@ -12,7 +12,7 @@
 
 use crate::platform::{db_err, Res};
 use crate::platform_engage::notify;
-use crate::platform_exams::TEACHER_OK;
+use crate::platform_content::exam_standing;
 use crate::relay::now_ms;
 use rusqlite::{params, Connection};
 use serde_json::json;
@@ -69,7 +69,8 @@ fn remind_closing(conn: &Connection, now: i64) -> Res<usize> {
               WHERE a.status = 'published' AND a.closes_at > ?1 AND a.closes_at <= ?1 + ?2
                 AND (a.opens_at IS NULL OR a.opens_at <= ?1)
                 AND COALESCE(a.published_at, 0) + ?3 <= ?1
-                AND s.is_active = 1 AND {TEACHER_OK}"
+                AND {}",
+            exam_standing("a")
         ))
         .map_err(db_err)?
         .query_map(params![now, CLOSING_LEAD_MS, AFTER_ANNOUNCE_MS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
@@ -124,7 +125,8 @@ fn announce_released(conn: &Connection, now: i64) -> Res<usize> {
               WHERE a.release_mode = 'after_close' AND a.status IN ('published','closed')
                 AND (a.status = 'closed' OR a.closes_at <= ?1)
                 AND COALESCE(a.closed_at, a.closes_at, a.updated_at) >= ?2
-                AND s.is_active = 1 AND {TEACHER_OK}"
+                AND {}",
+            exam_standing("a")
         ))
         .map_err(db_err)?
         .query_map(params![now, now - RELEASE_LOOKBACK_MS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
@@ -532,5 +534,18 @@ mod tests {
         take(&w, &w.students[0], &id, T0 + 10 * MIN, 5 * MIN);
         let both = |t: i64| (sweep(&w.conn, t), sweep(&w.conn, t));
         assert_eq!(both(T0 + 3 * H), (Sweep { closing: 0, released: 1 }, Sweep::default()));
+    }
+
+    #[test]
+    fn nothing_is_announced_for_an_exam_in_a_hidden_institution_and_it_catches_up_when_it_is_back() {
+        let w = world();
+        exam(&w, serde_json::json!({ "closes_at": T0 + 30 * H }), T0);
+        let after = exam(&w, serde_json::json!({ "closes_at": T0 + 2 * H, "release_mode": "after_close", "duration_min": 60 }), T0);
+        take(&w, &w.students[0], &after, T0 + 10 * MIN, 5 * MIN);
+        w.conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        assert_eq!(sweep(&w.conn, T0 + 7 * H), Sweep::default(), "students cannot see the exams, so they are told nothing about them");
+        assert_eq!((count(&w, "exam_closing"), count(&w, "exam_results")), (0, 0));
+        w.conn.execute("UPDATE institutions SET is_active = 1 WHERE id = 'i1'", []).unwrap();
+        assert_eq!(sweep(&w.conn, T0 + 7 * H), Sweep { closing: 5, released: 1 }, "back on: the next sweep announces what was held back");
     }
 }

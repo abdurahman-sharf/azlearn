@@ -189,8 +189,13 @@ fn clean_sources(sources: &Option<HashMap<String, String>>, questions: &[Questio
     Ok(out)
 }
 
+/// Whether students can reach the subject: it AND its institution are switched on (404 when it does not exist).
 fn subject_state(conn: &Connection, id: &str) -> Res<bool> {
-    conn.query_row("SELECT is_active FROM subjects WHERE id = ?1", params![id], |r| r.get(0))
+    conn.query_row(
+        "SELECT s.is_active AND i.is_active FROM subjects s JOIN institutions i ON i.id = s.institution_id WHERE s.id = ?1",
+        params![id],
+        |r| r.get(0),
+    )
         .optional()
         .map_err(db_err)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))
@@ -856,5 +861,20 @@ mod tests {
         assert_eq!((page.items.len(), page.total), (2, 4));
         let page2 = list_exams(&w.conn, &w.admin, &ListQuery { limit: Some(2), offset: Some(2), status: Some("all".into()), ..Default::default() }, NOW).unwrap();
         assert!(page.items.iter().all(|a| page2.items.iter().all(|b| a.info.id != b.info.id)));
+    }
+
+    #[test]
+    fn an_exam_cannot_be_published_into_a_hidden_institution_but_drafting_stays_possible() {
+        let w = world();
+        let draft = create_exam(&w.conn, &w.admin, &basic(json!({})), NOW).unwrap();
+        let id = draft.row.info.id.clone();
+        w.conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        let e = act(&w.conn, &w.admin, &id, "publish", NOW).unwrap_err();
+        assert_eq!((e.0, e.1.contains("subject_inactive")), (StatusCode::BAD_REQUEST, true), "the subject is on, its institution is off");
+        let e = create_exam(&w.conn, &w.admin, &basic(json!({"status": "published"})), NOW).unwrap_err();
+        assert_eq!((e.0, e.1.contains("subject_inactive")), (StatusCode::BAD_REQUEST, true));
+        assert!(create_exam(&w.conn, &w.admin, &basic(json!({"title": "مسودة أخرى"})), NOW).is_ok(), "a draft can still be prepared");
+        w.conn.execute("UPDATE institutions SET is_active = 1 WHERE id = 'i1'", []).unwrap();
+        assert_eq!(act(&w.conn, &w.admin, &id, "publish", NOW).unwrap().row.info.status, "published");
     }
 }

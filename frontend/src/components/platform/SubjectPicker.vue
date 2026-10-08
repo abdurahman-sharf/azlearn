@@ -3,14 +3,20 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { usePt, platformErrorMessage, type PlatformKey } from '@/i18n/platform'
 import { getStructure, listInstitutions, type Institution, type Structure, type Unit } from '@/api/platformAdmin'
 import { buildIndex, children, pathToSubject, subtreeSubjects } from '@/utils/structureTree'
+import { activeSubset, subjectSelectable, type AssignmentStatus } from '@/utils/subjectPicker'
 
-// Institution → level/department/year/term (one list per depth, as deep as the structure goes) → subject, for admin
-// screens. The model is the subject id; the last subject is remembered per browser (`remember`).
-const props = withDefaults(defineProps<{ remember?: boolean }>(), { remember: true })
+// Institution → level/department/year/term (one list per depth, as deep as the structure goes) → subject. The model is
+// the subject id; the last subject is remembered per browser (`remember`, admin screens only: with `remember=false` the
+// picker neither reads nor writes that key).
+// - `statusBySubject`: a teacher's assignment per subject id. Subjects that are pending or approved are listed with
+//   their status and cannot be picked (they are already requested); rejected ones stay pickable for a new request.
+// - `activeOnly`: hide inactive institutions, units and subjects (and everything below an inactive unit).
+const props = withDefaults(defineProps<{ remember?: boolean; statusBySubject?: Record<string, AssignmentStatus>; activeOnly?: boolean }>(), { remember: true, statusBySubject: undefined, activeOnly: false })
 const subjectId = defineModel<string>({ default: '' })
 const pt = usePt()
 const KEY = 'exameow-admin-subject'
 const KIND_KEY: Record<string, PlatformKey> = { department: 'kindDepartment', level: 'kindLevel', year: 'kindYear', term: 'kindTerm' }
+const STATUS_KEY: Record<AssignmentStatus, PlatformKey> = { pending: 'statusPending', approved: 'statusApproved', rejected: 'statusRejected' }
 
 const institutions = ref<Institution[]>([])
 const structure = ref<Structure | null>(null)
@@ -19,8 +25,19 @@ const institutionId = ref('')
 const unitPath = ref<string[]>([])
 const error = ref('')
 
-const idx = computed(() => (structure.value ? buildIndex(structure.value.units, structure.value.subjects) : null))
+const shown = computed(() => {
+  const st = structure.value
+  if (!st) return null
+  return props.activeOnly ? activeSubset(st.units, st.subjects) : { units: st.units, subjects: st.subjects }
+})
+const idx = computed(() => (shown.value ? buildIndex(shown.value.units, shown.value.subjects) : null))
+const shownInstitutions = computed(() => (props.activeOnly ? institutions.value.filter((i) => i.is_active) : institutions.value))
 const suffix = (active: boolean) => (active ? '' : ` (${pt('inactive')})`)
+const statusOf = (id: string): AssignmentStatus | undefined => props.statusBySubject?.[id]
+const statusSuffix = (id: string) => {
+  const st = statusOf(id)
+  return st ? ` — ${pt(STATUS_KEY[st])}` : ''
+}
 
 interface Level { depth: number; options: Unit[]; value: string; label: string }
 /** One select per depth: the children of the node chosen above (roots first), until "all" is chosen or a leaf is reached. */
@@ -59,7 +76,8 @@ async function loadStructure() {
 }
 
 function pickOnlySubject() {
-  if (subjects.value.length === 1) subjectId.value = subjects.value[0]!.id
+  const only = subjects.value.length === 1 ? subjects.value[0]! : null
+  if (only && subjectSelectable(statusOf(only.id))) subjectId.value = only.id
 }
 
 async function onInstitution() {
@@ -96,10 +114,10 @@ onMounted(async () => {
   let saved: { i?: string; s?: string } = {}
   if (!props.remember) return
   try { saved = JSON.parse(localStorage.getItem(KEY) ?? '{}') } catch { /* ignore */ }
-  if (saved.i && institutions.value.some((i) => i.id === saved.i)) {
+  if (saved.i && shownInstitutions.value.some((i) => i.id === saved.i)) {
     institutionId.value = saved.i
     await loadStructure()
-    if (saved.s && structure.value?.subjects.some((s) => s.id === saved.s)) {
+    if (saved.s && shown.value?.subjects.some((s) => s.id === saved.s)) {
       subjectId.value = saved.s
       onSubject()
     }
@@ -113,7 +131,7 @@ onMounted(async () => {
       <span class="text-label-lg">{{ pt('bankInstitution') }}</span>
       <select v-model="institutionId" class="input-outlined w-full mt-1" data-testid="pick-institution" @change="onInstitution">
         <option value="" disabled></option>
-        <option v-for="i in institutions" :key="i.id" :value="i.id">{{ i.name_ar }}</option>
+        <option v-for="i in shownInstitutions" :key="i.id" :value="i.id">{{ i.name_ar }}</option>
       </select>
     </label>
     <label v-for="l in levels" :key="'u' + l.depth" class="block">
@@ -127,7 +145,7 @@ onMounted(async () => {
       <span class="text-label-lg">{{ pt('bankSubject') }}</span>
       <select v-model="subjectId" class="input-outlined w-full mt-1" :disabled="!subjects.length" data-testid="pick-subject" @change="onSubject">
         <option value="" disabled></option>
-        <option v-for="s in subjects" :key="s.id" :value="s.id">{{ s.name_ar }}{{ suffix(s.is_active) }}</option>
+        <option v-for="s in subjects" :key="s.id" :value="s.id" :disabled="!subjectSelectable(statusOf(s.id))" :data-testid="`pick-subject-option-${s.id}`">{{ s.name_ar }}{{ suffix(s.is_active) }}{{ statusSuffix(s.id) }}</option>
       </select>
     </label>
     <p v-if="institutionId && structure && !subjects.length && !error" class="text-body-sm sm:col-span-2" style="color: rgb(var(--md-on-surface-variant))" data-testid="pick-empty">

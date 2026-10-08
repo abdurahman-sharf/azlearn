@@ -6,6 +6,7 @@ import { usePt, platformErrorMessage } from '@/i18n/platform'
 import ReportButton from '@/components/platform/ReportButton.vue'
 import { getPost, updatePost, deletePost, downloadFile, type Post } from '@/api/platformContent'
 import PageError from '@/components/platform/PageError.vue'
+import ConfirmDeleteDialog from '@/components/platform/ConfirmDeleteDialog.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -29,9 +30,22 @@ async function download() {
 async function unpublish() {
   try { await updatePost(id, { status: 'draft' }); await load() } catch (e) { error.value = platformErrorMessage(pt, e) }
 }
+const deleting = ref(false)
+const deleteBusy = ref(false)
+const deleteError = ref('')
 async function remove() {
-  if (!window.confirm(pt('confirmDelete'))) return
-  try { await deletePost(id); router.replace('/platform') } catch (e) { error.value = platformErrorMessage(pt, e) }
+  if (deleteBusy.value) return
+  deleteBusy.value = true
+  deleteError.value = ''
+  try {
+    await deletePost(id)
+    deleting.value = false
+    await router.replace('/platform')
+  } catch (e) {
+    deleteError.value = platformErrorMessage(pt, e)
+  } finally {
+    deleteBusy.value = false
+  }
 }
 onMounted(load)
 </script>
@@ -57,9 +71,19 @@ onMounted(load)
       <router-link v-if="auth.profile?.id === post.teacher_id" :to="`/platform/posts/${post.id}/edit`" class="btn-outlined">{{ pt('edit') }}</router-link>
       <template v-if="auth.role === 'admin'">
         <button v-if="post.status === 'published'" class="btn-outlined" @click="unpublish">{{ pt('unpublish') }}</button>
-        <button class="btn-outlined" @click="remove">{{ pt('del') }}</button>
+        <button class="btn-outlined" data-testid="post-admin-delete" @click="deleteError = ''; deleting = true">{{ pt('del') }}</button>
       </template>
     </div>
+    <ConfirmDeleteDialog
+      v-if="deleting"
+      :title="`${pt('del')}: ${post.title}`"
+      :message="post.status === 'published' ? `${pt('edDeletePostMsg')} ${pt('edDeletePublished')}` : pt('edDeletePostMsg')"
+      :counts="[{ label: pt('attachment'), value: post.file ? 1 : 0 }]"
+      :busy="deleteBusy"
+      :error="deleteError"
+      @confirm="remove"
+      @close="deleting = false"
+    />
   </div>
   <PageError v-else-if="error" :message="error" />
 </template>

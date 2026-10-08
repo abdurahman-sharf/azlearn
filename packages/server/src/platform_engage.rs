@@ -1,7 +1,7 @@
 //! Student engagement: lesson progress, ratings & reviews, in-app notifications.
 //! Other platform modules call `notify` / `notify_audience` when something worth telling happens.
 
-use crate::platform::{bad, db_err, lock, new_id, opt_text, require_active, require_role, Res, User};
+use crate::platform::{bad, db_err, lock, new_id, opt_text, require_active, require_role, Res, User, INSTITUTION_ACTIVE, SUBJECT_ACTIVE};
 use crate::relay::{err, now_ms};
 use crate::routes::AppState;
 use axum::{
@@ -152,13 +152,16 @@ pub async fn mark_read_handler(State(state): State<Arc<AppState>>, headers: Head
 /// The lesson's course must be visible to the student (published, teacher active+approved) and the
 /// student enrolled in the course's subject.
 fn lesson_accessible(conn: &Connection, student_id: &str, lesson_id: &str) -> Res<bool> {
+    // `visible` = published, teacher active and approved for the subject, subject AND its institution active
     conn.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM lessons l JOIN courses c ON c.id = l.course_id
-           JOIN users u ON u.id = c.teacher_id JOIN subjects s ON s.id = c.subject_id
-           WHERE l.id = ?1 AND c.status = 'published' AND u.status = 'active' AND s.is_active = 1
-             AND EXISTS(SELECT 1 FROM teacher_subjects ts WHERE ts.teacher_id = c.teacher_id AND ts.subject_id = c.subject_id AND ts.status = 'approved')
-             AND EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?2 AND e.subject_id = c.subject_id))",
+        &format!(
+            "SELECT EXISTS(
+               SELECT 1 FROM lessons l JOIN courses c ON c.id = l.course_id
+               JOIN users u ON u.id = c.teacher_id JOIN subjects s ON s.id = c.subject_id
+               WHERE l.id = ?1 AND {}
+                 AND EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?2 AND e.subject_id = c.subject_id))",
+            crate::platform_content::visible("c", "published")
+        ),
         params![lesson_id, student_id],
         |r| r.get(0),
     )
@@ -218,18 +221,19 @@ pub struct ProgressItem {
 }
 
 fn my_progress(conn: &Connection, student_id: &str) -> Res<Vec<ProgressItem>> {
-    conn.prepare(
+    // only courses the student can still open: published, teacher in good standing, subject and institution active
+    conn.prepare(&format!(
         "SELECT c.id, c.title, s.name_ar,
                 (SELECT count(*) FROM lessons l WHERE l.course_id = c.id),
                 (SELECT count(*) FROM lesson_progress p JOIN lessons l ON l.id = p.lesson_id WHERE l.course_id = c.id AND p.student_id = ?1),
                 (SELECT max(p.completed_at) FROM lesson_progress p JOIN lessons l ON l.id = p.lesson_id WHERE l.course_id = c.id AND p.student_id = ?1) AS last
          FROM courses c JOIN subjects s ON s.id = c.subject_id JOIN users u ON u.id = c.teacher_id
-         WHERE c.status = 'published' AND u.status = 'active' AND s.is_active = 1
+         WHERE {}
            AND EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?1 AND e.subject_id = c.subject_id)
-           AND EXISTS(SELECT 1 FROM teacher_subjects ts WHERE ts.teacher_id = c.teacher_id AND ts.subject_id = c.subject_id AND ts.status = 'approved')
            AND last IS NOT NULL
          ORDER BY last DESC LIMIT 20",
-    )
+        crate::platform_content::visible("c", "published")
+    ))
     .map_err(db_err)?
     .query_map(params![student_id], |r| {
         Ok(ProgressItem { course_id: r.get(0)?, title: r.get(1)?, subject_name: r.get(2)?, total: r.get(3)?, completed: r.get(4)? })
@@ -256,7 +260,7 @@ pub struct Review {
     created_at: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ReviewSummary {
     average: f64,
     count: i64,
@@ -273,18 +277,25 @@ fn first_name(full: &str) -> String {
 /// Only students enrolled in the subject (course) or in a subject the teacher is approved for may review.
 fn can_review(conn: &Connection, student_id: &str, target_type: &str, target_id: &str) -> Res<bool> {
     let sql = match target_type {
-        "course" => {
-            "SELECT EXISTS(SELECT 1 FROM courses c JOIN subject_enrollments e ON e.subject_id = c.subject_id AND e.student_id = ?1
-              WHERE c.id = ?2 AND c.status = 'published')"
-        }
-        "teacher" => {
-            "SELECT EXISTS(SELECT 1 FROM teacher_subjects ts JOIN subject_enrollments e ON e.subject_id = ts.subject_id AND e.student_id = ?1
+        // a course can be reviewed while students can see it (published, teacher in good standing, subject and
+        // institution active) and only by someone enrolled in its subject
+        "course" => format!(
+            "SELECT EXISTS(SELECT 1 FROM courses c JOIN users u ON u.id = c.teacher_id JOIN subjects s ON s.id = c.subject_id
+              JOIN subject_enrollments e ON e.subject_id = c.subject_id AND e.student_id = ?1
+              WHERE c.id = ?2 AND {})",
+            crate::platform_content::visible("c", "published")
+        ),
+        // a teacher can be reviewed through an enrolment the student can still see: the subject and its institution
+        // must be active (a hidden institution is hidden everywhere, reviews included)
+        "teacher" => format!(
+            "SELECT EXISTS(SELECT 1 FROM teacher_subjects ts JOIN subjects s ON s.id = ts.subject_id
+              JOIN subject_enrollments e ON e.subject_id = ts.subject_id AND e.student_id = ?1
               JOIN users u ON u.id = ts.teacher_id AND u.role = 'teacher' AND u.status = 'active'
-              WHERE ts.teacher_id = ?2 AND ts.status = 'approved')"
-        }
+              WHERE ts.teacher_id = ?2 AND ts.status = 'approved' AND {SUBJECT_ACTIVE} AND {INSTITUTION_ACTIVE})"
+        ),
         _ => return Err(bad("invalid_target")),
     };
-    conn.query_row(sql, params![student_id, target_id], |r| r.get(0)).map_err(db_err)
+    conn.query_row(&sql, params![student_id, target_id], |r| r.get(0)).map_err(db_err)
 }
 
 fn review_owner(conn: &Connection, target_type: &str, target_id: &str) -> Res<Option<(String, String)>> {
@@ -344,6 +355,16 @@ fn upsert_review(conn: &Connection, student: &User, r: &ReviewReq) -> Res<()> {
 fn review_summary(conn: &Connection, viewer: &User, target_type: &str, target_id: &str) -> Res<ReviewSummary> {
     if target_type != "course" && target_type != "teacher" {
         return Err(bad("invalid_target"));
+    }
+    if target_type == "course" && viewer.role != "admin" {
+        // the ratings, comments and reviewer names of a course are shown only while students can see the course
+        // (published, teacher in good standing, subject and institution active) - or to its owner
+        let owner: Option<String> =
+            conn.query_row("SELECT teacher_id FROM courses WHERE id = ?1", params![target_id], |r| r.get(0)).optional().map_err(db_err)?;
+        let shown = owner.as_deref() == Some(viewer.id.as_str()) || crate::platform_content::visible_to_public(conn, "courses", "c", target_id, "published")?;
+        if !shown {
+            return Err(err(StatusCode::NOT_FOUND, "not_found"));
+        }
     }
     let (average, count): (Option<f64>, i64) = conn
         .query_row(
@@ -430,7 +451,7 @@ mod tests {
         let student = insert_test_user(&conn, "s@x.com", "student", "active");
         let outsider = insert_test_user(&conn, "o@x.com", "student", "active");
         let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
-        conn.execute("INSERT INTO teacher_subjects VALUES (?1,'s1','approved',0,0)", params![teacher.id]).unwrap();
+        conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,'s1','approved',0,0)", params![teacher.id]).unwrap();
         conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![student.id]).unwrap();
         conn.execute("INSERT INTO courses VALUES ('c1', ?1, 's1', 'دورة', NULL, 'published', 0, 0)", params![teacher.id]).unwrap();
         for (i, n) in ["l1", "l2", "l3"].iter().enumerate() {
@@ -509,5 +530,70 @@ mod tests {
         mark_read(&w.conn, &w.student.id, &Some(vec![list.items[0].id.clone()])).unwrap();
         assert_eq!(list_notifications(&w.conn, &w.student.id).unwrap().unread, 0);
         assert_eq!(list_notifications(&w.conn, &w.student.id).unwrap().items[0].data["title"], "t");
+    }
+
+    // ───── phase 3-2: a hidden institution takes the course out of reach ─────
+
+    #[test]
+    fn a_hidden_institution_closes_the_lessons_the_progress_list_and_course_reviews() {
+        let w = world();
+        let review = ReviewReq { target_type: "course".into(), target_id: "c1".into(), rating: 4, comment: None };
+        set_complete(&w.conn, &w.student, "l1", true).unwrap();
+        assert!(lesson_accessible(&w.conn, &w.student.id, "l2").unwrap());
+        assert_eq!(my_progress(&w.conn, &w.student.id).unwrap().len(), 1);
+        assert!(review_summary(&w.conn, &w.student, "course", "c1").unwrap().can_review);
+
+        w.conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        assert!(!lesson_accessible(&w.conn, &w.student.id, "l2").unwrap());
+        assert_eq!(set_complete(&w.conn, &w.student, "l2", true).unwrap_err().0, StatusCode::NOT_FOUND, "no new progress in a hidden institution");
+        assert_eq!(set_complete(&w.conn, &w.student, "l1", false).unwrap_err().0, StatusCode::NOT_FOUND, "nor can it be un-ticked");
+        assert!(my_progress(&w.conn, &w.student.id).unwrap().is_empty(), "the course leaves the student's progress list");
+        assert_eq!(upsert_review(&w.conn, &w.student, &review).unwrap_err().0, StatusCode::FORBIDDEN);
+        // the ratings, comments and reviewer names of the hidden course are no longer readable by a student either
+        assert_eq!(review_summary(&w.conn, &w.student, "course", "c1").unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(review_summary(&w.conn, &w.outsider, "course", "c1").unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(review_summary(&w.conn, &w.teacher, "course", "c1").unwrap().count, 0, "the owner still sees their own course");
+        assert_eq!(review_summary(&w.conn, &w.admin, "course", "c1").unwrap().count, 0, "and so does an admin (moderation)");
+        let kept: i64 = w.conn.query_row("SELECT count(*) FROM lesson_progress", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 1, "what the student already did is kept");
+
+        w.conn.execute("UPDATE institutions SET is_active = 1 WHERE id = 'i1'", []).unwrap();
+        assert_eq!(my_progress(&w.conn, &w.student.id).unwrap()[0].completed, 1, "and is there again when the institution is");
+        set_complete(&w.conn, &w.student, "l2", true).unwrap();
+        // the same door closes for the other reasons `visible()` knows about
+        w.conn.execute("UPDATE users SET role = 'student' WHERE id = ?1", params![w.teacher.id]).unwrap();
+        assert!(!lesson_accessible(&w.conn, &w.student.id, "l3").unwrap(), "a teacher whose role changed no longer serves courses");
+    }
+
+    #[test]
+    fn a_hidden_course_or_institution_closes_reviews_for_students() {
+        let w = world();
+        let rev = |t: &str, id: &str| ReviewReq { target_type: t.into(), target_id: id.into(), rating: 5, comment: Some("جيد".into()) };
+        upsert_review(&w.conn, &w.student, &rev("course", "c1")).unwrap();
+        assert_eq!(review_summary(&w.conn, &w.outsider, "course", "c1").unwrap().items.len(), 1, "a visible course shows its reviews");
+        // a draft course: reviews are the owner's and the admin's business only
+        w.conn.execute("UPDATE courses SET status = 'draft' WHERE id = 'c1'", []).unwrap();
+        assert_eq!(review_summary(&w.conn, &w.student, "course", "c1").unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(review_summary(&w.conn, &w.teacher, "course", "c1").unwrap().items.len(), 1);
+        w.conn.execute("UPDATE courses SET status = 'published' WHERE id = 'c1'", []).unwrap();
+        // an id that does not exist is a 404, never an empty (information-free but different) summary
+        assert_eq!(review_summary(&w.conn, &w.student, "course", "nope").unwrap_err().0, StatusCode::NOT_FOUND);
+
+        // a teacher can be reviewed only through an enrolment in a subject whose institution (and the subject) is active
+        assert!(can_review(&w.conn, &w.student.id, "teacher", &w.teacher.id).unwrap());
+        w.conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        assert!(!can_review(&w.conn, &w.student.id, "teacher", &w.teacher.id).unwrap(), "hidden institution");
+        assert_eq!(upsert_review(&w.conn, &w.student, &rev("teacher", &w.teacher.id)).unwrap_err().0, StatusCode::FORBIDDEN);
+        let before: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE kind = 'new_review'", [], |r| r.get(0)).unwrap();
+        w.conn.execute("UPDATE institutions SET is_active = 1 WHERE id = 'i1'", []).unwrap();
+        w.conn.execute("UPDATE subjects SET is_active = 0 WHERE id = 's1'", []).unwrap();
+        assert!(!can_review(&w.conn, &w.student.id, "teacher", &w.teacher.id).unwrap(), "hidden subject");
+        // an enrolment in a second, still visible subject keeps the door open
+        w.conn.execute("INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES ('s2','i1','أخرى',1,0)", []).unwrap();
+        w.conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,'s2','approved',0,0)", params![w.teacher.id]).unwrap();
+        w.conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s2',0)", params![w.student.id]).unwrap();
+        assert!(can_review(&w.conn, &w.student.id, "teacher", &w.teacher.id).unwrap(), "an enrolment that is still visible keeps the door open");
+        let after: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE kind = 'new_review'", [], |r| r.get(0)).unwrap();
+        assert_eq!(before, after);
     }
 }

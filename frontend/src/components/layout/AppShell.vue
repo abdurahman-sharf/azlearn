@@ -10,6 +10,7 @@ import { usePt } from '@/i18n/platform'
 import BrandMark from '@/components/platform/BrandMark.vue'
 import AdminSidebar from '@/components/platform/AdminSidebar.vue'
 import TeacherSidebar from '@/components/platform/TeacherSidebar.vue'
+import SignOutBankDialog from '@/components/platform/SignOutBankDialog.vue'
 import LandingNav from './LandingNav.vue'
 import { isTauri, isMacOS, isWindows, isLinux } from '@/utils/platform'
 import TitleBar from './TitleBar.vue'
@@ -287,6 +288,8 @@ const headerStyle = {
       </div>
     </nav>
     <CookieBanner />
+    <!-- the one "clear the local question banks?" question every sign-out button shares (see composables/signOutBank.ts) -->
+    <SignOutBankDialog />
     <UpdateDialog />
     <LanguageDialog v-if="showLanguageDialog" @close="showLanguageDialog = false" />
   </div>

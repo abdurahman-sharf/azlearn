@@ -137,6 +137,8 @@ pub fn apply_schema(conn: &Connection) -> Result<(), String> {
     // Columns added after the first release.
     add_column_if_missing(conn, "users", "bio", "TEXT")?;
     add_column_if_missing(conn, "users", "consented_at", "INTEGER")?;
+    // The admin's optional note on a teaching decision (phase 3-2); shown to the teacher only.
+    add_column_if_missing(conn, "teacher_subjects", "reason", "TEXT")?;
     Ok(())
 }
 
@@ -451,6 +453,19 @@ pub fn opt_text(raw: &Option<String>, max: usize, code: &str) -> Res<Option<Stri
         Some(t) if t.chars().count() <= max => Ok(Some(t.to_string())),
         _ => Err(bad(code)),
     }
+}
+
+/// SQL condition for the alias `s` (subjects): the subject itself is switched on.
+pub const SUBJECT_ACTIVE: &str = "s.is_active = 1";
+
+/// SQL condition for the alias `s` (subjects): the subject's *institution* is switched on. Hiding an institution
+/// hides everything below it, so every "may students see / may a teacher publish into this subject?" predicate
+/// carries this next to [`SUBJECT_ACTIVE`]. A correlated `EXISTS` instead of a join, so no extra alias is needed.
+pub const INSTITUTION_ACTIVE: &str = "EXISTS(SELECT 1 FROM institutions inst WHERE inst.id = s.institution_id AND inst.is_active = 1)";
+
+/// `%…%` pattern for a case-insensitive `LIKE … ESCAPE '\'`: `%`, `_` and `\` in the search text are literal.
+pub fn like_pattern(raw: &str) -> String {
+    format!("%{}%", raw.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_").to_lowercase())
 }
 
 pub fn audit(conn: &Connection, actor: &str, target: &str, action: &str, detail: &str) {

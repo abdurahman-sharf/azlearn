@@ -5,6 +5,7 @@
 //! before submission.
 
 use crate::platform::{audit, bad, db_err, lock, new_id, opt_text, require_active, require_role, text, Res, User};
+use crate::platform_content::{exam_reason_sql, exam_standing, require_assignment, HiddenReason};
 use crate::relay::{err, grade, now_ms};
 use crate::routes::AppState;
 use axum::{
@@ -304,12 +305,25 @@ impl AssessmentInfo {
     }
 }
 
-pub(crate) const INFO_SELECT: &str = "SELECT a.id, a.teacher_id, COALESCE(u.full_name, cb.full_name, ''), a.subject_id, s.name_ar, a.title, a.description, a.question_count,
+/// The column list `map_info` reads (24 columns), as a macro so `INFO_SELECT` can be built with `concat!` while
+/// `INFO_COLS`/`INFO_FROM` stay available to queries that add a column of their own (e.g. the hidden reason).
+macro_rules! info_cols {
+    () => {
+        "a.id, a.teacher_id, COALESCE(u.full_name, cb.full_name, ''), a.subject_id, s.name_ar, a.title, a.description, a.question_count,
         a.total_points, a.duration_min, a.opens_at, a.closes_at, a.max_attempts, a.show_answers, a.status,
         (SELECT count(*) FROM attempts t WHERE t.assessment_id = a.id AND t.student_id = ?1),
         (SELECT count(*) FROM attempts t WHERE t.assessment_id = a.id),
-        a.shuffle_questions, a.shuffle_options, a.pass_mark, a.release_mode, a.closed_at, a.archived_at, a.created_by
-     FROM assessments a LEFT JOIN users u ON u.id = a.teacher_id LEFT JOIN users cb ON cb.id = a.created_by JOIN subjects s ON s.id = a.subject_id";
+        a.shuffle_questions, a.shuffle_options, a.pass_mark, a.release_mode, a.closed_at, a.archived_at, a.created_by"
+    };
+}
+macro_rules! info_from {
+    () => {
+        "FROM assessments a LEFT JOIN users u ON u.id = a.teacher_id LEFT JOIN users cb ON cb.id = a.created_by JOIN subjects s ON s.id = a.subject_id"
+    };
+}
+pub(crate) const INFO_COLS: &str = info_cols!();
+pub(crate) const INFO_FROM: &str = info_from!();
+pub(crate) const INFO_SELECT: &str = concat!("SELECT ", info_cols!(), " ", info_from!());
 
 pub(crate) fn map_info(r: &rusqlite::Row) -> rusqlite::Result<AssessmentInfo> {
     Ok(AssessmentInfo {
@@ -347,16 +361,12 @@ pub(crate) fn get_info(conn: &Connection, viewer_id: &str, id: &str) -> Res<Asse
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))
 }
 
-/// Shared SQL predicate: an admin-created exam (no teacher) needs nothing more; a teacher's exam needs the
-/// teacher to be active and approved for the subject. Expects aliases `a` (assessments) and `u` (its teacher).
-pub(crate) const TEACHER_OK: &str = "(a.teacher_id IS NULL OR (u.status = 'active'
-            AND EXISTS(SELECT 1 FROM teacher_subjects ts WHERE ts.teacher_id = a.teacher_id AND ts.subject_id = a.subject_id AND ts.status = 'approved')))";
-
-/// Published (or closed, so students can still see it and their results), subject active, teacher in good standing.
+/// Published (or closed, so students can still see it and their results), subject and institution active, teacher in
+/// good standing (an admin exam needs no teacher): [`exam_standing`].
 fn publicly_visible(conn: &Connection, id: &str) -> Res<bool> {
     conn.query_row(
         &format!("SELECT EXISTS(SELECT 1 FROM assessments a LEFT JOIN users u ON u.id = a.teacher_id JOIN subjects s ON s.id = a.subject_id
-          WHERE a.id = ?1 AND a.status IN ('published','closed') AND s.is_active = 1 AND {TEACHER_OK})"),
+          WHERE a.id = ?1 AND a.status IN ('published','closed') AND {})", exam_standing("a")),
         params![id],
         |r| r.get(0),
     )
@@ -405,17 +415,8 @@ pub(crate) fn check_duration(d: Option<i64>) -> Res<()> {
 
 pub(crate) fn create_assessment(conn: &Connection, teacher: &User, r: &AssessmentReq) -> Res<AssessmentInfo> {
     let subject_id = r.subject_id.as_deref().unwrap_or("");
-    let assigned: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM teacher_subjects ts JOIN subjects s ON s.id = ts.subject_id
-             WHERE ts.teacher_id = ?1 AND ts.subject_id = ?2 AND ts.status = 'approved' AND s.is_active = 1)",
-            params![teacher.id, subject_id],
-            |x| x.get(0),
-        )
-        .map_err(db_err)?;
-    if !assigned {
-        return Err(err(StatusCode::FORBIDDEN, "not_assigned"));
-    }
+    // an approved assignment on an active subject of an active institution (403 `not_assigned` otherwise)
+    require_assignment(conn, &teacher.id, subject_id)?;
     let title = text(r.title.as_deref().unwrap_or(""), 200, "invalid_title")?;
     let description = opt_text(&r.description, 2000, "description_too_long")?;
     let questions = r.questions.as_ref().ok_or_else(|| bad("invalid_question_count"))?;
@@ -537,16 +538,12 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
     if status == "draft" && cur.status != "draft" && cur.attempt_count > 0 {
         return Err(err(StatusCode::CONFLICT, "has_attempts"));
     }
-    if status == "published" && is_owner {
-        let ok: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM teacher_subjects WHERE teacher_id = ?1 AND subject_id = ?2 AND status = 'approved')",
-                params![user.id, cur.subject_id],
-                |x| x.get(0),
-            )
-            .map_err(db_err)?;
-        if !ok {
-            return Err(err(StatusCode::FORBIDDEN, "not_assigned"));
+    // Whoever turns it on (the owner on any save that leaves it published, an admin on a transition) needs the owning
+    // teacher to hold a live assignment: nothing is published into a subject it cannot be seen in. An admin exam
+    // (no owner) has no assignment to check.
+    if status == "published" && (is_owner || cur.status != "published") {
+        if let Some(teacher) = &owner {
+            require_assignment(conn, teacher, &cur.subject_id)?;
         }
     }
     if let Some(qs) = &r.questions {
@@ -1253,8 +1250,9 @@ fn results_summary(conn: &Connection, user: &User, id: &str, now: i64) -> Res<Re
 
 fn list_for_subject(conn: &Connection, student_id: &str, subject_id: &str) -> Res<Vec<AssessmentInfo>> {
     conn.prepare(&format!(
-        "{INFO_SELECT} WHERE a.subject_id = ?2 AND a.status = 'published' AND s.is_active = 1 AND {TEACHER_OK}
-         ORDER BY a.updated_at DESC LIMIT 50"
+        "{INFO_SELECT} WHERE a.subject_id = ?2 AND a.status = 'published' AND {}
+         ORDER BY a.updated_at DESC LIMIT 50",
+        exam_standing("a")
     ))
     .map_err(db_err)?
     .query_map(params![student_id, subject_id], map_info)
@@ -1263,21 +1261,43 @@ fn list_for_subject(conn: &Connection, student_id: &str, subject_id: &str) -> Re
     .map_err(db_err)
 }
 
-fn list_mine(conn: &Connection, teacher_id: &str) -> Res<Vec<AssessmentInfo>> {
-    conn.prepare(&format!("{INFO_SELECT} WHERE a.teacher_id = ?1 ORDER BY a.updated_at DESC LIMIT 100"))
+/// A teacher's exam as its owner sees it: the usual fields plus whether students can see it right now and, when it is
+/// published/closed but not shown, why (the same reasons as `GET /my/content`).
+#[derive(Serialize, Debug)]
+pub struct MineExam {
+    #[serde(flatten)]
+    info: AssessmentInfo,
+    visible: bool,
+    hidden_reason: Option<HiddenReason>,
+}
+
+/// Students see `published` and `closed` exams (a closed one keeps its results); a draft or archived one is simply
+/// not shown and has no reason.
+fn shown_state(status: &str) -> bool {
+    matches!(status, "published" | "closed")
+}
+
+fn list_mine(conn: &Connection, teacher_id: &str) -> Res<Vec<MineExam>> {
+    // column 24 (after the 24 of `map_info`) is the reason; `?1` = the teacher, which is also the viewer
+    conn.prepare(&format!("SELECT {INFO_COLS}, ({}) {INFO_FROM} WHERE a.teacher_id = ?1 ORDER BY a.updated_at DESC LIMIT 100", exam_reason_sql("a")))
         .map_err(db_err)?
-        .query_map(params![teacher_id], map_info)
+        .query_map(params![teacher_id], |r| Ok((map_info(r)?, r.get::<_, Option<String>>(24)?)))
         .map_err(db_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_err)
+        .map(|row| {
+            let (info, reason) = row.map_err(db_err)?;
+            let (visible, hidden_reason) = crate::platform_content::presence(shown_state(&info.status), reason);
+            Ok(MineExam { info, visible, hidden_reason })
+        })
+        .collect()
 }
 
 /// Published assessments of the student's enrolled subjects.
 pub(crate) fn list_available(conn: &Connection, student_id: &str) -> Res<Vec<AssessmentInfo>> {
     conn.prepare(&format!(
-        "{INFO_SELECT} WHERE a.status = 'published' AND s.is_active = 1 AND {TEACHER_OK}
+        "{INFO_SELECT} WHERE a.status = 'published' AND {}
            AND EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?1 AND e.subject_id = a.subject_id)
-         ORDER BY a.updated_at DESC LIMIT 30"
+         ORDER BY a.updated_at DESC LIMIT 30",
+        exam_standing("a")
     ))
     .map_err(db_err)?
     .query_map(params![student_id], map_info)
@@ -1447,7 +1467,7 @@ pub async fn subject_list_handler(State(s): State<Arc<AppState>>, h: HeaderMap, 
     list_for_subject(&*lock(&s)?, &u.id, &id).map(Json)
 }
 
-pub async fn mine_handler(State(s): State<Arc<AppState>>, h: HeaderMap) -> Res<Json<Vec<AssessmentInfo>>> {
+pub async fn mine_handler(State(s): State<Arc<AppState>>, h: HeaderMap) -> Res<Json<Vec<MineExam>>> {
     let u = require_role(&s, &h, "teacher")?;
     list_mine(&*lock(&s)?, &u.id).map(Json)
 }
@@ -1499,7 +1519,7 @@ mod tests {
         let teacher = insert_test_user(&conn, "t@x.com", "teacher", "active");
         let student = insert_test_user(&conn, "s@x.com", "student", "active");
         let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
-        conn.execute("INSERT INTO teacher_subjects VALUES (?1,'s1','approved',0,0)", params![teacher.id]).unwrap();
+        conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,'s1','approved',0,0)", params![teacher.id]).unwrap();
         conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![student.id]).unwrap();
         let req = AssessmentReq {
             subject_id: Some("s1".into()), title: Some("اختبار".into()), description: None, questions: Some(questions()),
@@ -1811,6 +1831,142 @@ mod tests {
         w.conn.execute("UPDATE assessments SET status = 'draft' WHERE id = ?1", params![w.id]).unwrap();
         let edit = AssessmentReq { title: Some("تعديل آخر".into()), ..status_patch("draft") };
         assert_eq!(update_assessment(&w.conn, &w.teacher, &w.id, &edit).unwrap().status, "draft");
+    }
+
+    // ───── phase 3-2: a hidden institution, and the owner's view of each exam ─────
+
+    fn patch_json(v: serde_json::Value) -> AssessmentReq {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// An exam created by an admin (no teacher) in `s1`.
+    fn admin_exam(w: &W, id: &str, status: &str) {
+        w.conn
+            .execute(
+                "INSERT INTO assessments(id,teacher_id,created_by,subject_id,title,questions,question_count,total_points,status,created_at,updated_at) VALUES (?1,NULL,?2,'s1','امتحان المدير','[]',1,1,?3,0,0)",
+                params![id, w.admin.id, status],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_hidden_institution_hides_exams_refuses_attempts_and_blocks_creating_and_publishing() {
+        let w = world(true, None, 2);
+        admin_exam(&w, "ea", "published");
+        let shown = |w: &W| (list_available(&w.conn, &w.student.id).unwrap().len(), list_for_subject(&w.conn, &w.student.id, "s1").unwrap().len(), publicly_visible(&w.conn, &w.id).unwrap(), publicly_visible(&w.conn, "ea").unwrap());
+        assert_eq!(shown(&w), (2, 2, true, true));
+
+        w.conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        assert_eq!(shown(&w), (0, 0, false, false), "the teacher's exam and the admin's exam alike");
+        for id in [w.id.as_str(), "ea"] {
+            assert_eq!(start_attempt(&w.conn, &w.student, id, now_ms()).unwrap_err().0, StatusCode::NOT_FOUND, "{id}");
+        }
+        // nothing new in it: a draft is already refused, like a published exam
+        let new_exam = |status: &str| patch_json(json!({ "subject_id": "s1", "title": "x", "questions": questions(), "status": status }));
+        for status in ["draft", "published"] {
+            let e = create_assessment(&w.conn, &w.teacher, &new_exam(status)).unwrap_err();
+            assert_eq!((e.0, code(&e).contains("not_assigned")), (StatusCode::FORBIDDEN, true), "{status}");
+        }
+        // the owner cannot save it as published any more, but may pull it back to a draft
+        let e = update_assessment(&w.conn, &w.teacher, &w.id, &patch_json(json!({ "title": "جديد" }))).unwrap_err();
+        assert_eq!((e.0, code(&e).contains("not_assigned")), (StatusCode::FORBIDDEN, true));
+        assert_eq!(update_assessment(&w.conn, &w.teacher, &w.id, &patch_json(json!({ "status": "draft" }))).unwrap().status, "draft");
+        let e = update_assessment(&w.conn, &w.teacher, &w.id, &patch_json(json!({ "status": "published" }))).unwrap_err();
+        assert_eq!(e.0, StatusCode::FORBIDDEN, "and cannot publish it again");
+
+        w.conn.execute("UPDATE institutions SET is_active = 1 WHERE id = 'i1'", []).unwrap();
+        assert_eq!(update_assessment(&w.conn, &w.teacher, &w.id, &patch_json(json!({ "status": "published" }))).unwrap().status, "published");
+        assert!(start_attempt(&w.conn, &w.student, "ea", now_ms()).is_ok());
+    }
+
+    #[test]
+    fn anyone_who_switches_an_exam_on_needs_the_owner_to_hold_a_live_assignment() {
+        let w = world(true, None, 1);
+        w.conn.execute("UPDATE assessments SET status = 'draft'", []).unwrap();
+        w.conn.execute("UPDATE teacher_subjects SET status = 'rejected'", []).unwrap();
+        let publish = || patch_json(json!({ "status": "published" }));
+        for who in [&w.teacher, &w.admin] {
+            let e = update_assessment(&w.conn, who, &w.id, &publish()).unwrap_err();
+            assert_eq!((e.0, code(&e).contains("not_assigned")), (StatusCode::FORBIDDEN, true), "{}", who.role);
+        }
+        assert_eq!(get_info(&w.conn, "", &w.id).unwrap().status, "draft");
+        w.conn.execute("UPDATE teacher_subjects SET status = 'approved'", []).unwrap();
+        assert_eq!(update_assessment(&w.conn, &w.admin, &w.id, &publish()).unwrap().status, "published", "moderation by an admin works while the assignment stands");
+        // an admin exam has no owner whose assignment could be missing
+        w.conn.execute("DELETE FROM teacher_subjects", []).unwrap();
+        admin_exam(&w, "ea", "draft");
+        assert_eq!(update_assessment(&w.conn, &w.admin, "ea", &publish()).unwrap().status, "published");
+    }
+
+    #[test]
+    fn the_owners_exam_list_agrees_with_what_students_are_served_across_the_whole_matrix() {
+        let w = world(true, None, 1);
+        let accounts = [("active", "teacher"), ("pending", "teacher"), ("suspended", "teacher"), ("rejected", "teacher"), ("active", "student")];
+        let assignments = [None, Some("pending"), Some("rejected"), Some("approved")];
+        let mut cases = 0;
+        for (status, role) in accounts {
+            for assignment in assignments {
+                for subject_on in [true, false] {
+                    for institution_on in [true, false] {
+                        w.conn.execute("UPDATE users SET status = ?1, role = ?2 WHERE id = ?3", params![status, role, w.teacher.id]).unwrap();
+                        w.conn.execute("DELETE FROM teacher_subjects", []).unwrap();
+                        if let Some(a) = assignment {
+                            w.conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at) VALUES (?1,'s1',?2,0)", params![w.teacher.id, a]).unwrap();
+                        }
+                        w.conn.execute("UPDATE subjects SET is_active = ?1", params![subject_on]).unwrap();
+                        w.conn.execute("UPDATE institutions SET is_active = ?1", params![institution_on]).unwrap();
+                        let expected = if !(status == "active" && role == "teacher") {
+                            Some(HiddenReason::AccountInactive)
+                        } else if !institution_on {
+                            Some(HiddenReason::InstitutionInactive)
+                        } else if !subject_on {
+                            Some(HiddenReason::SubjectInactive)
+                        } else if assignment != Some("approved") {
+                            Some(HiddenReason::NoAssignment)
+                        } else {
+                            None
+                        };
+                        let case = format!("{status}/{role} assignment={assignment:?} subject_on={subject_on} institution_on={institution_on}");
+                        let served = !list_available(&w.conn, &w.student.id).unwrap().is_empty();
+                        assert_eq!(served, expected.is_none(), "served: {case}");
+                        let mine = list_mine(&w.conn, &w.teacher.id).unwrap();
+                        assert_eq!((mine[0].visible, mine[0].hidden_reason), (expected.is_none(), expected), "owner's view: {case}");
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 5 * 4 * 2 * 2);
+    }
+
+    #[test]
+    fn the_owners_exam_list_has_no_reason_for_exams_that_are_simply_not_published() {
+        let w = world(true, None, 1);
+        w.conn.execute("UPDATE institutions SET is_active = 0", []).unwrap();
+        let one = |w: &W| {
+            let m = list_mine(&w.conn, &w.teacher.id).unwrap();
+            (m[0].visible, m[0].hidden_reason)
+        };
+        assert_eq!(one(&w), (false, Some(HiddenReason::InstitutionInactive)), "published and hidden");
+        w.conn.execute("UPDATE assessments SET status = 'closed'", []).unwrap();
+        assert_eq!(one(&w), (false, Some(HiddenReason::InstitutionInactive)), "a closed exam is shown to students (their results), so it can be hidden too");
+        for status in ["draft", "archived"] {
+            w.conn.execute("UPDATE assessments SET status = ?1", params![status]).unwrap();
+            assert_eq!(one(&w), (false, None), "{status} is not published, so it is not 'hidden'");
+        }
+        w.conn.execute("UPDATE institutions SET is_active = 1", []).unwrap();
+        w.conn.execute("UPDATE assessments SET status = 'closed'", []).unwrap();
+        assert_eq!(one(&w), (true, None), "closed and standing: still shown");
+        assert_eq!(publicly_visible(&w.conn, &w.id).unwrap(), true, "and the student-side predicate agrees");
+        // still an array of assessments with every field the list used before, plus the two new ones
+        let json = serde_json::to_value(list_mine(&w.conn, &w.teacher.id).unwrap()).unwrap();
+        let first = json[0].as_object().unwrap();
+        for key in ["id", "teacher_id", "subject_id", "subject_name", "title", "question_count", "total_points", "status", "attempt_count", "pass_mark", "release_mode", "visible", "hidden_reason"] {
+            assert!(first.contains_key(key), "{key} in {first:?}");
+        }
+        // another teacher's exam is never in my list
+        let other = insert_test_user(&w.conn, "o@x.com", "teacher", "active");
+        assert!(list_mine(&w.conn, &other.id).unwrap().is_empty());
     }
 }
 

@@ -14,6 +14,8 @@ const props = defineProps<{
   kept?: string
   confirmName?: string
   confirmKind?: 'name' | 'email'
+  /** text of the red button; the default is "Delete" (use it for actions that delete nothing, e.g. withdrawing from a subject) */
+  confirmLabel?: string
   busy?: boolean
   error?: string
 }>()
@@ -47,7 +49,7 @@ const allowed = computed(() => !props.confirmName || norm(typed.value) === norm(
       <p v-if="props.error" role="alert" class="text-body-sm font-semibold" style="color: rgb(var(--md-error))">{{ props.error }}</p>
       <div class="flex gap-2 justify-end">
         <button type="button" class="btn-outlined" :data-autofocus="props.confirmName ? undefined : ''" @click="emit('close')">{{ pt('cancel') }}</button>
-        <button type="submit" class="btn-filled" :disabled="props.busy || !allowed" style="background-color: rgb(var(--md-error)); color: rgb(var(--md-on-error))" data-testid="confirm-yes">{{ pt('del') }}</button>
+        <button type="submit" class="btn-filled" :disabled="props.busy || !allowed" style="background-color: rgb(var(--md-error)); color: rgb(var(--md-on-error))" data-testid="confirm-yes">{{ props.confirmLabel ?? pt('del') }}</button>
       </div>
     </form>
   </div>

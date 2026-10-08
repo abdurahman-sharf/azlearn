@@ -1,5 +1,6 @@
 import { platformFetch } from '@/lib/platformApi'
 import type { Question } from '@exameow/shared'
+import type { HiddenReason } from './platformContent'
 
 export interface AssessmentInfo {
   /** null for exams created by an admin */
@@ -10,6 +11,9 @@ export interface AssessmentInfo {
   attempts_used: number; attempt_count: number
   shuffle_questions: boolean; shuffle_options: boolean; pass_mark: number | null
   release_mode: 'immediate' | 'after_close'; closed_at: number | null; archived_at: number | null; created_by: string | null
+  /** only on the owner's list (`/assessments/mine`): whether students can see this exam, and if not why not */
+  visible?: boolean
+  hidden_reason?: HiddenReason | null
 }
 export interface MyAttempt {
   attempt_id: string; assessment_id: string; title: string

@@ -166,7 +166,9 @@ async fn main() {
         .route("/api/platform/me/placement", get(platform_learning::get_placement_handler).put(platform_learning::set_placement_handler))
         .route("/api/platform/teaching", get(platform_learning::my_teaching_handler).post(platform_learning::request_teaching_handler))
         .route("/api/platform/teaching/{subject_id}", delete(platform_learning::drop_teaching_handler))
+        .route("/api/platform/teaching/{subject_id}/impact", get(platform_learning::teaching_impact_handler))
         .route("/api/platform/admin/teaching", get(platform_learning::admin_teaching_handler).patch(platform_learning::admin_decide_teaching_handler))
+        .route("/api/platform/admin/teaching/impact", get(platform_learning::admin_teaching_impact_handler))
         .route("/api/platform/enrollments", get(platform_learning::my_enrollments_handler).post(platform_learning::enroll_handler))
         .route("/api/platform/enrollments/{subject_id}", delete(platform_learning::unenroll_handler))
         .route("/api/platform/teachers", get(platform_learning::list_teachers_handler))
@@ -178,6 +180,7 @@ async fn main() {
             "/api/platform/posts/{id}",
             get(platform_content::get_post_handler).patch(platform_content::update_post_handler).delete(platform_content::delete_post_handler),
         )
+        .route("/api/platform/posts/{id}/duplicate", post(platform_content::duplicate_post_handler))
         .route(
             "/api/platform/posts/{id}/file",
             post(platform_content::upload_file_handler).delete(platform_content::remove_file_handler).layer(platform_content::upload_limit()),
@@ -188,6 +191,7 @@ async fn main() {
             "/api/platform/courses/{id}",
             get(platform_content::get_course_handler).patch(platform_content::update_course_handler).delete(platform_content::delete_course_handler),
         )
+        .route("/api/platform/courses/{id}/duplicate", post(platform_content::duplicate_course_handler))
         .route("/api/platform/courses/{id}/lessons", post(platform_content::add_lesson_handler))
         .route(
             "/api/platform/lessons/{id}",
@@ -197,7 +201,7 @@ async fn main() {
         .route("/api/platform/live", post(platform_content::create_live_handler))
         .route(
             "/api/platform/live/{id}",
-            axum::routing::patch(platform_content::update_live_handler).delete(platform_content::delete_live_handler),
+            get(platform_content::get_live_handler).patch(platform_content::update_live_handler).delete(platform_content::delete_live_handler),
         )
         .route("/api/platform/subjects/{id}/content", get(platform_content::subject_content_handler))
         .route("/api/platform/teachers/{id}/content", get(platform_content::teacher_content_handler))

@@ -550,6 +550,28 @@ fn purge_dangling_references(conn: &Connection, user_id: &str) -> Res<()> {
     Ok(())
 }
 
+/// Removes the reviews and reports that point at ONE piece of content that is being deleted (`post`, `course` or
+/// `live`), for the same reason as [`purge_dangling_references`]: neither table has a foreign key to its target.
+/// A course takes its reviews, the reports about those reviews and the reports about the course itself with it.
+/// The caller runs it in the same transaction as the delete, so it never touches content that survives.
+pub(crate) fn purge_target_references(conn: &Connection, target_type: &str, target_id: &str) -> Res<()> {
+    match target_type {
+        "course" => {
+            conn.execute(
+                "DELETE FROM reports WHERE target_type = 'review'
+                   AND target_id IN (SELECT id FROM reviews WHERE target_type = 'course' AND target_id = ?1)",
+                params![target_id],
+            )
+            .map_err(db_err)?;
+            conn.execute("DELETE FROM reviews WHERE target_type = 'course' AND target_id = ?1", params![target_id]).map_err(db_err)?;
+        }
+        "post" | "live" => {}
+        _ => return Err(bad("invalid_target")),
+    }
+    conn.execute("DELETE FROM reports WHERE target_type = ?1 AND target_id = ?2", params![target_type, target_id]).map_err(db_err)?;
+    Ok(())
+}
+
 /// Deletes the account and everything it owns, in one transaction (all or nothing). The foreign keys cascade the
 /// user's content, sessions, progress, enrolments and notifications; `purge_dangling_references` removes what the
 /// foreign keys cannot reach. `assessments.teacher_id` is deliberately never set to NULL: NULL means "admin exam".
@@ -627,7 +649,7 @@ mod tests {
         let teacher = insert_test_user(&conn, "t@x.com", "teacher", "active");
         let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
         let students: Vec<User> = (0..4).map(|i| insert_test_user(&conn, &format!("s{i}@x.com"), "student", "active")).collect();
-        conn.execute("INSERT INTO teacher_subjects VALUES (?1,'s1','approved',0,0)", params![teacher.id]).unwrap();
+        conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,'s1','approved',0,0)", params![teacher.id]).unwrap();
         conn.execute("INSERT INTO posts VALUES ('p1', ?1, 's1', 'article', 'مقال عن البرمجة', 'نص', 'published', NULL, 0, 0)", params![teacher.id]).unwrap();
         conn.execute("INSERT INTO courses VALUES ('c1', ?1, 's1', 'دورة بايثون', NULL, 'published', 0, 0)", params![teacher.id]).unwrap();
         conn.execute("UPDATE users SET full_name = 'د. خالد البرمجي' WHERE id = ?1", params![teacher.id]).unwrap();
@@ -683,7 +705,7 @@ mod tests {
     fn stats_count_correctly() {
         let w = world();
         insert_test_user(&w.conn, "p@x.com", "teacher", "pending");
-        w.conn.execute("INSERT INTO teacher_subjects VALUES (?1,'s1','pending',0,NULL)", params![w.students[0].id]).unwrap();
+        w.conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,'s1','pending',0,NULL)", params![w.students[0].id]).unwrap();
         let s = stats(&w.conn, 1).unwrap();
         assert_eq!((s.pending_teachers, s.pending_teaching, s.subjects), (1, 1, 1));
         assert_eq!(s.users["student"], 4);
@@ -699,13 +721,13 @@ mod tests {
         let rejected = insert_test_user(&w.conn, "r@x.com", "teacher", "rejected");
         for t in [&pending, &rejected] {
             for s in ["s1", "s2"] {
-                w.conn.execute("INSERT INTO teacher_subjects VALUES (?1,?2,'pending',0,NULL)", params![t.id, s]).unwrap();
+                w.conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,?2,'pending',0,NULL)", params![t.id, s]).unwrap();
             }
         }
         // an active teacher has one real request waiting and one already decided
         let active = insert_test_user(&w.conn, "a2@x.com", "teacher", "active");
-        w.conn.execute("INSERT INTO teacher_subjects VALUES (?1,'s2','pending',0,NULL)", params![active.id]).unwrap();
-        w.conn.execute("INSERT INTO teacher_subjects VALUES (?1,'s1','rejected',0,0)", params![active.id]).unwrap();
+        w.conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,'s2','pending',0,NULL)", params![active.id]).unwrap();
+        w.conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,'s1','rejected',0,0)", params![active.id]).unwrap();
         let s = stats(&w.conn, 1).unwrap();
         assert_eq!(s.pending_teaching, 1, "only the active teacher's waiting request is actionable");
         assert_eq!(s.pending_teachers, 1, "the pending ACCOUNT is what the admin has to decide first");
@@ -1055,5 +1077,41 @@ mod tests {
         let page2 = list_audit(&w.conn, Some(page1.last().unwrap().id)).unwrap();
         assert_eq!(page2.len(), 10);
         assert_eq!(page1[0].actor.as_deref(), Some("T"));
+    }
+
+    // ───── phase 3-2: a hidden institution leaves the search; content cleanup helper ─────
+
+    #[test]
+    fn a_hidden_institution_takes_its_subjects_courses_and_posts_out_of_the_search() {
+        let w = world();
+        let found = |q: &str| {
+            let r = search(&w.conn, q).unwrap();
+            (r.subjects.len(), r.courses.len(), r.posts.len())
+        };
+        assert_eq!((found("برمج"), found("بايثون")), ((1, 0, 1), (0, 1, 0)));
+        w.conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        assert_eq!((found("برمج"), found("بايثون")), ((0, 0, 0), (0, 0, 0)), "subject, course and post are all gone from the results");
+        assert_eq!(search(&w.conn, "خالد").unwrap().teachers.len(), 1, "the person is still findable; their page just lists nothing hidden");
+        w.conn.execute("UPDATE institutions SET is_active = 1 WHERE id = 'i1'", []).unwrap();
+        assert_eq!(found("بايثون"), (0, 1, 0));
+    }
+
+    #[test]
+    fn purging_the_references_of_one_item_knows_exactly_three_kinds_and_touches_only_that_item() {
+        let w = world();
+        let reporter = &w.students[0];
+        let report = |id: &str, ttype: &str, tid: &str| {
+            w.conn.execute("INSERT INTO reports(id,reporter_id,target_type,target_id,reason,status,created_at) VALUES (?1,?2,?3,?4,'سبب','open',0)", params![id, reporter.id, ttype, tid]).unwrap();
+        };
+        report("r1", "post", "p1");
+        report("r2", "post", "other");
+        report("r3", "assessment", "p1"); // same id, another kind of target: never matched
+        purge_target_references(&w.conn, "post", "p1").unwrap();
+        let left: Vec<String> = w.conn.prepare("SELECT id FROM reports ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(left, ["r2", "r3"]);
+        for unknown in ["review", "teacher", "assessment", "", "posts"] {
+            assert_eq!(purge_target_references(&w.conn, unknown, "x").unwrap_err().0, StatusCode::BAD_REQUEST, "{unknown:?}");
+        }
+        purge_target_references(&w.conn, "live", "nothing").unwrap(); // nothing to remove is fine
     }
 }

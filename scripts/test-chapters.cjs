@@ -16,7 +16,7 @@ require.extensions['.ts'] = (module, filename) => {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText, filename)
 }
-for (const name of ['chapters', 'practiceFilter', 'questionMetadata', 'importParser', 'arabicImport', 'structureTree', 'examBuilder', 'teacherOnboarding', 'platformGuard']) {
+for (const name of ['chapters', 'practiceFilter', 'questionMetadata', 'importParser', 'arabicImport', 'structureTree', 'examBuilder', 'teacherOnboarding', 'platformGuard', 'videoKind', 'subjectPicker', 'localBanks', 'teachingCards', 'contentHub', 'notificationText']) {
   require(path.join(root, `frontend/src/utils/${name}.test.ts`))
 }
 const direct = require(path.join(root, 'frontend/src/utils/aiClient.ts'))
