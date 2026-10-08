@@ -67,8 +67,16 @@ let failures = 0; const ok = (label, cond) => { console.log((cond ? 'PASS' : 'FA
   const answersFor = i => { const a = {}; for (const q of plan[i].right) { const shown = S[i].questions.find(x => x.id === q.id); if (q.type === 'true_false') a[q.id] = 'A'; else { const want = q.answer.split('').map(c => q.options['ABCDE'.indexOf(c)]); a[q.id] = shown.options.map((t, k) => want.includes(t) ? 'ABCDE'[k] : '').join('') } } return a }
 
   // ── autosave storm: every student saves 10 times in a row (the last one carries the real answers), all 300 streams at once
+  // BACKUP_DURING=1 takes a full backup (consistent snapshot + zip) in the middle of the storm: the exam must not notice
+  const backupDuring = process.env.BACKUP_DURING === '1'
+  const backup = backupDuring ? new Promise(r => setTimeout(r, 400)).then(() => call('POST', '/admin/backup', admin)) : null
   const saves = (await Promise.all(ids.map(async i => { const rs = []; for (let r = 0; r < 10; r++) rs.push(await call('PUT', `/attempts/${S[i].attempt_id}/answers`, tok[i], { answers: r === 9 ? answersFor(i) : {} })); return rs }))).flat()
   stats('AUTOSAVE storm (300 streams x 10)', saves)
+  if (backup) {
+    const b = await backup
+    console.log(`   backup taken during the storm: HTTP ${b.status} in ${b.ms.toFixed(0)} ms, ${b.json && (b.json.size / 1024).toFixed(0)} KiB`)
+    ok('the backup succeeded while 300 students were saving, and no save failed', b.status === 200 && b.json.ok && saves.every(r => r.status === 200))
+  }
   console.log(`server RSS after the storm: ${rssMb()} MB`)
   // ── steady state: one save per student per second for 10 s (about 30x the real rate of one per 30 s)
   const steady = []; for (let sec = 0; sec < 10; sec++) { const t0 = Date.now(); steady.push(...await Promise.all(ids.map(i => call('PUT', `/attempts/${S[i].attempt_id}/answers`, tok[i], { answers: answersFor(i) })))); await new Promise(r => setTimeout(r, Math.max(0, 1000 - (Date.now() - t0)))) }

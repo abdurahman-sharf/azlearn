@@ -30,6 +30,16 @@ impl AIClient {
         let endpoint = stripped.trim_end_matches('/').to_string();
         let client = reqwest::Client::builder()
             .no_proxy()
+            // A provider has no reason to bounce us to another host; following such a redirect would let a
+            // public-looking endpoint steer the server at internal addresses (SSRF), so only same-host hops are followed.
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                let same_host = attempt.previous().first().is_some_and(|first| first.host_str() == attempt.url().host_str());
+                if attempt.previous().len() >= 3 || !same_host {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            }))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {

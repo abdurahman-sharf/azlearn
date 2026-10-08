@@ -1,6 +1,6 @@
 use axum::{
     extract::{Multipart, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::Response,
     Json,
 };
@@ -19,6 +19,7 @@ pub struct AppState {
     pub relay: crate::relay::RelayState,
     pub platform: crate::platform::PlatformState,
     pub admin_token: Mutex<String>,
+    pub legacy: crate::legacy_guard::LegacyGuard,
 }
 
 #[derive(Deserialize)]
@@ -41,24 +42,106 @@ fn ai_endpoint() -> String { std::env::var("AI_ENDPOINT").unwrap_or_default() }
 fn ai_api_key() -> String { std::env::var("AI_API_KEY").unwrap_or_default() }
 fn ai_model() -> String { std::env::var("AI_MODEL").unwrap_or_default() }
 
+/// The AI connection a legacy request will use.
+pub struct Resolved {
+    pub endpoint: String,
+    pub api_key: String,
+    pub model: String,
+    /// The caller sent no key, so the server's `AI_API_KEY` pays for this call.
+    pub used_server_key: bool,
+    /// The caller named an endpoint other than the operator's `AI_ENDPOINT` (that one is trusted, this one is not).
+    pub custom_endpoint: bool,
+}
+
+fn same_endpoint(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('/').eq_ignore_ascii_case(b.trim().trim_end_matches('/'))
+}
+
+/// Merges what the caller sent with the server's `AI_*` environment. The server's key is only ever used with the
+/// server's own endpoint — a caller-chosen endpoint without a caller key is refused, never sent the operator's key.
+fn resolve_ai(endpoint: Option<&str>, api_key: Option<&str>, model: Option<&str>) -> Result<Resolved, (StatusCode, String)> {
+    resolve_with((ai_endpoint(), ai_api_key(), ai_model()), endpoint, api_key, model)
+}
+
+fn resolve_with(
+    (server_endpoint, server_key, server_model): (String, String, String),
+    endpoint: Option<&str>,
+    api_key: Option<&str>,
+    model: Option<&str>,
+) -> Result<Resolved, (StatusCode, String)> {
+    let no_config = || (StatusCode::BAD_REQUEST, "No AI config (set AI_ENDPOINT/AI_API_KEY env vars)".to_string());
+    let given = |v: Option<&str>| v.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let endpoint = given(endpoint).unwrap_or_else(|| server_endpoint.clone());
+    let (api_key, used_server_key) = match given(api_key) {
+        Some(k) => (k, false),
+        None if !server_endpoint.is_empty() && same_endpoint(&endpoint, &server_endpoint) => (server_key, true),
+        None => return Err(no_config()),
+    };
+    if endpoint.is_empty() || api_key.is_empty() {
+        return Err(no_config());
+    }
+    let model = given(model).unwrap_or(server_model);
+    let custom_endpoint = server_endpoint.is_empty() || !same_endpoint(&endpoint, &server_endpoint);
+    Ok(Resolved { endpoint, api_key, model, used_server_key, custom_endpoint })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server() -> (String, String, String) {
+        ("https://api.example.com/v1".into(), "sk-server-secret".into(), "server-model".into())
+    }
+
+    #[test]
+    fn the_servers_key_never_goes_to_an_endpoint_the_caller_chose() {
+        // the exfiltration case: caller names its own endpoint and sends no key
+        assert!(resolve_with(server(), Some("https://evil.example.org/v1"), None, None).is_err());
+        assert!(resolve_with(server(), Some("https://evil.example.org/v1"), Some(""), Some("m")).is_err());
+        // a look-alike of the server's endpoint is a different endpoint
+        assert!(resolve_with(server(), Some("https://api.example.com.evil.org/v1"), None, None).is_err());
+        assert!(resolve_with(server(), Some("https://api.example.com/v1/x"), None, None).is_err());
+    }
+
+    #[test]
+    fn caller_supplied_or_server_defaults_resolve_as_before() {
+        let r = resolve_with(server(), None, None, None).unwrap();
+        assert_eq!((r.endpoint.as_str(), r.api_key.as_str(), r.model.as_str(), r.used_server_key), ("https://api.example.com/v1", "sk-server-secret", "server-model", true));
+        // naming the server's own endpoint (trailing slash / case differences) still counts as the server's
+        let r = resolve_with(server(), Some(" HTTPS://API.example.com/v1/ "), Some(""), None).unwrap();
+        assert!(r.used_server_key && r.api_key == "sk-server-secret");
+        // the caller's own key + endpoint: the operator's key is untouched and the call is free for the operator
+        let r = resolve_with(server(), Some("https://other.example.org/v1"), Some("sk-mine"), Some("gpt")).unwrap();
+        assert_eq!((r.endpoint.as_str(), r.api_key.as_str(), r.model.as_str(), r.used_server_key), ("https://other.example.org/v1", "sk-mine", "gpt", false));
+        // the caller's key with the server's endpoint
+        let r = resolve_with(server(), None, Some("sk-mine"), None).unwrap();
+        assert!(!r.used_server_key && r.api_key == "sk-mine" && r.endpoint == "https://api.example.com/v1");
+        // only the operator's own endpoint is trusted; everything else the caller named is vetted
+        assert!(!r.custom_endpoint);
+        assert!(resolve_with(server(), Some("https://other.example.org/v1"), Some("k"), None).unwrap().custom_endpoint);
+        assert!(resolve_with((String::new(), String::new(), String::new()), Some("https://x.example/v1"), Some("k"), None).unwrap().custom_endpoint);
+    }
+
+    #[test]
+    fn nothing_configured_anywhere_is_a_clean_400() {
+        let none = (String::new(), String::new(), String::new());
+        assert_eq!(resolve_with(none.clone(), None, None, None).err().unwrap().0, StatusCode::BAD_REQUEST);
+        assert_eq!(resolve_with(none, Some("https://x.example/v1"), None, None).err().unwrap().0, StatusCode::BAD_REQUEST);
+        // a server key without an endpoint is not enough
+        let key_only = (String::new(), "sk".to_string(), String::new());
+        assert!(resolve_with(key_only, None, None, None).is_err());
+    }
+}
+
 pub async fn get_models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<ModelsQuery>,
 ) -> Result<Json<Vec<ModelInfo>>, (StatusCode, String)> {
-    let endpoint = params.endpoint.as_deref().unwrap_or("");
-    let api_key = params.api_key.as_deref().unwrap_or("");
+    let r = resolve_ai(params.endpoint.as_deref(), params.api_key.as_deref(), None)?;
+    state.legacy.check(&headers, r.custom_endpoint.then_some(r.endpoint.as_str()), r.used_server_key).await?;
 
-    let (endpoint, api_key) = if endpoint.is_empty() || api_key.is_empty() {
-        let e = ai_endpoint();
-        let k = ai_api_key();
-        if e.is_empty() || k.is_empty() {
-            return Err((StatusCode::BAD_REQUEST, "No AI config (set AI_ENDPOINT/AI_API_KEY env vars)".to_string()));
-        }
-        (e, k)
-    } else {
-        (endpoint.to_string(), api_key.to_string())
-    };
-
-    let client = AIClient::new(&endpoint, &api_key);
+    let client = AIClient::new(&r.endpoint, &r.api_key);
     let models = client
         .fetch_models()
         .await
@@ -82,7 +165,8 @@ pub fn extract_text(file_name: &str, data: &[u8]) -> Result<String, String> {
 }
 
 pub async fn generate_exam_handler(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<GenerateResult>, (StatusCode, String)> {
     let mut file_data: Option<Vec<u8>> = None;
@@ -140,13 +224,8 @@ pub async fn generate_exam_handler(
         }
     }
 
-    let endpoint = if endpoint.is_empty() { ai_endpoint() } else { endpoint };
-    let api_key = if api_key.is_empty() { ai_api_key() } else { api_key };
-    let model = if model.is_empty() { ai_model() } else { model };
-
-    if endpoint.is_empty() || api_key.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "No AI config (set AI_ENDPOINT/AI_API_KEY env vars)".to_string()));
-    }
+    let Resolved { endpoint, api_key, model, used_server_key, custom_endpoint } = resolve_ai(Some(&endpoint), Some(&api_key), Some(&model))?;
+    state.legacy.check(&headers, custom_endpoint.then_some(endpoint.as_str()), used_server_key).await?;
 
     let params: ExamParams = serde_json::from_str(&params_json)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid params: {e}")))?;
@@ -216,11 +295,20 @@ pub async fn export_xlsx_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+/// The shared config store holds the operator's AI key, so only a caller on this machine/LAN may read or replace it.
+/// An outside visitor of a public deployment gets nothing (they enter their own key, which stays in their browser).
+fn require_local(headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    let local = crate::relay::client_ip(headers).parse::<std::net::IpAddr>().map_or(false, crate::client_ip::is_local);
+    if local { Ok(()) } else { Err(crate::relay::err(StatusCode::FORBIDDEN, "local_only")) }
+}
+
 pub async fn save_config_handler(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(config): Json<AIConfigData>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    _state
+    require_local(&headers)?;
+    state
         .config_store
         .save(&config)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Save error: {e}")))?;
@@ -228,9 +316,14 @@ pub async fn save_config_handler(
 }
 
 pub async fn load_config_handler(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Result<Json<Option<AIConfigData>>, (StatusCode, String)> {
-    let config = _state
+    // An outsider simply sees "nothing saved": the page still works, with their own key.
+    if require_local(&headers).is_err() {
+        return Ok(Json(None));
+    }
+    let config = state
         .config_store
         .load()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Load error: {e}")))?;
@@ -248,28 +341,17 @@ pub struct AnswerRequest {
 }
 
 pub async fn answer_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<AnswerRequest>,
 ) -> Result<Json<AnswerResult>, (StatusCode, String)> {
     if req.question.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Question is empty".to_string()));
     }
 
-    let endpoint = req
-        .endpoint
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(ai_endpoint);
-    let api_key = req
-        .api_key
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(ai_api_key);
-    let model = req.model.filter(|s| !s.is_empty()).unwrap_or_else(ai_model);
-
-    if endpoint.is_empty() || api_key.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "No AI config (set AI_ENDPOINT/AI_API_KEY env vars)".to_string(),
-        ));
-    }
+    let Resolved { endpoint, api_key, model, used_server_key, custom_endpoint } =
+        resolve_ai(req.endpoint.as_deref(), req.api_key.as_deref(), req.model.as_deref())?;
+    state.legacy.check(&headers, custom_endpoint.then_some(endpoint.as_str()), used_server_key).await?;
 
     let language = req.language.filter(|s| !s.is_empty()).unwrap_or_else(|| "Chinese".to_string());
 
@@ -296,28 +378,17 @@ pub struct JudgeRequest {
 }
 
 pub async fn judge_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<JudgeRequest>,
 ) -> Result<Json<JudgeResult>, (StatusCode, String)> {
     if req.user_answer.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "User answer is empty".to_string()));
     }
 
-    let endpoint = req
-        .endpoint
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(ai_endpoint);
-    let api_key = req
-        .api_key
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(ai_api_key);
-    let model = req.model.filter(|s| !s.is_empty()).unwrap_or_else(ai_model);
-
-    if endpoint.is_empty() || api_key.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "No AI config (set AI_ENDPOINT/AI_API_KEY env vars)".to_string(),
-        ));
-    }
+    let Resolved { endpoint, api_key, model, used_server_key, custom_endpoint } =
+        resolve_ai(req.endpoint.as_deref(), req.api_key.as_deref(), req.model.as_deref())?;
+    state.legacy.check(&headers, custom_endpoint.then_some(endpoint.as_str()), used_server_key).await?;
 
     let language = req.language.filter(|s| !s.is_empty()).unwrap_or_else(|| "Chinese".to_string());
     let analysis = req.analysis.unwrap_or_default();
@@ -352,28 +423,17 @@ pub struct ExplainRequest {
 }
 
 pub async fn explain_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<ExplainRequest>,
 ) -> Result<Json<ExplainResult>, (StatusCode, String)> {
     if req.stem.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Question is empty".to_string()));
     }
 
-    let endpoint = req
-        .endpoint
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(ai_endpoint);
-    let api_key = req
-        .api_key
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(ai_api_key);
-    let model = req.model.filter(|s| !s.is_empty()).unwrap_or_else(ai_model);
-
-    if endpoint.is_empty() || api_key.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "No AI config (set AI_ENDPOINT/AI_API_KEY env vars)".to_string(),
-        ));
-    }
+    let Resolved { endpoint, api_key, model, used_server_key, custom_endpoint } =
+        resolve_ai(req.endpoint.as_deref(), req.api_key.as_deref(), req.model.as_deref())?;
+    state.legacy.check(&headers, custom_endpoint.then_some(endpoint.as_str()), used_server_key).await?;
 
     let language = req.language.filter(|s| !s.is_empty()).unwrap_or_else(|| "Chinese".to_string());
     let analysis = req.analysis.unwrap_or_default();
@@ -401,12 +461,13 @@ pub struct ServerConfigInfo {
     pub model: String,
 }
 
-pub async fn server_config_info_handler() -> Json<ServerConfigInfo> {
-    let endpoint = ai_endpoint();
+pub async fn server_config_info_handler(headers: HeaderMap) -> Json<ServerConfigInfo> {
+    // the URL can name an internal host: only callers on this machine/LAN get it, everyone else just learns "AI is available"
+    let endpoint = if require_local(&headers).is_ok() { ai_endpoint() } else { String::new() };
     let api_key = ai_api_key();
     let model = ai_model();
     Json(ServerConfigInfo {
-        has_env_ai: !endpoint.is_empty() && !api_key.is_empty(),
+        has_env_ai: !ai_endpoint().is_empty() && !api_key.is_empty(),
         endpoint,
         model,
     })

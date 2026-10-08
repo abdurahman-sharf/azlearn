@@ -21,13 +21,19 @@ pub const DEFAULT_PER_MINUTE: u32 = 600;
 
 pub struct TokenLimiter {
     per_minute: u32,
+    window_ms: i64,
     /// token hash → (window start, requests in the window)
     windows: Mutex<HashMap<u64, (i64, u32)>>,
 }
 
 impl TokenLimiter {
     pub fn new(per_minute: u32) -> Self {
-        TokenLimiter { per_minute, windows: Mutex::new(HashMap::new()) }
+        Self::with_window(per_minute, WINDOW_MS)
+    }
+
+    /// `max` requests per `window_ms` per key (the name `per_minute` in the struct is the budget, whatever the window).
+    pub fn with_window(max: u32, window_ms: i64) -> Self {
+        TokenLimiter { per_minute: max, window_ms, windows: Mutex::new(HashMap::new()) }
     }
 
     pub fn from_env() -> Self {
@@ -49,15 +55,16 @@ impl TokenLimiter {
         let key = h.finish();
         let Ok(mut map) = self.windows.lock() else { return Ok(()) };
         if map.len() > MAX_TRACKED {
-            map.retain(|_, (start, _)| now - *start < WINDOW_MS);
+            let w = self.window_ms;
+            map.retain(|_, (start, _)| now - *start < w);
         }
         let entry = map.entry(key).or_insert((now, 0));
-        if now - entry.0 >= WINDOW_MS {
+        if now - entry.0 >= self.window_ms {
             *entry = (now, 0);
         }
         entry.1 += 1;
         if entry.1 > self.per_minute {
-            Err((entry.0 + WINDOW_MS - now).max(1000))
+            Err((entry.0 + self.window_ms - now).max(1000))
         } else {
             Ok(())
         }

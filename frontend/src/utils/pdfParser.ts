@@ -1,5 +1,6 @@
 import * as pdfjsLib from 'pdfjs-dist'
 import { recognizeImage } from './ocr'
+import { assembleArabicPage, hasArabic, type PdfTextItem } from './arabicPdf'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
@@ -36,6 +37,12 @@ async function getPageText(page: any): Promise<string> {
     }
   } finally {
     reader.releaseLock()
+  }
+  // Arabic pages need geometry: pdf.js reports one item per shaped glyph in visual order, which joined with spaces is
+  // unreadable (see arabicPdf.ts). Everything else keeps the original flattening.
+  const textItems = items.filter((item: any) => typeof item.str === 'string')
+  if (textItems.some((item: any) => hasArabic(item.str))) {
+    return normalizeCompatChars(assembleArabicPage(textItems as PdfTextItem[]))
   }
   return normalizeCompatChars(
     items

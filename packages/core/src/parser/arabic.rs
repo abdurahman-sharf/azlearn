@@ -90,7 +90,7 @@ fn tidy_line(s: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     for tok in s.split(' ').filter(|t| !t.is_empty()) {
         match out.last_mut() {
-            Some(prev) if tok.chars().all(is_mark) => prev.push_str(tok),
+            Some(prev) if tok.chars().next().map_or(false, is_mark) => prev.push_str(tok),
             Some(prev) if prev == "ا" && tok.starts_with('ل') => prev.push_str(tok),
             _ => out.push(tok.to_string()),
         }
@@ -218,6 +218,7 @@ mod tests {
         assert_eq!(tidy_line("ا لإنشاء  و التعديل"), "الإنشاء و التعديل", "lone alef + lam, doubled space");
         assert_eq!(tidy_line("إلكترونيا ً ."), "إلكترونياً .", "a vowel mark never stands alone");
         assert_eq!(tidy_line("هذا ا لكتاب"), "هذا الكتاب");
+        assert_eq!(tidy_line("ت ُخ ز ن"), "تُخ ز ن", "a mark glued to the next letter still belongs to the previous one");
         assert_eq!(tidy_line("كل  كتاب"), "كل كتاب");
         assert_eq!(tidy_line("ا بحث"), "ا بحث", "only the article pattern is merged");
     }

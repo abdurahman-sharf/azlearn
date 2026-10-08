@@ -1,5 +1,6 @@
 mod auth_gate;
 mod client_ip;
+mod legacy_guard;
 mod platform;
 mod platform_admin;
 mod platform_ai;
@@ -68,6 +69,7 @@ async fn main() {
         relay,
         platform,
         admin_token: Mutex::new(admin_token),
+        legacy: legacy_guard::LegacyGuard::from_env(),
     });
 
     {
