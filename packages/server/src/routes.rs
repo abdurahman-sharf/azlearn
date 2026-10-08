@@ -20,6 +20,8 @@ pub struct AppState {
     pub platform: crate::platform::PlatformState,
     pub admin_token: Mutex<String>,
     pub legacy: crate::legacy_guard::LegacyGuard,
+    /// Requests carrying a session token the server does not know, counted per client address (see `auth_gate`).
+    pub auth_failures: crate::token_limit::TokenLimiter,
 }
 
 #[derive(Deserialize)]

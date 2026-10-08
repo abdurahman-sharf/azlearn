@@ -37,8 +37,12 @@ impl TokenLimiter {
     }
 
     pub fn from_env() -> Self {
-        let n = std::env::var("PLATFORM_TOKEN_RPM").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(DEFAULT_PER_MINUTE);
-        Self::new(n)
+        Self::from_env_named("PLATFORM_TOKEN_RPM", DEFAULT_PER_MINUTE)
+    }
+
+    /// Per-minute budget read from the environment variable `var` (`0` = off), `default` when unset or unparseable.
+    pub fn from_env_named(var: &str, default: u32) -> Self {
+        Self::new(std::env::var(var).ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(default))
     }
 
     pub fn per_minute(&self) -> u32 {

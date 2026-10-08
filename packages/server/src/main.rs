@@ -70,6 +70,7 @@ async fn main() {
         platform,
         admin_token: Mutex::new(admin_token),
         legacy: legacy_guard::LegacyGuard::from_env(),
+        auth_failures: token_limit::TokenLimiter::from_env_named("PLATFORM_AUTH_FAIL_RPM", 600),
     });
 
     {
@@ -264,11 +265,12 @@ async fn main() {
         )
         .route("/api/platform/admin/legal/{slug}", axum::routing::put(platform_public::legal_put_handler))
         .fallback_service(ServeDir::new(&static_dir))
-        // innermost on purpose: their 401/429 answers still pass through CORS and the security headers below, so
-        // cross-origin clients (Tauri/Cloudflare builds) can read them
-        .layer(axum::middleware::from_fn_with_state(token_limiter, token_limit::middleware))
+        // both sit inside CORS and the security headers on purpose: their 401/429 answers still carry those headers,
+        // so cross-origin clients (Tauri/Cloudflare builds) can read them
         // deny by default: no valid session, no platform API (except register/login/logout/public)
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_gate::middleware))
+        // outside the gate: a token over its budget (valid or made up) is refused before any database lookup
+        .layer(axum::middleware::from_fn_with_state(token_limiter, token_limit::middleware))
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any))
         // CSP / no-store API / permissions policy / optional HSTS (see security_headers.rs)
         .layer(axum::middleware::from_fn_with_state(sec, security_headers::middleware))

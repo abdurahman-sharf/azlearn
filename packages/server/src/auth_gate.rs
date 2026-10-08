@@ -30,6 +30,15 @@ pub async fn middleware(State(state): State<Arc<AppState>>, req: Request, next: 
             None => false,
         };
         if !valid {
+            // A token the server does not know costs a database lookup each time, and a flood can vary the token to
+            // dodge the per-token budget — so those are also counted per client address (valid tokens never are).
+            if bearer(req.headers()).is_some() {
+                let who = crate::relay::client_ip(req.headers());
+                if let Err(wait_ms) = state.auth_failures.check(&who, crate::relay::now_ms()) {
+                    let secs = ((wait_ms + 999) / 1000).max(1).to_string();
+                    return (StatusCode::TOO_MANY_REQUESTS, [(header::CONTENT_TYPE, "application/json".to_string()), (header::RETRY_AFTER, secs)], r#"{"error":"rate_limited"}"#).into_response();
+                }
+            }
             return (StatusCode::UNAUTHORIZED, [(header::CONTENT_TYPE, "application/json")], r#"{"error":"unauthorized"}"#).into_response();
         }
     }

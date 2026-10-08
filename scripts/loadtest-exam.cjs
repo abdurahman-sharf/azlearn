@@ -17,7 +17,7 @@ const pool = async (items, size, fn) => { const out = new Array(items.length); l
 const norm = o => JSON.stringify(Object.entries(o).sort(([a], [b]) => a.localeCompare(b)))
 const pct = (a, p) => { const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(s.length * p))] }
 const rssMb = () => Math.round(Number(fs.readFileSync(`/proc/${proc.pid}/status`, 'utf8').match(/VmRSS:\s+(\d+)/)?.[1]) / 1024)
-const stats = (label, rs) => { const ms = rs.map(r => r.ms); const bad = rs.filter(r => r.status >= 400).length; console.log(`${label.padEnd(34)} n=${String(rs.length).padStart(4)}  p50=${pct(ms, .5).toFixed(0).padStart(5)}ms  p95=${pct(ms, .95).toFixed(0).padStart(5)}ms  max=${Math.max(...ms).toFixed(0).padStart(5)}ms  errors=${bad}`); return bad }
+const stats = (label, rs) => { const ms = rs.map(r => r.ms); const bad = rs.filter(r => r.status >= 400).length; const avg = ms.reduce((a, b) => a + b, 0) / ms.length; console.log(`${label.padEnd(34)} n=${String(rs.length).padStart(4)}  avg=${avg.toFixed(0).padStart(5)}ms  p50=${pct(ms, .5).toFixed(0).padStart(5)}ms  p95=${pct(ms, .95).toFixed(0).padStart(5)}ms  max=${Math.max(...ms).toFixed(0).padStart(5)}ms  errors=${bad}`); return bad }
 let failures = 0; const ok = (label, cond) => { console.log((cond ? 'PASS' : 'FAIL') + '  ' + label); if (!cond) failures++ }
 ;(async () => {
   proc = spawn(`${ROOT}/target/release/exameow-server`, [], { cwd: ROOT, env: { ...process.env, PORT: String(PORT), EXAM_DB_PATH: DIR + '/e.db', PLATFORM_DB_PATH: DIR + '/p.db', PLATFORM_FILES_DIR: DIR + '/files', ADMIN_TOKEN_FILE: DIR + '/a.txt', PLATFORM_ADMIN_EMAIL: 'boss@x.com', PLATFORM_ADMIN_PASSWORD: 'bosspass123', STATIC_DIR: ROOT + '/frontend/dist' }, stdio: 'ignore' })
