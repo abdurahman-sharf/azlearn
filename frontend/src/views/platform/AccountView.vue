@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
 import { changePassword, deleteAccount } from '@/api/platformOps'
+import { useSignOut } from '@/composables/useSignOut'
 
 const pt = usePt()
 const auth = useAuthStore()
-const router = useRouter()
+const signOut = useSignOut()
 
 const current = ref('')
 const next = ref('')
@@ -32,8 +32,7 @@ async function remove() {
   if (!window.confirm(pt('deleteAccountHint'))) return
   try {
     await deleteAccount(delPassword.value)
-    await auth.signOut()
-    router.replace('/mine')
+    await signOut()
   } catch (e) {
     delError.value = platformErrorMessage(pt, e)
   }

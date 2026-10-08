@@ -10,7 +10,8 @@ const router = createRouter({
       path: '/',
       name: 'home',
       component: () => import('@/views/platform/LandingView.vue'),
-      meta: { title: 'Home' },
+      // landingHeader: the shell shows the landing menu (sections + sign in) instead of the practice/generate/search links
+      meta: { title: 'Home', landingHeader: true },
     },
     {
       path: '/legal/:slug(privacy|terms)',
@@ -157,9 +158,9 @@ const router = createRouter({
       meta: { title: 'Account status', requiresAuth: true },
     },
     {
-      // Admin area: sidebar shell + the existing admin pages as children (URLs unchanged).
+      // Admin area (URLs unchanged). The sidebar is not part of this route: the app shell (AppShell) shows it on every
+      // /platform page an admin opens, so shared pages (grading, notifications, account, …) keep it too.
       path: '/platform/admin',
-      component: () => import('@/components/platform/AdminLayout.vue'),
       meta: { requiresAuth: true, requiresActive: true, roles: ['admin'] },
       children: [
         {

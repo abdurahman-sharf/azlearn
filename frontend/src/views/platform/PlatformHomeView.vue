@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
+import { useSignOut } from '@/composables/useSignOut'
 import { listInstitutions, type Institution } from '@/api/platformAdmin'
 import AssessmentList from '@/components/platform/AssessmentList.vue'
 import { availableAssessments, type AssessmentInfo } from '@/api/platformExams'
@@ -15,6 +16,7 @@ import { pendingExams } from '@/api/platformGrading'
 const pt = usePt()
 const auth = useAuthStore()
 const router = useRouter()
+const logout = useSignOut()
 
 const institutions = ref<Institution[]>([])
 const enrolled = ref<EnrolledSubject[]>([])
@@ -48,10 +50,6 @@ onMounted(async () => {
   }
 })
 
-async function logout() {
-  await auth.signOut()
-  router.replace('/mine')
-}
 </script>
 
 <template>

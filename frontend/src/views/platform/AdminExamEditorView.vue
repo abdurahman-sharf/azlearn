@@ -8,9 +8,11 @@ import SubjectPicker from '@/components/platform/SubjectPicker.vue'
 import BankItemForm from '@/components/platform/BankItemForm.vue'
 import ExamAiPanel from '@/components/platform/ExamAiPanel.vue'
 import ExamBankPicker from '@/components/platform/ExamBankPicker.vue'
+import ExamImportPanel from '@/components/platform/ExamImportPanel.vue'
 import ExamPreview from '@/components/platform/ExamPreview.vue'
 import type { BankItem, BankItemInput } from '@/api/platformBank'
 import { createExam, examAction, getExam, updateExam, type ExamDetail, type ExamInput } from '@/api/platformExamAdmin'
+import { MAX_EXAM_QUESTIONS } from '@/utils/examImport'
 import { adoptQuestions, fromLocalInput, letter, move, toLocalInput, totals, validateQuestion, type ExamQuestion, type Problem } from '@/utils/examBuilder'
 
 const pt = usePt()
@@ -88,6 +90,9 @@ function addFromBank(items: BankItem[]) {
     return q
   })
   questions.value = [...questions.value, ...adoptQuestions(raw, nextId, (q) => bankOf.get(q))]
+}
+function addImported(qs: Question[]) {
+  questions.value = [...questions.value, ...adoptQuestions(qs, nextId)]
 }
 function addManual(i: BankItemInput) {
   questions.value = [...questions.value, ...adoptQuestions([{ id: '', type: i.type, stem: i.stem, options: i.options, answer: i.answer, analysis: i.analysis, chapter: i.chapter ?? undefined, difficulty: i.difficulty ?? undefined } as Question], nextId)]
@@ -194,6 +199,7 @@ const canPublish = computed(() => !exam.value || exam.value.status === 'draft')
       <template v-else-if="!locked">
         <p class="card-elevated p-3 text-body-md" data-testid="ex-count">{{ pt('exInExam') }}: <b dir="ltr" class="inline-block" data-testid="ex-count-n">{{ questions.length }}</b></p>
         <ExamAiPanel :subject-id="subjectId" @generated="addGenerated" />
+        <ExamImportPanel :existing="questions" :room="MAX_EXAM_QUESTIONS - questions.length" @imported="addImported" />
         <ExamBankPicker :subject-id="subjectId" :taken="taken" @add="addFromBank" />
         <section class="card-filled p-5 space-y-3">
           <h3 class="text-title-md font-bold">{{ pt('exSourceManual') }}</h3>

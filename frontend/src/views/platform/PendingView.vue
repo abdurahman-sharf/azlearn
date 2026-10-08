@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt } from '@/i18n/platform'
+import { useSignOut } from '@/composables/useSignOut'
 
 const pt = usePt()
 const auth = useAuthStore()
-const router = useRouter()
+const logout = useSignOut()
 
 const title = computed(() => {
   const s = auth.profile?.status
@@ -15,10 +15,6 @@ const title = computed(() => {
   return pt('pendingTitle')
 })
 
-async function logout() {
-  await auth.signOut()
-  router.replace('/auth/login')
-}
 </script>
 
 <template>

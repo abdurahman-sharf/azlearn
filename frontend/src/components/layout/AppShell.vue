@@ -5,8 +5,11 @@ import { useI18nStore } from '@/stores/i18n'
 import { useTheme } from '@/composables/useTheme'
 import { platformEnabled } from '@/lib/platformApi'
 import { useBrandingStore } from '@/stores/branding'
+import { useAuthStore } from '@/stores/auth'
 import { usePt } from '@/i18n/platform'
 import BrandMark from '@/components/platform/BrandMark.vue'
+import AdminSidebar from '@/components/platform/AdminSidebar.vue'
+import LandingNav from './LandingNav.vue'
 import { isTauri, isMacOS, isWindows, isLinux } from '@/utils/platform'
 import TitleBar from './TitleBar.vue'
 import CookieBanner from './CookieBanner.vue'
@@ -28,7 +31,14 @@ const route = useRoute()
 const i18n = useI18nStore()
 const showLanguageDialog = ref(false)
 const brand = useBrandingStore()
+const auth = useAuthStore()
 const pt = usePt()
+
+// Admin frame: on every /platform page an admin opens, the admin navigation sits beside <main> (not inside it, so the
+// skip link still bypasses it and there is a single main landmark). The router guards have awaited auth.init() by now.
+const adminFrame = computed(() => platformEnabled && auth.role === 'admin' && /^\/platform(\/|$)/.test(route.path))
+// Landing header: routes flagged `landingHeader` show the landing menu instead of the practice/generate/search links.
+const landing = computed(() => platformEnabled && route.meta.landingHeader === true)
 const mainEl = ref<HTMLElement | null>(null)
 function focusMain() {
   mainEl.value?.focus()
@@ -133,8 +143,10 @@ const headerStyle = {
           </template>
         </router-link>
 
+        <LandingNav v-if="landing" mode="top" />
+
         <!-- Desktop Nav — Pixel Segmented sliding pill navigation -->
-        <div class="hidden sm:flex items-center" :class="isDesktopTauri ? '' : 'ml-6'">
+        <div v-else class="hidden sm:flex items-center" :class="isDesktopTauri ? '' : 'ml-6'">
           <nav
             :aria-label="headerName"
             class="relative flex items-center p-1 rounded-full gap-0.5 shadow-sm"
@@ -168,7 +180,12 @@ const headerStyle = {
 
         <!-- Actions -->
         <div class="flex items-center gap-1.5">
+          <template v-if="landing">
+            <router-link to="/auth/login" class="btn-text hidden sm:inline-flex" data-testid="header-login">{{ pt('login') }}</router-link>
+            <router-link to="/auth/register" class="btn-filled !px-4 !py-2 text-sm" data-testid="header-register">{{ pt('register') }}</router-link>
+          </template>
           <button
+            v-if="!landing"
             class="btn-icon"
             @click="openGitHub"
             title="GitHub"
@@ -197,16 +214,26 @@ const headerStyle = {
     </header>
 
     <!-- ====== Main Content ====== -->
-    <main id="main-content" ref="mainEl" tabindex="-1" class="flex-1 mx-auto w-full max-w-5xl xl:max-w-6xl px-3 sm:px-6 py-4 sm:py-7 focus:outline-none">
-      <router-view v-slot="{ Component }">
-        <transition name="slide-up" mode="out-in">
-          <component :is="Component" />
-        </transition>
-      </router-view>
-    </main>
+    <div
+      class="flex-1 mx-auto w-full px-3 sm:px-6 py-4 sm:py-7"
+      :class="adminFrame ? 'max-w-[90rem] flex flex-col md:flex-row md:items-start gap-3 md:gap-8' : 'max-w-5xl xl:max-w-6xl'"
+      :data-testid="adminFrame ? 'admin-shell' : undefined"
+    >
+      <AdminSidebar v-if="adminFrame" />
+      <main id="main-content" ref="mainEl" tabindex="-1" class="focus:outline-none" :class="adminFrame ? 'min-w-0 w-full md:flex-1' : ''">
+        <router-view v-slot="{ Component }">
+          <!-- no page animation inside the admin frame: the sidebar stays put and every click is instant -->
+          <transition :name="adminFrame ? 'none' : 'slide-up'" mode="out-in">
+            <component :is="Component" />
+          </transition>
+        </router-view>
+      </main>
+    </div>
 
     <!-- ====== Bottom Navigation Bar (Mobile Pixel M3) ====== -->
+    <LandingNav v-if="landing" mode="bottom" />
     <nav
+      v-else
       :aria-label="headerName"
       class="sm:hidden sticky bottom-0 z-30 safe-bottom"
       :style="{
