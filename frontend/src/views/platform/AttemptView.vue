@@ -3,11 +3,13 @@ import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePracticeStore } from '@/stores/practice'
+import { useI18nStore } from '@/stores/i18n'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
 import { getAttempt, gradeAttempt, type AttemptResult } from '@/api/platformExams'
 import type { Question, QuestionType } from '@exameow/shared'
 
 const pt = usePt()
+const i18n = useI18nStore()
 const auth = useAuthStore()
 const practice = usePracticeStore()
 const route = useRoute()
@@ -65,17 +67,25 @@ onMounted(load)
     <p v-if="r.student_name" class="text-body-lg">{{ r.student_name }}</p>
 
     <div class="card-elevated p-5 my-4 text-center" data-testid="score-card">
-      <template v-if="r.status === 'submitted'">
+      <template v-if="r.status === 'submitted' && !r.released">
+        <p class="text-body-lg" data-testid="not-released">{{ pt('tkNotReleased') }}</p>
+        <p v-if="r.release_at" class="text-body-sm mt-1" style="color: rgb(var(--md-on-surface-variant))">{{ pt('tkReleaseAt') }}: {{ new Date(r.release_at).toLocaleString(i18n.locale === 'ar' ? 'ar' : undefined, { dateStyle: 'medium', timeStyle: 'short' }) }}</p>
+      </template>
+      <template v-else-if="r.status === 'submitted'">
         <div class="text-body-sm">{{ pt('yourScore') }}</div>
         <div class="text-display-sm font-bold" data-testid="score" dir="ltr">{{ r.score }} / {{ r.total }}</div>
         <div v-if="r.pending" class="text-body-sm mt-1" data-testid="pending">{{ pt('pendingGrading') }} ({{ r.pending }})</div>
+        <div v-if="r.passed !== null" class="mt-2 font-bold" :style="{ color: r.passed ? 'rgb(var(--azl-success-text, var(--md-primary)))' : 'rgb(var(--md-error))' }" data-testid="pass-badge">
+          {{ r.passed ? pt('tkPassed') : pt('tkFailed') }}<span v-if="r.pass_mark" class="text-body-sm font-normal ms-2">({{ pt('tkPassMark') }} <span dir="ltr" class="inline-block">{{ r.pass_mark }}%</span>)</span>
+        </div>
+        <div v-if="r.tab_leaves !== null && isGrader" class="text-body-sm mt-2" data-testid="tab-leaves">{{ pt('tkTabLeaves') }}: <span dir="ltr" class="inline-block">{{ r.tab_leaves }}</span></div>
       </template>
       <div v-else>{{ pt('expiredAttempt') }}</div>
     </div>
 
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
     <p v-if="msg" class="text-body-sm mb-3" role="status">{{ msg }}</p>
-    <p v-if="!r.items && r.status === 'submitted'" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))">{{ pt('answersHidden') }}</p>
+    <p v-if="!r.items && r.status === 'submitted' && r.released" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))">{{ pt('answersHidden') }}</p>
 
     <button v-if="r.items && auth.role === 'student'" class="btn-tonal mb-4" @click="practiceThese">{{ pt('practiceThese') }}</button>
 

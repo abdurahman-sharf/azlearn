@@ -616,6 +616,12 @@ pub async fn import_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Json(r
     import(&*lock(&s)?, &admin, &r, now_ms()).map(Json)
 }
 
+/// Test helper for other modules: builds core questions from JSON.
+#[cfg(test)]
+pub(crate) fn tests_questions(v: &[serde_json::Value]) -> Vec<Question> {
+    v.iter().map(|x| serde_json::from_value(x.clone()).unwrap()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

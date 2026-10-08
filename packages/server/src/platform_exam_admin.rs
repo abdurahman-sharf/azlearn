@@ -212,6 +212,14 @@ pub struct ExamRow {
     can_edit: bool,
 }
 
+impl ExamDetail {
+    /// The exam id (used by cross-module tests).
+    #[cfg(test)]
+    pub(crate) fn info_id(&self) -> String {
+        self.row.info.id.clone()
+    }
+}
+
 #[derive(Serialize, Debug)]
 pub struct ExamDetail {
     #[serde(flatten)]

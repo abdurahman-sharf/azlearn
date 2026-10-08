@@ -218,7 +218,7 @@ fn normalize_choice(s: &str) -> String {
         .trim()
         .to_uppercase()
         .chars()
-        .filter(|c| ('A'..='H').contains(c))
+        .filter(|c| ('A'..='J').contains(c))
         .collect();
     chars.sort();
     chars.into_iter().collect()

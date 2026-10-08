@@ -26,11 +26,12 @@ onMounted(async () => {
   <div v-if="data" class="max-w-3xl mx-auto pb-8">
     <router-link :to="`/platform/assessments/${id}`" class="text-body-sm underline">{{ pt('back') }}</router-link>
     <h1 class="text-display-sm font-bold tracking-tight my-3 break-words">{{ data.info.title }} — {{ pt('results') }}</h1>
-    <div class="grid grid-cols-4 gap-2 mb-4 text-center">
+    <div class="grid gap-2 mb-4 text-center" :class="data.info.pass_mark ? 'grid-cols-5' : 'grid-cols-4'">
       <div class="card-filled p-2"><div class="text-body-sm">{{ pt('submittedCount') }}</div><div class="font-bold" data-testid="n-submitted">{{ data.submitted }}</div></div>
       <div class="card-filled p-2"><div class="text-body-sm">{{ pt('average') }}</div><div class="font-bold" data-testid="avg">{{ data.average }}</div></div>
       <div class="card-filled p-2"><div class="text-body-sm">{{ pt('highest') }}</div><div class="font-bold">{{ data.highest }}</div></div>
       <div class="card-filled p-2"><div class="text-body-sm">{{ pt('lowest') }}</div><div class="font-bold">{{ data.lowest }}</div></div>
+      <div v-if="data.info.pass_mark" class="card-filled p-2"><div class="text-body-sm">{{ pt('tkPassedCount') }}</div><div class="font-bold" data-testid="n-passed" dir="ltr">{{ data.passed }} / {{ data.submitted }}</div></div>
     </div>
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
     <p v-if="!data.attempts.length" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))">{{ pt('noResults') }}</p>
@@ -41,8 +42,10 @@ onMounted(async () => {
           <span v-if="a.status === 'expired'" class="text-body-sm">{{ pt('expiredAttempt') }}</span>
           <template v-else>
             <span v-if="a.pending" class="text-xs font-semibold px-2 py-0.5 rounded-full" style="background-color: rgb(var(--md-secondary-container))">{{ pt('pendingGrading') }}</span>
+            <span v-if="a.passed !== null" class="text-xs font-semibold px-2 py-0.5 rounded-full" style="background-color: rgb(var(--md-surface-container-high))" data-testid="row-pass">{{ a.passed ? pt('tkPassed') : pt('tkFailed') }}</span>
             <span class="font-bold" dir="ltr">{{ a.score }} / {{ data.info.total_points }}</span>
           </template>
+          <span v-if="a.tab_leaves > 0" class="text-body-sm" data-testid="row-leaves" :title="pt('tkTabLeaves')">↗ <span dir="ltr" class="inline-block">{{ a.tab_leaves }}</span></span>
           <span v-if="a.submitted_at" class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ fmt(a.submitted_at) }}</span>
         </router-link>
       </li>

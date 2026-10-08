@@ -279,7 +279,6 @@ const canPublish = computed(() => !exam.value || exam.value.status === 'draft')
               <option value="immediate">{{ pt('exReleaseNow') }}</option><option value="after_close">{{ pt('exReleaseClose') }}</option>
             </select></label>
         </div>
-        <p class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ pt('exSoonHint') }}</p>
         <p v-if="f.release === 'after_close' && !f.closes" class="text-body-sm" role="alert" style="color: rgb(var(--md-error))" data-testid="release-warn">{{ pt('exReleaseNeedsClose') }}</p>
       </div>
       <div class="flex flex-wrap gap-2 items-center">

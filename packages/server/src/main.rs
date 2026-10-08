@@ -79,6 +79,7 @@ async fn main() {
                 platform::cleanup_expired(&state.platform);
                 platform_content::purge_orphan_files(&state.platform);
                 platform_engage::purge_old_notifications(&state.platform);
+                platform_exams::settle_overdue(&state.platform);
             }
         });
     }
@@ -215,6 +216,8 @@ async fn main() {
         .route("/api/platform/admin/exams", get(platform_exam_admin::list_handler).post(platform_exam_admin::create_handler))
         .route("/api/platform/admin/exams/{id}", get(platform_exam_admin::get_handler).patch(platform_exam_admin::update_handler).delete(platform_exam_admin::delete_handler))
         .route("/api/platform/admin/exams/{id}/{action}", post(platform_exam_admin::action_handler))
+        .route("/api/platform/attempts/{id}/answers", axum::routing::put(platform_exams::save_handler))
+        .route("/api/platform/attempts/{id}/events", post(platform_exams::event_handler))
         .route("/api/platform/admin/branding", axum::routing::put(platform_public::set_branding_handler))
         .route(
             "/api/platform/admin/branding/logo",

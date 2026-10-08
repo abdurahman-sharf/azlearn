@@ -559,32 +559,210 @@ pub struct StartRes {
     pub(crate) started_at: i64,
     /// Server-enforced deadline (ms epoch).
     pub(crate) ends_at: i64,
+    /// Questions in this attempt's display order, with options already permuted when the exam shuffles them.
     pub(crate) questions: Vec<PublicQuestion>,
     pub(crate) resumed: bool,
+    /// Answers autosaved earlier (keyed like `questions`, i.e. in the *displayed* option letters), so an
+    /// attempt resumes on any device.
+    pub(crate) saved_answers: HashMap<String, String>,
+    pub(crate) saved_at: Option<i64>,
 }
 
 fn deadline(started_at: i64, duration_min: Option<i64>) -> i64 {
     started_at + duration_min.map_or(OPEN_ENDED_LIMIT_MS, |m| m * 60_000)
 }
 
-/// Marks in-progress attempts past their deadline (+grace) as expired with score 0.
+// ───────── per-attempt shuffling (PRD F2) ─────────
+
+/// The order one attempt was dealt, stored in `attempts.order_json` so reopening it shows the same
+/// layout and answers can be mapped back to the original options at grading time.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+pub(crate) struct Order {
+    /// Question ids in display order.
+    q: Vec<String>,
+    /// Choice questions only: displayed option position -> original option index.
+    o: HashMap<String, Vec<usize>>,
+}
+
+fn is_choice(t: &QuestionType) -> bool {
+    matches!(t, QuestionType::SingleChoice | QuestionType::MultiChoice)
+}
+
+/// Deals a fresh order, or `None` when the exam shuffles nothing (the stored layout is then the original).
+pub(crate) fn make_order(questions: &[Question], shuffle_questions: bool, shuffle_options: bool, rng: &mut impl rand::Rng) -> Option<Order> {
+    use rand::seq::SliceRandom;
+    if !shuffle_questions && !shuffle_options {
+        return None;
+    }
+    let mut q: Vec<String> = questions.iter().map(|x| x.id.clone()).collect();
+    if shuffle_questions {
+        q.shuffle(rng);
+    }
+    let mut o = HashMap::new();
+    if shuffle_options {
+        for x in questions.iter().filter(|x| is_choice(&x.qtype) && x.options.len() > 1) {
+            let mut perm: Vec<usize> = (0..x.options.len()).collect();
+            perm.shuffle(rng);
+            o.insert(x.id.clone(), perm);
+        }
+    }
+    Some(Order { q, o })
+}
+
+/// The question list as one student sees it (reordered, options permuted).
+fn displayed(questions: &[Question], order: Option<&Order>) -> Vec<Question> {
+    let Some(order) = order else { return questions.to_vec() };
+    let by_id: HashMap<&str, &Question> = questions.iter().map(|q| (q.id.as_str(), q)).collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out: Vec<Question> = vec![];
+    for id in &order.q {
+        if let Some(q) = by_id.get(id.as_str()) {
+            seen.insert(q.id.as_str());
+            out.push(permuted(q, order));
+        }
+    }
+    // anything the stored order does not mention keeps its place at the end
+    out.extend(questions.iter().filter(|q| !seen.contains(q.id.as_str())).map(|q| permuted(q, order)));
+    out
+}
+
+fn permuted(q: &Question, order: &Order) -> Question {
+    let mut c = q.clone();
+    if let Some(perm) = order.o.get(&q.id) {
+        if perm.len() == q.options.len() && perm.iter().all(|&i| i < q.options.len()) {
+            c.options = perm.iter().map(|&i| q.options[i].clone()).collect();
+        }
+    }
+    c
+}
+
+/// Converts answers given against the displayed options back to the original option letters.
+pub(crate) fn to_original(questions: &[Question], order: Option<&Order>, answers: &HashMap<String, String>) -> HashMap<String, String> {
+    let Some(order) = order else { return answers.clone() };
+    let mut out = answers.clone();
+    for q in questions.iter().filter(|q| is_choice(&q.qtype)) {
+        let (Some(perm), Some(given)) = (order.o.get(&q.id), answers.get(&q.id)) else { continue };
+        let mut letters: Vec<char> = given
+            .to_uppercase()
+            .chars()
+            .filter(|c| c.is_ascii_uppercase())
+            .filter_map(|c| perm.get((c as u8 - b'A') as usize).map(|&orig| (b'A' + orig as u8) as char))
+            .collect();
+        letters.sort();
+        letters.dedup();
+        out.insert(q.id.clone(), letters.into_iter().collect());
+    }
+    out
+}
+
+fn parse_order(raw: Option<String>) -> Option<Order> {
+    raw.and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn public_questions(qs: &[Question]) -> Vec<PublicQuestion> {
+    qs.iter().map(|q| PublicQuestion { id: q.id.clone(), qtype: q.qtype.clone(), stem: q.stem.clone(), options: q.options.clone(), points: points_of(q) }).collect()
+}
+
+// ───────── finishing attempts ─────────
+
+/// Grades `shown` answers (displayed letters) and stores the attempt as submitted at `submitted_at`.
+fn finalize_attempt(conn: &Connection, attempt_id: &str, assessment_id: &str, shown: &HashMap<String, String>, order_raw: Option<String>, submitted_at: i64) -> Res<()> {
+    let questions = load_questions(conn, assessment_id)?;
+    let order = parse_order(order_raw);
+    let answers = to_original(&questions, order.as_ref(), &clean_answers(shown, &questions));
+    let (outcomes, score, pending) = grade_all(&questions, &answers);
+    conn.execute(
+        "UPDATE attempts SET status = 'submitted', submitted_at = ?1, answers = ?2, results = ?3, score = ?4, pending = ?5 WHERE id = ?6",
+        params![submitted_at, serde_json::to_string(&answers).map_err(db_err)?, serde_json::to_string(&outcomes).map_err(db_err)?, score, pending, attempt_id],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// If an in-progress attempt is past its deadline (+grace): submit whatever was autosaved, or mark it
+/// expired (score 0) when nothing was ever saved. Returns whether it was due.
+fn settle_if_due(conn: &Connection, attempt_id: &str, assessment_id: &str, duration_min: Option<i64>, now: i64) -> Res<bool> {
+    let row: Option<(i64, Option<i64>, String, Option<String>)> = conn
+        .query_row("SELECT started_at, saved_at, answers, order_json FROM attempts WHERE id = ?1 AND status = 'in_progress'", params![attempt_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .optional()
+        .map_err(db_err)?;
+    let Some((started, saved_at, answers_raw, order_raw)) = row else { return Ok(false) };
+    let due = deadline(started, duration_min);
+    if now <= due + GRACE_MS {
+        return Ok(false);
+    }
+    if saved_at.is_some() {
+        // the browser went away (or lost connection) before the timer ran out: the autosaved answers count
+        let shown: HashMap<String, String> = serde_json::from_str(&answers_raw).unwrap_or_default();
+        finalize_attempt(conn, attempt_id, assessment_id, &shown, order_raw, due)?;
+    } else {
+        conn.execute("UPDATE attempts SET status = 'expired' WHERE id = ?1", params![attempt_id]).map_err(db_err)?;
+    }
+    Ok(true)
+}
+
+/// Settles this student's overdue attempts on one assessment.
 fn expire_stale(conn: &Connection, assessment_id: &str, student_id: &str, duration_min: Option<i64>, now: i64) -> Res<()> {
-    let stale: Vec<(String, i64)> = conn
-        .prepare("SELECT id, started_at FROM attempts WHERE assessment_id = ?1 AND student_id = ?2 AND status = 'in_progress'")
+    let ids: Vec<String> = conn
+        .prepare("SELECT id FROM attempts WHERE assessment_id = ?1 AND student_id = ?2 AND status = 'in_progress'")
         .map_err(db_err)?
-        .query_map(params![assessment_id, student_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_map(params![assessment_id, student_id], |r| r.get(0))
         .map_err(db_err)?
         .collect::<Result<_, _>>()
         .map_err(db_err)?;
-    for (id, started) in stale {
-        if now > deadline(started, duration_min) + GRACE_MS {
-            conn.execute("UPDATE attempts SET status = 'expired' WHERE id = ?1", params![id]).map_err(db_err)?;
-        }
+    for id in ids {
+        settle_if_due(conn, &id, assessment_id, duration_min, now)?;
     }
     Ok(())
 }
 
+/// Settles every overdue attempt of an assessment (graders open its results).
+pub(crate) fn settle_assessment(conn: &Connection, assessment_id: &str, duration_min: Option<i64>, now: i64) -> Res<()> {
+    let ids: Vec<String> = conn
+        .prepare("SELECT id FROM attempts WHERE assessment_id = ?1 AND status = 'in_progress'")
+        .map_err(db_err)?
+        .query_map(params![assessment_id], |r| r.get(0))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    for id in ids {
+        settle_if_due(conn, &id, assessment_id, duration_min, now)?;
+    }
+    Ok(())
+}
+
+/// Hourly task entry point: settles overdue attempts nobody came back to.
+pub fn settle_overdue(state: &crate::platform::PlatformState) {
+    if let Ok(conn) = state.conn.lock() {
+        let _ = settle_all(&conn, now_ms());
+    }
+}
+
+/// Periodic sweep: settles every overdue attempt on the platform. Returns how many were settled.
+pub(crate) fn settle_all(conn: &Connection, now: i64) -> Res<usize> {
+    let rows: Vec<(String, String, Option<i64>)> = conn
+        .prepare("SELECT t.id, t.assessment_id, a.duration_min FROM attempts t JOIN assessments a ON a.id = t.assessment_id WHERE t.status = 'in_progress'")
+        .map_err(db_err)?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    let mut n = 0;
+    for (id, aid, dur) in rows {
+        if settle_if_due(conn, &id, &aid, dur, now)? {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 pub(crate) fn start_attempt(conn: &Connection, student: &User, assessment_id: &str, now: i64) -> Res<StartRes> {
+    start_attempt_with(conn, student, assessment_id, now, &mut rand::thread_rng())
+}
+
+pub(crate) fn start_attempt_with(conn: &Connection, student: &User, assessment_id: &str, now: i64, rng: &mut impl rand::Rng) -> Res<StartRes> {
     if !publicly_visible(conn, assessment_id)? {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
@@ -594,22 +772,26 @@ pub(crate) fn start_attempt(conn: &Connection, student: &User, assessment_id: &s
     }
     expire_stale(conn, assessment_id, &student.id, info.duration_min, now)?;
     let questions = load_questions(conn, assessment_id)?;
-    let public = |qs: &[Question]| -> Vec<PublicQuestion> {
-        qs.iter()
-            .map(|q| PublicQuestion { id: q.id.clone(), qtype: q.qtype.clone(), stem: q.stem.clone(), options: q.options.clone(), points: points_of(q) })
-            .collect()
-    };
-    // Resume an in-progress attempt instead of burning another one.
-    let open: Option<(String, i64)> = conn
+    // Resume an in-progress attempt instead of burning another one: same order, same saved answers.
+    let open: Option<(String, i64, Option<String>, String, Option<i64>)> = conn
         .query_row(
-            "SELECT id, started_at FROM attempts WHERE assessment_id = ?1 AND student_id = ?2 AND status = 'in_progress'",
+            "SELECT id, started_at, order_json, answers, saved_at FROM attempts WHERE assessment_id = ?1 AND student_id = ?2 AND status = 'in_progress'",
             params![assessment_id, student.id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
         .map_err(db_err)?;
-    if let Some((id, started)) = open {
-        return Ok(StartRes { attempt_id: id, started_at: started, ends_at: deadline(started, info.duration_min), questions: public(&questions), resumed: true });
+    if let Some((id, started, order_raw, answers_raw, saved_at)) = open {
+        let order = parse_order(order_raw);
+        return Ok(StartRes {
+            attempt_id: id,
+            started_at: started,
+            ends_at: deadline(started, info.duration_min),
+            questions: public_questions(&displayed(&questions, order.as_ref())),
+            resumed: true,
+            saved_answers: serde_json::from_str(&answers_raw).unwrap_or_default(),
+            saved_at,
+        });
     }
     if info.status != "published" {
         return Err(err(StatusCode::FORBIDDEN, "closed"));
@@ -626,13 +808,70 @@ pub(crate) fn start_attempt(conn: &Connection, student: &User, assessment_id: &s
     if used >= info.max_attempts {
         return Err(err(StatusCode::FORBIDDEN, "no_attempts_left"));
     }
+    let order = make_order(&questions, info.shuffle_questions, info.shuffle_options, rng);
     let id = new_id();
     conn.execute(
-        "INSERT INTO attempts(id, assessment_id, student_id, started_at, status) VALUES (?1,?2,?3,?4,'in_progress')",
-        params![id, assessment_id, student.id, now],
+        "INSERT INTO attempts(id, assessment_id, student_id, started_at, status, order_json) VALUES (?1,?2,?3,?4,'in_progress',?5)",
+        params![id, assessment_id, student.id, now, order.as_ref().map(|o| serde_json::to_string(o).unwrap_or_default())],
     )
     .map_err(db_err)?;
-    Ok(StartRes { attempt_id: id, started_at: now, ends_at: deadline(now, info.duration_min), questions: public(&questions), resumed: false })
+    Ok(StartRes {
+        attempt_id: id,
+        started_at: now,
+        ends_at: deadline(now, info.duration_min),
+        questions: public_questions(&displayed(&questions, order.as_ref())),
+        resumed: false,
+        saved_answers: HashMap::new(),
+        saved_at: None,
+    })
+}
+
+// ───────── autosave & integrity events (PRD F3, F5) ─────────
+
+/// Stores the in-progress answers (displayed letters) so the attempt can resume anywhere.
+pub(crate) fn save_answers(conn: &Connection, student: &User, attempt_id: &str, raw: &HashMap<String, String>, now: i64) -> Res<i64> {
+    let (assessment_id, started, status): (String, i64, String) = conn
+        .query_row("SELECT assessment_id, started_at, status FROM attempts WHERE id = ?1 AND student_id = ?2", params![attempt_id, student.id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()
+        .map_err(db_err)?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
+    if status != "in_progress" {
+        return Err(err(StatusCode::CONFLICT, if status == "expired" { "time_expired" } else { "already_submitted" }));
+    }
+    let info = get_info(conn, &student.id, &assessment_id)?;
+    if now > deadline(started, info.duration_min) + GRACE_MS {
+        settle_if_due(conn, attempt_id, &assessment_id, info.duration_min, now)?;
+        return Err(err(StatusCode::CONFLICT, "time_expired"));
+    }
+    let questions = load_questions(conn, &assessment_id)?;
+    let answers = clean_answers(raw, &questions);
+    conn.execute("UPDATE attempts SET answers = ?1, saved_at = ?2 WHERE id = ?3", params![serde_json::to_string(&answers).map_err(db_err)?, now, attempt_id]).map_err(db_err)?;
+    Ok(now)
+}
+
+const MAX_TAB_LEAVES: i64 = 1000;
+
+/// Counts a tab/focus loss. Informational only: nothing is blocked or ended (shown to graders/admins).
+pub(crate) fn record_event(conn: &Connection, student: &User, attempt_id: &str, kind: &str) -> Res<()> {
+    if kind != "tab_leave" {
+        return Err(bad("invalid_event"));
+    }
+    let n = conn
+        .execute(
+            "UPDATE attempts SET tab_leaves = tab_leaves + 1 WHERE id = ?1 AND student_id = ?2 AND status = 'in_progress' AND tab_leaves < ?3",
+            params![attempt_id, student.id, MAX_TAB_LEAVES],
+        )
+        .map_err(db_err)?;
+    if n == 0 {
+        // distinguish "not yours / finished" from "cap reached" without leaking other students' attempts
+        let owned: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE id = ?1 AND student_id = ?2)", params![attempt_id, student.id], |r| r.get(0)).map_err(db_err)?;
+        if !owned {
+            return Err(err(StatusCode::NOT_FOUND, "not_found"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Debug)]
@@ -664,6 +903,29 @@ pub struct AttemptResult {
     submitted_at: Option<i64>,
     show_answers: bool,
     items: Option<Vec<ItemResult>>,
+    /// False while a student must wait for the exam to close (release mode `after_close`): score and
+    /// details are withheld by the server until then.
+    released: bool,
+    release_at: Option<i64>,
+    pass_mark: Option<f64>,
+    /// Pass/fail once fully graded and released; `None` when there is no pass mark or grading is pending.
+    passed: Option<bool>,
+    /// Tab/focus losses during the attempt; only graders and admins see it.
+    tab_leaves: Option<i64>,
+}
+
+/// Results are visible at once for `immediate` exams; for `after_close` only once the exam is closed
+/// (manually, or its closing time has passed).
+fn is_released(release_mode: &str, status: &str, closes_at: Option<i64>, now: i64) -> bool {
+    release_mode != "after_close" || matches!(status, "closed" | "archived") || closes_at.map_or(false, |c| c <= now)
+}
+
+fn passed_flag(score: f64, total: f64, pending: i64, pass_mark: Option<f64>) -> Option<bool> {
+    let pm = pass_mark?;
+    if pending > 0 || total <= 0.0 {
+        return None;
+    }
+    Some(score / total * 100.0 + 1e-9 >= pm)
 }
 
 fn clean_answers(raw: &HashMap<String, String>, questions: &[Question]) -> HashMap<String, String> {
@@ -675,11 +937,11 @@ fn clean_answers(raw: &HashMap<String, String>, questions: &[Question]) -> HashM
 }
 
 pub(crate) fn submit_attempt(conn: &Connection, student: &User, attempt_id: &str, raw: &HashMap<String, String>, now: i64) -> Res<AttemptResult> {
-    let (assessment_id, started, status): (String, i64, String) = conn
+    let (assessment_id, started, status, order_raw): (String, i64, String, Option<String>) = conn
         .query_row(
-            "SELECT assessment_id, started_at, status FROM attempts WHERE id = ?1 AND student_id = ?2",
+            "SELECT assessment_id, started_at, status, order_json FROM attempts WHERE id = ?1 AND student_id = ?2",
             params![attempt_id, student.id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(db_err)?
@@ -689,17 +951,11 @@ pub(crate) fn submit_attempt(conn: &Connection, student: &User, attempt_id: &str
     }
     let info = get_info(conn, &student.id, &assessment_id)?;
     if now > deadline(started, info.duration_min) + GRACE_MS {
-        conn.execute("UPDATE attempts SET status = 'expired' WHERE id = ?1", params![attempt_id]).map_err(db_err)?;
+        // too late for a manual submit; whatever was autosaved still counts
+        settle_if_due(conn, attempt_id, &assessment_id, info.duration_min, now)?;
         return Err(err(StatusCode::CONFLICT, "time_expired"));
     }
-    let questions = load_questions(conn, &assessment_id)?;
-    let answers = clean_answers(raw, &questions);
-    let (outcomes, score, pending) = grade_all(&questions, &answers);
-    conn.execute(
-        "UPDATE attempts SET status = 'submitted', submitted_at = ?1, answers = ?2, results = ?3, score = ?4, pending = ?5 WHERE id = ?6",
-        params![now, serde_json::to_string(&answers).map_err(db_err)?, serde_json::to_string(&outcomes).map_err(db_err)?, score, pending, attempt_id],
-    )
-    .map_err(db_err)?;
+    finalize_attempt(conn, attempt_id, &assessment_id, raw, order_raw, now)?;
     attempt_result(conn, student, attempt_id)
 }
 
@@ -709,7 +965,7 @@ fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str) -> Res<Att
     let row = conn
         .query_row(
             "SELECT t.assessment_id, t.student_id, t.status, t.score, t.pending, t.started_at, t.submitted_at, t.answers, t.results,
-                    a.title, a.total_points, a.show_answers, a.teacher_id, u.full_name
+                    a.title, a.total_points, a.show_answers, a.teacher_id, u.full_name, a.release_mode, a.status, a.closes_at, a.pass_mark, t.tab_leaves
              FROM attempts t JOIN assessments a ON a.id = t.assessment_id JOIN users u ON u.id = t.student_id WHERE t.id = ?1",
             params![attempt_id],
             |r| {
@@ -717,13 +973,14 @@ fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str) -> Res<Att
                     r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, f64>(3)?, r.get::<_, i64>(4)?,
                     r.get::<_, i64>(5)?, r.get::<_, Option<i64>>(6)?, r.get::<_, String>(7)?, r.get::<_, String>(8)?,
                     r.get::<_, String>(9)?, r.get::<_, f64>(10)?, r.get::<_, bool>(11)?, r.get::<_, Option<String>>(12)?, r.get::<_, String>(13)?,
+                    r.get::<_, String>(14)?, r.get::<_, String>(15)?, r.get::<_, Option<i64>>(16)?, r.get::<_, Option<f64>>(17)?, r.get::<_, i64>(18)?,
                 ))
             },
         )
         .optional()
         .map_err(db_err)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
-    let (assessment_id, student_id, status, score, pending, started_at, submitted_at, answers_raw, results_raw, title, total, show, teacher_id, student_name) = row;
+    let (assessment_id, student_id, status, score, pending, started_at, submitted_at, answers_raw, results_raw, title, total, show, teacher_id, student_name, release_mode, exam_status, closes_at, pass_mark, tab_leaves) = row;
     let is_owner = teacher_id.as_deref() == Some(viewer.id.as_str()) || viewer.role == "admin";
     if student_id != viewer.id && !is_owner {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
@@ -731,7 +988,8 @@ fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str) -> Res<Att
     if status == "in_progress" {
         return Err(err(StatusCode::CONFLICT, "in_progress"));
     }
-    let detail = is_owner || show;
+    let released = is_owner || is_released(&release_mode, &exam_status, closes_at, now_ms());
+    let detail = (is_owner || show) && released;
     let items = if detail && status == "submitted" {
         let questions = load_questions(conn, &assessment_id)?;
         let answers: HashMap<String, String> = serde_json::from_str(&answers_raw).unwrap_or_default();
@@ -765,14 +1023,20 @@ fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str) -> Res<Att
         assessment_id,
         title,
         student_name: if is_owner { student_name } else { String::new() },
-        status,
-        score,
+        status: status.clone(),
+        // a student who must wait for the exam to close learns nothing about the outcome yet
+        score: if released { score } else { 0.0 },
         total,
-        pending,
+        pending: if released { pending } else { 0 },
         started_at,
         submitted_at,
         show_answers: show,
         items,
+        released,
+        release_at: if released { None } else { closes_at },
+        pass_mark,
+        passed: if released && status == "submitted" { passed_flag(score, total, pending, pass_mark) } else { None },
+        tab_leaves: is_owner.then_some(tab_leaves),
     })
 }
 
@@ -832,6 +1096,9 @@ pub struct AttemptRow {
     score: f64,
     pending: i64,
     submitted_at: Option<i64>,
+    tab_leaves: i64,
+    /// Pass/fail against the exam's pass mark (`None` when there is none or grading is pending).
+    passed: Option<bool>,
 }
 
 #[derive(Serialize, Debug)]
@@ -841,23 +1108,35 @@ pub struct ResultsSummary {
     average: f64,
     highest: f64,
     lowest: f64,
+    /// Number of submitted attempts that reached the pass mark (0 when the exam has none).
+    passed: i64,
     attempts: Vec<AttemptRow>,
 }
 
-fn results_summary(conn: &Connection, user: &User, id: &str) -> Res<ResultsSummary> {
+fn results_summary(conn: &Connection, user: &User, id: &str, now: i64) -> Res<ResultsSummary> {
     let owner = owner_of(conn, id)?;
     if owner.as_deref() != Some(user.id.as_str()) && user.role != "admin" {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
     let info = get_info(conn, &user.id, id)?;
+    // attempts whose time ran out while the browser was away are settled before the numbers are shown
+    settle_assessment(conn, id, info.duration_min, now)?;
+    let total = info.total_points;
+    let pass_mark = info.pass_mark;
     let attempts = conn
         .prepare(
-            "SELECT t.id, u.full_name, t.status, t.score, t.pending, t.submitted_at FROM attempts t JOIN users u ON u.id = t.student_id
+            "SELECT t.id, u.full_name, t.status, t.score, t.pending, t.submitted_at, t.tab_leaves FROM attempts t JOIN users u ON u.id = t.student_id
              WHERE t.assessment_id = ?1 AND t.status <> 'in_progress' ORDER BY t.submitted_at DESC, t.started_at DESC LIMIT 500",
         )
         .map_err(db_err)?
         .query_map(params![id], |r| {
-            Ok(AttemptRow { attempt_id: r.get(0)?, student_name: r.get(1)?, status: r.get(2)?, score: r.get(3)?, pending: r.get(4)?, submitted_at: r.get(5)? })
+            let (status, score, pending): (String, f64, i64) = (r.get(2)?, r.get(3)?, r.get(4)?);
+            Ok(AttemptRow {
+                attempt_id: r.get(0)?,
+                student_name: r.get(1)?,
+                passed: if status == "submitted" { passed_flag(score, total, pending, pass_mark) } else { None },
+                status, score, pending, submitted_at: r.get(5)?, tab_leaves: r.get(6)?,
+            })
         })
         .map_err(db_err)?
         .collect::<Result<Vec<_>, _>>()
@@ -870,6 +1149,7 @@ fn results_summary(conn: &Connection, user: &User, id: &str) -> Res<ResultsSumma
         average: if n == 0 { 0.0 } else { round2(scores.iter().sum::<f64>() / n as f64) },
         highest: scores.iter().cloned().fold(0.0, f64::max),
         lowest: if n == 0 { 0.0 } else { scores.iter().cloned().fold(f64::MAX, f64::min) },
+        passed: attempts.iter().filter(|a| a.passed == Some(true)).count() as i64,
         attempts,
     })
 }
@@ -921,16 +1201,34 @@ pub struct MyAttempt {
     total: f64,
     pending: i64,
     started_at: i64,
+    /// False while the score is withheld until the exam closes.
+    released: bool,
+    passed: Option<bool>,
 }
 
 fn my_attempts(conn: &Connection, student_id: &str, assessment_id: Option<&str>) -> Res<Vec<MyAttempt>> {
+    let now = now_ms();
     conn.prepare(
-        "SELECT t.id, a.id, a.title, t.status, t.score, a.total_points, t.pending, t.started_at FROM attempts t
+        "SELECT t.id, a.id, a.title, t.status, t.score, a.total_points, t.pending, t.started_at, a.release_mode, a.status, a.closes_at, a.pass_mark FROM attempts t
          JOIN assessments a ON a.id = t.assessment_id WHERE t.student_id = ?1 AND (?2 IS NULL OR a.id = ?2) ORDER BY t.started_at DESC LIMIT 50",
     )
     .map_err(db_err)?
     .query_map(params![student_id, assessment_id], |r| {
-        Ok(MyAttempt { attempt_id: r.get(0)?, assessment_id: r.get(1)?, title: r.get(2)?, status: r.get(3)?, score: r.get(4)?, total: r.get(5)?, pending: r.get(6)?, started_at: r.get(7)? })
+        let (status, score, total, pending): (String, f64, f64, i64) = (r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?);
+        let released = is_released(&r.get::<_, String>(8)?, &r.get::<_, String>(9)?, r.get(10)?, now);
+        let pass_mark: Option<f64> = r.get(11)?;
+        Ok(MyAttempt {
+            attempt_id: r.get(0)?,
+            assessment_id: r.get(1)?,
+            title: r.get(2)?,
+            passed: if released && status == "submitted" { passed_flag(score, total, pending, pass_mark) } else { None },
+            status,
+            score: if released { score } else { 0.0 },
+            total,
+            pending: if released { pending } else { 0 },
+            started_at: r.get(7)?,
+            released,
+        })
     })
     .map_err(db_err)?
     .collect::<Result<Vec<_>, _>>()
@@ -1003,6 +1301,34 @@ pub async fn submit_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(i
     submit_attempt(&*lock(&s)?, &u, &id, &r.answers, now_ms()).map(Json)
 }
 
+#[derive(Deserialize)]
+pub struct SaveReq {
+    answers: HashMap<String, String>,
+}
+
+pub async fn save_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>, Json(r): Json<SaveReq>) -> Res<Json<serde_json::Value>> {
+    let u = require_role(&s, &h, "student")?;
+    let conn = lock(&s)?;
+    // The browser saves about every 30 s and after edits; far more than that is a runaway client.
+    crate::platform::rate_limit(&conn, &format!("save:{id}"), 60_000, 30)?;
+    let at = save_answers(&conn, &u, &id, &r.answers, now_ms())?;
+    Ok(Json(json!({ "saved_at": at })))
+}
+
+#[derive(Deserialize)]
+pub struct EventReq {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+pub async fn event_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>, Json(r): Json<EventReq>) -> Res<StatusCode> {
+    let u = require_role(&s, &h, "student")?;
+    let conn = lock(&s)?;
+    crate::platform::rate_limit(&conn, &format!("evt:{id}"), 60_000, 30)?;
+    record_event(&conn, &u, &id, &r.kind)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn attempt_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>) -> Res<Json<AttemptResult>> {
     let u = require_active(&s, &h)?;
     attempt_result(&*lock(&s)?, &u, &id).map(Json)
@@ -1018,7 +1344,7 @@ pub async fn grade_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id
 
 pub async fn results_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>) -> Res<Json<ResultsSummary>> {
     let u = require_active(&s, &h)?;
-    results_summary(&*lock(&s)?, &u, &id).map(Json)
+    results_summary(&*lock(&s)?, &u, &id, now_ms()).map(Json)
 }
 
 pub async fn subject_list_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>) -> Res<Json<Vec<AssessmentInfo>>> {
@@ -1133,7 +1459,7 @@ mod tests {
         assert_eq!((g.score, g.pending), (8.0, 0));
         let n: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE kind = 'assessment_graded'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
-        let s = results_summary(&w.conn, &w.teacher, &w.id).unwrap();
+        let s = results_summary(&w.conn, &w.teacher, &w.id, now_ms()).unwrap();
         assert_eq!((s.submitted, s.average, s.highest), (1, 8.0, 8.0));
     }
 
@@ -1395,7 +1721,9 @@ mod migration_tests {
         let (teacher, s1, s2) = (user("t1@x.com"), user("s1@x.com"), user("s2@x.com"));
         let published: String = one(&c, "SELECT id FROM assessments WHERE status = 'published'");
         // teacher dashboard numbers come out as they did before the upgrade
-        let r = results_summary(&c, &teacher, &published).unwrap();
+        // anchored to the fixture's own clock so the old in-progress attempt is not settled as overdue
+        let fixture_now: i64 = c.query_row("SELECT max(started_at) FROM attempts", [], |r| r.get(0)).unwrap();
+        let r = results_summary(&c, &teacher, &published, fixture_now + 1000).unwrap();
         assert_eq!((r.submitted, r.highest), (2, 8.0));
         // student review of the graded attempt still shows the graded items
         let graded: String = one(&c, "SELECT id FROM attempts WHERE score = 8.0");
@@ -1455,5 +1783,357 @@ mod migration_tests {
         assert!(!crate::platform::column_exists(&c, "assessments", "created_by").unwrap());
         assert_eq!(one::<i64>(&c, "SELECT count(*) FROM assessments"), 2);
         assert_eq!(one::<i64>(&c, "PRAGMA foreign_keys"), 1);
+    }
+}
+
+/// Exam-taking behaviour (phase 1-6): per-attempt shuffling, autosave, overdue settling, tab events,
+/// result release timing and the pass mark.
+#[cfg(test)]
+mod taking_tests {
+    use super::*;
+    use crate::platform::{create_test_db, insert_test_user};
+    use rand::{rngs::StdRng, SeedableRng};
+    use serde_json::json;
+
+    const NOW: i64 = 1_000_000_000_000;
+
+    struct W {
+        conn: Connection,
+        admin: User,
+        student: User,
+    }
+
+    fn world() -> W {
+        let conn = create_test_db();
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        conn.execute("INSERT INTO institutions(id, type, name_ar, created_at) VALUES ('i1','university','جامعة',0)", []).unwrap();
+        conn.execute("INSERT INTO subjects(id, institution_id, name_ar, created_at) VALUES ('s1','i1','برمجة',0)", []).unwrap();
+        let student = insert_test_user(&conn, "s@x.com", "student", "active");
+        conn.execute("INSERT INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1,'s1',0)", params![student.id]).unwrap();
+        W { conn, admin, student }
+    }
+
+    fn enroll(w: &W, email: &str) -> User {
+        let u = insert_test_user(&w.conn, email, "student", "active");
+        w.conn.execute("INSERT INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1,'s1',0)", params![u.id]).unwrap();
+        u
+    }
+
+    /// 6 questions: 3 single, 1 multi, 1 true/false, 1 short answer. Option texts are "o<q>-<index>"; the
+    /// correct original answers are B / AC / A.
+    fn qs() -> Vec<serde_json::Value> {
+        let opts = |q: usize, n: usize| (0..n).map(|i| format!("o{q}-{i}")).collect::<Vec<_>>();
+        vec![
+            json!({"id":"q1","type":"single_choice","stem":"س1","options":opts(1,4),"answer":"B","score":1}),
+            json!({"id":"q2","type":"single_choice","stem":"س2","options":opts(2,4),"answer":"D","score":1}),
+            json!({"id":"q3","type":"single_choice","stem":"س3","options":opts(3,5),"answer":"A","score":1}),
+            json!({"id":"q4","type":"multi_choice","stem":"س4","options":opts(4,5),"answer":"AC","score":2}),
+            json!({"id":"q5","type":"true_false","stem":"س5","options":["صحيح","خطأ"],"answer":"A","score":1}),
+            json!({"id":"q6","type":"short_answer","stem":"س6","answer":"مرجع","score":4}),
+        ]
+    }
+
+    fn exam(w: &W, extra: serde_json::Value) -> String {
+        let mut v = json!({"subject_id":"s1","title":"امتحان","questions":qs(),"status":"published"});
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        let req: crate::platform_exam_admin::ExamReq = serde_json::from_value(v).unwrap();
+        crate::platform_exam_admin::create_exam(&w.conn, &w.admin, &req, NOW).unwrap().info_id()
+    }
+
+    fn originals() -> Vec<Question> {
+        crate::platform_bank::tests_questions(&qs())
+    }
+
+    // ── ordering primitives
+
+    #[test]
+    fn no_shuffle_flags_means_no_stored_order_and_identity_mapping() {
+        let mut rng = StdRng::seed_from_u64(1);
+        assert_eq!(make_order(&originals(), false, false, &mut rng), None);
+        let a = ans(&[("q1", "B"), ("q4", "AC")]);
+        assert_eq!(to_original(&originals(), None, &a), a);
+        assert_eq!(displayed(&originals(), None).iter().map(|q| q.id.clone()).collect::<Vec<_>>(), vec!["q1", "q2", "q3", "q4", "q5", "q6"]);
+    }
+
+    fn ans(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn every_dealt_order_is_a_real_permutation_and_leaves_non_choice_questions_alone() {
+        let qs = originals();
+        for seed in 0..50 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let o = make_order(&qs, true, true, &mut rng).unwrap();
+            let mut ids = o.q.clone();
+            ids.sort();
+            assert_eq!(ids, vec!["q1", "q2", "q3", "q4", "q5", "q6"], "each question exactly once");
+            assert_eq!(o.o.keys().cloned().collect::<HashSet<_>>(), HashSet::from(["q1".to_string(), "q2".into(), "q3".into(), "q4".into()]), "only choice questions get option permutations");
+            for (id, perm) in &o.o {
+                let n = qs.iter().find(|q| &q.id == id).unwrap().options.len();
+                let mut sorted = perm.clone();
+                sorted.sort();
+                assert_eq!(sorted, (0..n).collect::<Vec<_>>(), "{id}: a permutation of the option indexes");
+            }
+            let shown = displayed(&qs, Some(&o));
+            assert_eq!(shown.iter().map(|q| q.id.clone()).collect::<Vec<_>>(), o.q);
+            let tf = shown.iter().find(|q| q.id == "q5").unwrap();
+            assert_eq!(tf.options, vec!["صحيح", "خطأ"], "true/false options keep their order so A/B stay true/false");
+        }
+        let seeds_differ: HashSet<Vec<String>> = (0..20).map(|s| make_order(&qs, true, false, &mut StdRng::seed_from_u64(s)).unwrap().q).collect();
+        assert!(seeds_differ.len() > 10, "different attempts really get different question orders");
+        let only_q = make_order(&qs, true, false, &mut StdRng::seed_from_u64(3)).unwrap();
+        assert!(only_q.o.is_empty(), "options untouched when only questions are shuffled");
+        let only_o = make_order(&qs, false, true, &mut StdRng::seed_from_u64(3)).unwrap();
+        assert_eq!(only_o.q, vec!["q1", "q2", "q3", "q4", "q5", "q6"], "questions untouched when only options are shuffled");
+    }
+
+    /// The property that makes shuffling safe: whatever a student ticks on the shuffled screen, the
+    /// answer mapped back to the original letters selects exactly the same option *texts*.
+    #[test]
+    fn displayed_answers_map_back_to_the_same_option_texts_for_every_possible_selection() {
+        let qs = originals();
+        for seed in 0..30 {
+            let order = make_order(&qs, true, true, &mut StdRng::seed_from_u64(seed)).unwrap();
+            let shown = displayed(&qs, Some(&order));
+            for q in qs.iter().filter(|q| is_choice(&q.qtype)) {
+                let sq = shown.iter().find(|x| x.id == q.id).unwrap();
+                let n = q.options.len();
+                for mask in 1u32..(1 << n) {
+                    let picked: String = (0..n).filter(|i| mask & (1 << i) != 0).map(|i| (b'A' + i as u8) as char).collect();
+                    if q.qtype == QuestionType::SingleChoice && picked.len() != 1 {
+                        continue;
+                    }
+                    let mapped = to_original(&qs, Some(&order), &ans(&[(&q.id, &picked)]))[&q.id].clone();
+                    let shown_texts: HashSet<&String> = picked.chars().map(|c| &sq.options[(c as u8 - b'A') as usize]).collect();
+                    let orig_texts: HashSet<&String> = mapped.chars().map(|c| &q.options[(c as u8 - b'A') as usize]).collect();
+                    assert_eq!(shown_texts, orig_texts, "seed {seed} {} picked {picked} mapped {mapped}", q.id);
+                }
+            }
+        }
+        // out-of-range letters and junk are dropped, duplicates collapsed, lower case accepted
+        let order = make_order(&qs, false, true, &mut StdRng::seed_from_u64(9)).unwrap();
+        let m = to_original(&qs, Some(&order), &ans(&[("q1", "Zb9b"), ("q2", ""), ("q5", "B")]));
+        assert_eq!(m["q1"].len(), 1, "junk and duplicates dropped");
+        assert_eq!((m["q2"].as_str(), m["q5"].as_str()), ("", "B"), "empty stays empty, true/false untouched");
+    }
+
+    // ── full attempt flow
+
+    /// The displayed letter(s) whose option text equals the original correct option(s).
+    fn solve(shown: &[PublicQuestion], original: &[Question], right: bool) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for o in original.iter().filter(|q| is_choice(&q.qtype)) {
+            let sq = shown.iter().find(|x| x.id == o.id).unwrap();
+            let want: Vec<&String> = o.answer.chars().map(|c| &o.options[(c as u8 - b'A') as usize]).collect();
+            let pick: String = sq.options.iter().enumerate().filter(|(_, t)| want.contains(t) == right).map(|(i, _)| (b'A' + i as u8) as char).take(if o.qtype == QuestionType::SingleChoice { 1 } else { 9 }).collect();
+            out.insert(o.id.clone(), pick);
+        }
+        out.insert("q5".into(), if right { "A" } else { "B" }.into());
+        out
+    }
+
+    #[test]
+    fn shuffled_attempts_grade_by_option_text_not_by_screen_position_and_never_leak() {
+        let w = world();
+        let id = exam(&w, json!({"shuffle_questions": true, "shuffle_options": true}));
+        let s2 = enroll(&w, "s2@x.com");
+        let a = start_attempt_with(&w.conn, &w.student, &id, NOW, &mut StdRng::seed_from_u64(1)).unwrap();
+        let b = start_attempt_with(&w.conn, &s2, &id, NOW, &mut StdRng::seed_from_u64(2)).unwrap();
+        let ids = |s: &StartRes| s.questions.iter().map(|q| q.id.clone()).collect::<Vec<_>>();
+        assert_ne!(ids(&a), ids(&b), "two students are dealt different question orders");
+        assert!(a.questions.iter().zip(&b.questions).any(|(x, y)| x.id == y.id && x.options != y.options) || ids(&a) != ids(&b));
+        for s in [&a, &b] {
+            let json = serde_json::to_string(&s.questions).unwrap();
+            assert!(!json.contains("\"answer\"") && !json.contains("analysis") && !json.contains("مرجع"), "no answers leak: {json}");
+        }
+        // the attempt reopens in exactly the same layout
+        let again = start_attempt_with(&w.conn, &w.student, &id, NOW + 5, &mut StdRng::seed_from_u64(99)).unwrap();
+        assert!(again.resumed && ids(&again) == ids(&a) && again.questions.iter().zip(&a.questions).all(|(x, y)| x.options == y.options), "resuming restores the stored order, not a new deal");
+        // student A answers everything right (by option text), student B everything wrong
+        let right = solve(&a.questions, &originals(), true);
+        let mut right_all = right.clone();
+        right_all.insert("q6".into(), "إجابتي".into());
+        let ra = submit_attempt(&w.conn, &w.student, &a.attempt_id, &right_all, NOW + 10).unwrap();
+        assert_eq!((ra.score, ra.pending), (1.0 + 1.0 + 1.0 + 2.0 + 1.0, 1), "every objective question is right regardless of the shuffle");
+        let wrong = submit_attempt(&w.conn, &s2, &b.attempt_id, &solve(&b.questions, &originals(), false), NOW + 10).unwrap();
+        assert_eq!(wrong.score, 0.0, "the complement of the right options scores nothing");
+        // the stored answers are in the original letters, so the review shows them against the original options
+        let items = ra.items.unwrap();
+        let q4 = items.iter().find(|i| i.id == "q4").unwrap();
+        assert_eq!((q4.your_answer.as_deref(), q4.correct_answer.as_deref(), q4.correct), (Some("AC"), Some("AC"), Some(true)));
+    }
+
+    #[test]
+    fn autosave_resumes_on_any_device_and_is_validated() {
+        let w = world();
+        let id = exam(&w, json!({"shuffle_options": true, "duration_min": 10}));
+        let s = start_attempt_with(&w.conn, &w.student, &id, NOW, &mut StdRng::seed_from_u64(4)).unwrap();
+        assert!(s.saved_answers.is_empty() && s.saved_at.is_none());
+        let long = "ك".repeat(3000);
+        let at = save_answers(&w.conn, &w.student, &s.attempt_id, &ans(&[("q1", "C"), ("q6", &long), ("ghost", "x")]), NOW + 1000).unwrap();
+        assert_eq!(at, NOW + 1000);
+        let r = start_attempt_with(&w.conn, &w.student, &id, NOW + 2000, &mut StdRng::seed_from_u64(5)).unwrap();
+        assert!(r.resumed && r.saved_at == Some(NOW + 1000));
+        assert_eq!(r.saved_answers.get("q1").map(String::as_str), Some("C"), "answers are given back in displayed letters");
+        assert_eq!(r.saved_answers["q6"].chars().count(), 2000, "over-long text is cut like on submit");
+        assert!(!r.saved_answers.contains_key("ghost"), "answers for unknown questions are dropped");
+        // latest save wins
+        save_answers(&w.conn, &w.student, &s.attempt_id, &ans(&[("q1", "A")]), NOW + 3000).unwrap();
+        assert_eq!(start_attempt_with(&w.conn, &w.student, &id, NOW + 4000, &mut StdRng::seed_from_u64(5)).unwrap().saved_answers.len(), 1);
+        // not yours / already submitted / unknown
+        let other = enroll(&w, "o@x.com");
+        assert_eq!(save_answers(&w.conn, &other, &s.attempt_id, &ans(&[]), NOW + 5000).unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(save_answers(&w.conn, &w.student, "nope", &ans(&[]), NOW + 5000).unwrap_err().0, StatusCode::NOT_FOUND);
+        submit_attempt(&w.conn, &w.student, &s.attempt_id, &ans(&[("q1", "A")]), NOW + 6000).unwrap();
+        assert_eq!(save_answers(&w.conn, &w.student, &s.attempt_id, &ans(&[]), NOW + 7000).unwrap_err().0, StatusCode::CONFLICT, "no saving after the attempt ended");
+    }
+
+    #[test]
+    fn overdue_attempts_are_submitted_from_the_autosave_or_expired_when_nothing_was_saved() {
+        let w = world();
+        let id = exam(&w, json!({"duration_min": 10, "max_attempts": 3}));
+        let late = NOW + 10 * 60_000 + GRACE_MS + 1;
+        // 1. saved something, then the browser vanished: the saved answers are graded at the deadline
+        let s = start_attempt(&w.conn, &w.student, &id, NOW).unwrap();
+        save_answers(&w.conn, &w.student, &s.attempt_id, &ans(&[("q1", "B"), ("q2", "A")]), NOW + 60_000).unwrap();
+        let next = start_attempt(&w.conn, &w.student, &id, late).unwrap();
+        assert!(!next.resumed, "a new attempt starts once the old one is settled");
+        let (status, score, at): (String, f64, i64) = w.conn.query_row("SELECT status, score, submitted_at FROM attempts WHERE id = ?1", params![s.attempt_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!((status.as_str(), score, at), ("submitted", 1.0, NOW + 10 * 60_000), "q1 right, q2 wrong; stamped at the deadline, not at discovery time");
+        // 2. never saved anything: expired with 0, as before
+        let gone = start_attempt(&w.conn, &w.student, &id, late + 1).unwrap();
+        assert!(gone.resumed);
+        let very_late = late + 1 + 10 * 60_000 + GRACE_MS + 1;
+        let third = start_attempt(&w.conn, &w.student, &id, very_late).unwrap();
+        assert!(!third.resumed);
+        let st: String = w.conn.query_row("SELECT status FROM attempts WHERE id = ?1", params![next.attempt_id], |r| r.get(0)).unwrap();
+        assert_eq!(st, "expired");
+        // 3. a manual submit that is too late fails, but the autosave still counts
+        save_answers(&w.conn, &w.student, &third.attempt_id, &ans(&[("q1", "B")]), very_late + 1000).unwrap();
+        let too_late = very_late + 10 * 60_000 + GRACE_MS + 1;
+        assert_eq!(submit_attempt(&w.conn, &w.student, &third.attempt_id, &ans(&[("q1", "B"), ("q2", "D")]), too_late).unwrap_err().0, StatusCode::CONFLICT);
+        let (status, score): (String, f64) = w.conn.query_row("SELECT status, score FROM attempts WHERE id = ?1", params![third.attempt_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((status.as_str(), score), ("submitted", 1.0), "only what was autosaved is graded");
+        // saving after the deadline is refused (and settles the attempt)
+        let fourth = enroll(&w, "f@x.com");
+        let f = start_attempt(&w.conn, &fourth, &id, NOW).unwrap();
+        save_answers(&w.conn, &fourth, &f.attempt_id, &ans(&[("q1", "B")]), NOW + 1000).unwrap();
+        assert_eq!(save_answers(&w.conn, &fourth, &f.attempt_id, &ans(&[("q1", "B")]), late).unwrap_err().0, StatusCode::CONFLICT);
+        assert_eq!(w.conn.query_row::<String, _, _>("SELECT status FROM attempts WHERE id = ?1", params![f.attempt_id], |r| r.get(0)).unwrap(), "submitted");
+    }
+
+    #[test]
+    fn the_periodic_sweep_and_the_results_page_settle_attempts_nobody_returned_to() {
+        let w = world();
+        let id = exam(&w, json!({"duration_min": 5}));
+        let s = start_attempt(&w.conn, &w.student, &id, NOW).unwrap();
+        save_answers(&w.conn, &w.student, &s.attempt_id, &ans(&[("q1", "B")]), NOW + 1).unwrap();
+        let s2 = enroll(&w, "s2@x.com");
+        let silent = start_attempt(&w.conn, &s2, &id, NOW).unwrap();
+        assert_eq!(settle_all(&w.conn, NOW + 4 * 60_000).unwrap(), 0, "not overdue yet");
+        let sum = results_summary(&w.conn, &w.admin, &id, NOW + 6 * 60_000 + GRACE_MS + 1).unwrap();
+        assert_eq!((sum.submitted, sum.attempts.len()), (1, 2), "the saved attempt counts as submitted, the silent one as expired");
+        assert_eq!(settle_all(&w.conn, NOW + 99 * 60_000).unwrap(), 0, "already settled: the sweep is idempotent");
+        let _ = silent;
+        // the sweep alone does the same for an exam nobody opens
+        let s3 = enroll(&w, "s3@x.com");
+        start_attempt(&w.conn, &s3, &id, NOW + 100 * 60_000).unwrap();
+        assert_eq!(settle_all(&w.conn, NOW + 200 * 60_000).unwrap(), 1);
+    }
+
+    // ── integrity events
+
+    #[test]
+    fn tab_leaves_are_counted_capped_owned_and_only_shown_to_graders() {
+        let w = world();
+        let id = exam(&w, json!({}));
+        let s = start_attempt(&w.conn, &w.student, &id, NOW).unwrap();
+        for _ in 0..3 {
+            record_event(&w.conn, &w.student, &s.attempt_id, "tab_leave").unwrap();
+        }
+        assert_eq!(record_event(&w.conn, &w.student, &s.attempt_id, "screenshot").unwrap_err().0, StatusCode::BAD_REQUEST);
+        let other = enroll(&w, "o@x.com");
+        assert_eq!(record_event(&w.conn, &other, &s.attempt_id, "tab_leave").unwrap_err().0, StatusCode::NOT_FOUND, "cannot touch another student's attempt");
+        assert_eq!(record_event(&w.conn, &w.student, "ghost", "tab_leave").unwrap_err().0, StatusCode::NOT_FOUND);
+        w.conn.execute("UPDATE attempts SET tab_leaves = 999 WHERE id = ?1", params![s.attempt_id]).unwrap();
+        record_event(&w.conn, &w.student, &s.attempt_id, "tab_leave").unwrap();
+        record_event(&w.conn, &w.student, &s.attempt_id, "tab_leave").unwrap();
+        let n: i64 = w.conn.query_row("SELECT tab_leaves FROM attempts WHERE id = ?1", params![s.attempt_id], |r| r.get(0)).unwrap();
+        assert_eq!(n, MAX_TAB_LEAVES, "capped, and hitting the cap is not an error");
+        let r = submit_attempt(&w.conn, &w.student, &s.attempt_id, &ans(&[]), NOW + 10).unwrap();
+        assert_eq!(r.tab_leaves, None, "the student never sees the counter");
+        record_event(&w.conn, &w.student, &s.attempt_id, "tab_leave").unwrap();
+        let after: i64 = w.conn.query_row("SELECT tab_leaves FROM attempts WHERE id = ?1", params![s.attempt_id], |r| r.get(0)).unwrap();
+        assert_eq!(after, MAX_TAB_LEAVES, "events after the attempt ended are ignored");
+        assert_eq!(attempt_result(&w.conn, &w.admin, &s.attempt_id).unwrap().tab_leaves, Some(MAX_TAB_LEAVES), "the admin sees it");
+        let row = &results_summary(&w.conn, &w.admin, &id, NOW + 20).unwrap().attempts[0];
+        assert_eq!(row.tab_leaves, MAX_TAB_LEAVES);
+    }
+
+    // ── release timing & pass mark
+
+    #[test]
+    fn results_wait_for_the_close_when_release_is_after_close_and_the_server_withholds_them() {
+        let w = world();
+        let soon = now_ms() + 3_600_000;
+        let id = exam(&w, json!({"release_mode": "after_close", "closes_at": soon, "pass_mark": 50}));
+        let s = start_attempt(&w.conn, &w.student, &id, now_ms()).unwrap();
+        let r = submit_attempt(&w.conn, &w.student, &s.attempt_id, &solve(&s.questions, &originals(), true), now_ms()).unwrap();
+        assert!(!r.released && r.release_at == Some(soon));
+        assert_eq!((r.score, r.pending, r.passed), (0.0, 0, None), "no score, no pending count, no pass/fail while embargoed");
+        assert!(r.items.is_none(), "no per-question details either");
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("correct_answer") && !json.contains("\"score\":6"), "{json}");
+        let mine = my_attempts(&w.conn, &w.student.id, None).unwrap();
+        assert_eq!((mine[0].released, mine[0].score, mine[0].passed), (false, 0.0, None), "the attempts list is gated too");
+        let admin_view = attempt_result(&w.conn, &w.admin, &s.attempt_id).unwrap();
+        assert!(admin_view.released && admin_view.score == 6.0 && admin_view.items.is_some(), "graders always see everything");
+        // closing the exam releases the results
+        crate::platform_exam_admin::act(&w.conn, &w.admin, &id, "close", now_ms()).unwrap();
+        let after = attempt_result(&w.conn, &w.student, &s.attempt_id).unwrap();
+        assert!(after.released && after.release_at.is_none() && after.score == 6.0 && after.items.is_some());
+        assert!(my_attempts(&w.conn, &w.student.id, None).unwrap()[0].released);
+        // a closing time in the past releases them as well, even if nobody pressed "close"
+        let id2 = exam(&w, json!({"title": "ثان", "release_mode": "after_close", "closes_at": soon, "max_attempts": 2}));
+        let s2 = start_attempt(&w.conn, &w.student, &id2, now_ms()).unwrap();
+        let r2 = submit_attempt(&w.conn, &w.student, &s2.attempt_id, &ans(&[]), now_ms()).unwrap();
+        assert!(!r2.released);
+        w.conn.execute("UPDATE assessments SET closes_at = 1 WHERE id = ?1", params![id2]).unwrap();
+        assert!(attempt_result(&w.conn, &w.student, &s2.attempt_id).unwrap().released, "closes_at passed");
+        // immediate exams are never embargoed
+        let id3 = exam(&w, json!({"title": "فوري"}));
+        let s3 = start_attempt(&w.conn, &w.student, &id3, now_ms()).unwrap();
+        assert!(submit_attempt(&w.conn, &w.student, &s3.attempt_id, &ans(&[]), now_ms()).unwrap().released);
+    }
+
+    #[test]
+    fn pass_mark_is_a_percentage_of_the_total_and_waits_for_manual_grading() {
+        let w = world();
+        // total 10 points: 1+1+1+2+1 objective, 4 for the short answer. 60% = 6 points.
+        let id = exam(&w, json!({"pass_mark": 60, "max_attempts": 5}));
+        let attempt = |answers: HashMap<String, String>, who: &User| {
+            let s = start_attempt(&w.conn, who, &id, now_ms()).unwrap();
+            submit_attempt(&w.conn, who, &s.attempt_id, &answers, now_ms()).unwrap()
+        };
+        let s2 = enroll(&w, "s2@x.com");
+        let full = attempt(ans(&[("q1", "B"), ("q2", "D"), ("q3", "A"), ("q4", "AC"), ("q5", "A"), ("q6", "كتبت إجابة")]), &s2);
+        assert_eq!((full.score, full.pending, full.passed), (6.0, 1, None), "pending short answer → the outcome is not decided yet");
+        let g = grade_attempt(&w.conn, &w.admin, &full.attempt_id, &GradeReq { grades: [("q6".to_string(), 0.0)].into() }).unwrap();
+        assert_eq!((g.score, g.passed), (6.0, Some(true)), "exactly 60% passes (the mark is inclusive)");
+        let s3 = enroll(&w, "s3@x.com");
+        let low = attempt(ans(&[("q1", "B"), ("q2", "D"), ("q3", "A"), ("q4", "A"), ("q6", "إجابة ضعيفة")]), &s3);
+        let low = grade_attempt(&w.conn, &w.admin, &low.attempt_id, &GradeReq { grades: [("q6".to_string(), 0.0)].into() }).unwrap();
+        assert_eq!((low.score, low.passed), (3.0, Some(false)));
+        let sum = results_summary(&w.conn, &w.admin, &id, now_ms()).unwrap();
+        assert_eq!((sum.submitted, sum.passed), (2, 1), "the summary counts passers");
+        assert!(sum.attempts.iter().any(|r| r.passed == Some(false)) && sum.attempts.iter().any(|r| r.passed == Some(true)));
+        // no pass mark → never a verdict
+        let id2 = exam(&w, json!({"title": "بلا نجاح"}));
+        let s = start_attempt(&w.conn, &w.student, &id2, now_ms()).unwrap();
+        assert_eq!(submit_attempt(&w.conn, &w.student, &s.attempt_id, &ans(&[]), now_ms()).unwrap().passed, None);
+        assert_eq!(passed_flag(5.0, 0.0, 0, Some(50.0)), None, "an exam worth 0 points has no percentage");
     }
 }
