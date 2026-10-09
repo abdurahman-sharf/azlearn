@@ -13,6 +13,8 @@ export interface Bin { from: number; to: number; count: number }
 export interface QStat {
   id: string; position: number; type: string; stem: string; max: number
   graded: number; answered: number; rate: number | null; avg_points: number | null; weak: boolean; easy: boolean
+  /** the question was voided by an answer-key correction: it counts for nobody (max 0, no rate) */
+  voided: boolean
 }
 export interface Analytics {
   info: AssessmentInfo
@@ -22,6 +24,8 @@ export interface Analytics {
   passed: number; failed: number; distribution: Bin[]
   avg_duration_sec: number | null; tab_leave_students: number; tab_leaves_total: number
   questions: QStat[]
+  /** also on `/results`; the results page reads it from there */
+  can_correct?: boolean
 }
 
 export type SortKey = 'name' | 'score' | 'duration' | 'tab_leaves' | 'submitted_at' | 'status'

@@ -27,3 +27,4 @@ libc = "0.2"
 
 [dev-dependencies]
 csv = "1"
+tower = { version = "0.5", features = ["util"] }

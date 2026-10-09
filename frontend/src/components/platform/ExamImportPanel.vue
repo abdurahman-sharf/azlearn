@@ -59,7 +59,7 @@ const reason = (issue: RowIssue) =>
   <section class="card-filled p-5 space-y-3" data-testid="exam-import">
     <div class="flex flex-wrap items-start justify-between gap-2">
       <div class="min-w-0">
-        <h3 class="text-title-md font-bold">{{ pt('xiTitle') }}</h3>
+        <h2 class="text-title-md font-bold">{{ pt('xiTitle') }}</h2>
         <p class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ pt('xiHint') }}</p>
       </div>
       <button type="button" class="btn-text shrink-0" data-testid="exim-template" @click="downloadTemplate">

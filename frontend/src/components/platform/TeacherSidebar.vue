@@ -2,7 +2,7 @@
 import { computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
-  ArchiveBoxIcon, BellIcon, BookOpenIcon, ClipboardDocumentCheckIcon, Cog6ToothIcon, GlobeAltIcon, HomeIcon,
+  ArchiveBoxIcon, BellIcon, BookOpenIcon, ClipboardDocumentCheckIcon, ClipboardDocumentListIcon, Cog6ToothIcon, GlobeAltIcon, HomeIcon,
   MagnifyingGlassIcon, RectangleStackIcon, UserCircleIcon, UsersIcon,
 } from '@heroicons/vue/24/outline'
 import { useAuthStore } from '@/stores/auth'
@@ -26,6 +26,7 @@ const groups = computed<NavGroup[]>(() => [
   { key: 'teaching', label: 'tchGroupTeaching', items: [
     { to: '/platform/teaching', label: 'tchNavSubjects', icon: BookOpenIcon, testid: 'nav-teacher-teaching' },
     { to: '/platform/my-content', label: 'myContent', icon: RectangleStackIcon, testid: 'nav-teacher-content' },
+    { to: '/platform/exams', label: 'mexTitle', icon: ClipboardDocumentListIcon, testid: 'nav-teacher-exams' },
     { to: '/platform/grading', label: 'navGrading', icon: ClipboardDocumentCheckIcon, badge: stats.value?.pending_grading?.answers, testid: 'nav-teacher-grading' },
   ] },
   { key: 'comms', label: 'tchGroupComms', items: [

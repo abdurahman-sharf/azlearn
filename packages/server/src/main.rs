@@ -7,6 +7,8 @@ mod platform_ai;
 mod platform_backup;
 mod platform_bank;
 mod platform_exam_admin;
+mod platform_exam_key;
+mod platform_exam_teacher;
 mod platform_grading;
 mod platform_content;
 mod platform_engage;
@@ -258,9 +260,8 @@ async fn main() {
         .route("/api/platform/admin/bank/bulk", post(platform_bank::bulk_handler))
         .route("/api/platform/admin/bank/import", post(platform_bank::import_handler).layer(platform_bank::import_limit()))
         .route("/api/platform/admin/bank/{id}", axum::routing::patch(platform_bank::update_handler))
-        .route("/api/platform/admin/exams", get(platform_exam_admin::list_handler).post(platform_exam_admin::create_handler))
-        .route("/api/platform/admin/exams/{id}", get(platform_exam_admin::get_handler).patch(platform_exam_admin::update_handler).delete(platform_exam_admin::delete_handler))
-        .route("/api/platform/admin/exams/{id}/{action}", post(platform_exam_admin::action_handler))
+        // the exam builder, both doors (admin and teacher) and the answer-key correction: see platform_exam_teacher::routes
+        .merge(platform_exam_teacher::routes())
         .route("/api/platform/attempts/{id}/answers", axum::routing::put(platform_exams::save_handler))
         .route("/api/platform/attempts/{id}/events", post(platform_exams::event_handler))
         .route("/api/platform/grading/pending", get(platform_grading::pending_handler))

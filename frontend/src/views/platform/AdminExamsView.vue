@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { usePt, platformErrorMessage, type PlatformKey } from '@/i18n/platform'
+import { usePt, platformErrorMessage, platformAdminErrorMessage, type PlatformKey } from '@/i18n/platform'
 import { useI18nStore } from '@/stores/i18n'
 import SubjectPicker from '@/components/platform/SubjectPicker.vue'
 import { deleteExam, examAction, listExams, type ExamAction, type ExamRow, type Phase } from '@/api/platformExamAdmin'
@@ -48,7 +48,7 @@ async function run(row: ExamRow, action: ExamAction) {
     notice.value = pt('bankDone')
     await load()
   } catch (e) {
-    error.value = platformErrorMessage(pt, e)
+    error.value = platformAdminErrorMessage(pt, e)
   }
 }
 
@@ -108,19 +108,21 @@ const tabs: { key: Phase | 'all' | ''; label: PlatformKey }[] = [
             <div v-if="e.opens_at || e.closes_at" class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">
               <template v-if="e.opens_at">{{ pt('exOpens').replace(/ \(.*\)/, '') }}: {{ fmt(e.opens_at) }}</template><template v-if="e.opens_at && e.closes_at"> · </template><template v-if="e.closes_at">{{ pt('exCloses').replace(/ \(.*\)/, '') }}: {{ fmt(e.closes_at) }}</template>
             </div>
-            <div v-if="!e.can_edit" class="text-body-sm font-semibold">{{ pt('exTeacherOwned') }}</div>
+            <div v-if="e.owned === false" class="text-body-sm font-semibold">{{ pt('exTeacherOwned') }}</div>
+            <div v-if="e.locked" class="text-body-sm font-semibold" data-testid="exam-locked-note">{{ pt('exLockedByStaff') }}</div>
           </div>
           <span class="text-xs font-semibold px-2 py-1 rounded-full shrink-0" style="background-color: rgb(var(--md-surface-container-high))" data-testid="exam-phase">{{ pt(`exPhase_${e.phase}` as PlatformKey) }}</span>
         </div>
         <div class="flex flex-wrap gap-1">
           <router-link v-if="e.can_edit && e.status !== 'archived'" :to="`/platform/admin/exams/${e.id}/edit`" class="btn-text" data-testid="act-edit">{{ pt('exEdit') }}</router-link>
           <button v-if="e.can_edit && e.status === 'draft'" class="btn-text" data-testid="act-publish" @click="run(e, 'publish')">{{ pt('exPublish') }}</button>
-          <button v-if="e.can_edit && e.status === 'published' && e.attempt_count === 0" class="btn-text" data-testid="act-unpublish" @click="run(e, 'unpublish')">{{ pt('exUnpublish') }}</button>
+          <button v-if="e.status === 'published' && e.attempt_count === 0" class="btn-text" data-testid="act-unpublish" @click="run(e, 'unpublish')">{{ pt('exUnpublish') }}</button>
           <button v-if="e.status === 'published'" class="btn-text" data-testid="act-close" @click="run(e, 'close')">{{ pt('exClose') }}</button>
-          <button v-if="e.can_edit && e.status === 'closed'" class="btn-text" data-testid="act-reopen" @click="run(e, 'reopen')">{{ pt('exReopen') }}</button>
+          <button v-if="e.status === 'closed'" class="btn-text" data-testid="act-reopen" @click="run(e, 'reopen')">{{ pt('exReopen') }}</button>
           <button class="btn-text" data-testid="act-duplicate" @click="run(e, 'duplicate')">{{ pt('exDuplicate') }}</button>
           <button v-if="e.status === 'draft' || e.status === 'closed'" class="btn-text" data-testid="act-archive" @click="run(e, 'archive')">{{ pt('exArchive') }}</button>
           <button v-if="e.status === 'archived'" class="btn-text" data-testid="act-restore" @click="run(e, 'restore')">{{ pt('exRestore') }}</button>
+          <button v-if="e.locked" class="btn-text" data-testid="act-unlock" @click="run(e, 'unlock')">{{ pt('exUnlock') }}</button>
           <router-link v-if="e.attempt_count > 0" :to="`/platform/assessments/${e.id}/results`" class="btn-text" data-testid="act-results">{{ pt('exResults') }}</router-link>
           <button class="btn-text" data-testid="act-delete" @click="remove(e)">{{ pt('exDelete') }}</button>
         </div>

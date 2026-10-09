@@ -1,5 +1,4 @@
 import { platformFetch } from '@/lib/platformApi'
-import type { Question } from '@exameow/shared'
 import type { HiddenReason } from './platformContent'
 
 export interface AssessmentInfo {
@@ -23,6 +22,8 @@ export interface MyAttempt {
 }
 export interface AssessmentDetail extends AssessmentInfo {
   can_start: boolean; in_progress_attempt: string | null; attempts: MyAttempt[]
+  /** staff only (a student always gets false): a teacher's exam closed/archived by someone other than its owner */
+  locked?: boolean
 }
 export interface PublicQuestion { id: string; type: string; stem: string; options: string[]; points: number }
 export interface StartRes {
@@ -43,18 +44,14 @@ export interface AttemptResult {
   tab_leaves: number | null
 }
 export interface AttemptRow { attempt_id: string; student_name: string; status: string; score: number; pending: number; submitted_at: number | null; tab_leaves: number; passed: boolean | null }
-export interface ResultsSummary { info: AssessmentInfo; submitted: number; average: number; highest: number; lowest: number; passed: number; attempts: AttemptRow[] }
-
-export interface AssessmentInput {
-  subject_id: string; title: string; description?: string; questions: Question[]
-  duration_min?: number; opens_at?: number; closes_at?: number
-  max_attempts: number; show_answers: boolean; status: 'draft' | 'published'
+export interface ResultsSummary {
+  info: AssessmentInfo; submitted: number; average: number; highest: number; lowest: number; passed: number; attempts: AttemptRow[]
+  /** the caller owns this exam and it is neither archived nor locked: the answer key can be corrected */
+  can_correct: boolean
 }
 
-export const createAssessment = (b: AssessmentInput) => platformFetch<AssessmentInfo>('/assessments', { body: b })
-export const updateAssessment = (id: string, b: Partial<Omit<AssessmentInput, 'subject_id' | 'questions'>> & { clear_duration?: boolean; clear_window?: boolean }) =>
-  platformFetch<AssessmentInfo>(`/assessments/${id}`, { method: 'PATCH', body: b })
-export const deleteAssessment = (id: string) => platformFetch<void>(`/assessments/${id}`, { method: 'DELETE' })
+// Exams are written through the exam builder's API (`platformExamAdmin.ts`: /admin/exams and /teacher/exams); the legacy
+// POST/PATCH/DELETE /assessments routes are no longer called from the app. Reads stay here.
 export const getAssessment = (id: string) => platformFetch<AssessmentDetail>(`/assessments/${id}`)
 export const startAssessment = (id: string) => platformFetch<StartRes>(`/assessments/${id}/start`, { method: 'POST', body: {} })
 export const submitAttempt = (id: string, answers: Record<string, string>) =>

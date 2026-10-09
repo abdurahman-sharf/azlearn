@@ -105,7 +105,8 @@ pub fn grading_sheet(conn: &Connection, user: &User, id: &str, only_pending: boo
     require_grader(conn, user, id)?;
     let info = get_info(conn, &user.id, id)?;
     let questions = load_questions(conn, id)?;
-    let short: Vec<&Question> = questions.iter().filter(|q| q.qtype == QuestionType::ShortAnswer).collect();
+    // a voided question (0 points) has nothing left to grade
+    let short: Vec<&Question> = questions.iter().filter(|q| q.qtype == QuestionType::ShortAnswer && points_of(q) > 0.0).collect();
     let mut out: Vec<GradingQuestion> = short
         .iter()
         .map(|q| GradingQuestion { id: q.id.clone(), stem: q.stem.clone(), reference: q.answer.clone(), max: points_of(q), pending: 0, answers: vec![] })
@@ -217,11 +218,17 @@ pub struct QStat {
     avg_points: Option<f64>,
     weak: bool,
     easy: bool,
+    /// Worth 0 points (dropped by an answer-key correction, or set to 0): it counts for nobody, so it has no rate and
+    /// is never flagged weak / easy.
+    voided: bool,
 }
 
 #[derive(Serialize, Debug)]
 pub struct Analytics {
     info: AssessmentInfo,
+    /// The caller may correct this exam's answer key right now (see `AssessmentInfo::can_correct_key`): the results
+    /// page needs this one bit, and reads it from here instead of fetching every attempt.
+    can_correct: bool,
     enrolled: i64,
     /// Distinct students with at least one submitted attempt.
     participants: i64,
@@ -332,10 +339,12 @@ pub fn analytics(conn: &Connection, user: &User, id: &str, now: i64) -> Res<Anal
             easy: rate.map_or(false, |x| graded >= MIN_SAMPLE && x > EASY_ABOVE),
             rate,
             avg_points: (graded > 0).then(|| round2(earned / graded as f64)),
+            voided: max <= 0.0,
         });
     }
     let leave_students = rows.iter().filter(|r| r.leaves > 0).map(|r| r.student.as_str()).collect::<std::collections::HashSet<_>>().len() as i64;
     Ok(Analytics {
+        can_correct: info.can_correct_key(user),
         participation_pct: (enrolled > 0).then(|| round2(students.len() as f64 / enrolled as f64 * 100.0)),
         participants: students.len() as i64,
         attempts_submitted: rows.len() as i64,
@@ -508,6 +517,7 @@ struct Labels {
     in_progress: &'static str,
     weak: &'static str,
     easy: &'static str,
+    voided: &'static str,
 }
 
 fn labels(lang: &str) -> Labels {
@@ -524,6 +534,7 @@ fn labels(lang: &str) -> Labels {
             in_progress: "جارية",
             weak: "ضعيف",
             easy: "سهل",
+            voided: "ملغى",
         }
     } else {
         Labels {
@@ -538,6 +549,7 @@ fn labels(lang: &str) -> Labels {
             in_progress: "In progress",
             weak: "Weak",
             easy: "Easy",
+            voided: "Voided",
         }
     }
 }
@@ -591,7 +603,7 @@ fn question_rows(a: &Analytics, l: &Labels) -> Vec<Vec<Cell>> {
             Cell::Num(q.graded as f64),
             Cell::Num(q.answered as f64),
             q.rate.map_or(Cell::Text(String::new()), |r| Cell::Num(round2(r * 100.0))),
-            if q.weak { l.weak } else if q.easy { l.easy } else { "" }.into(),
+            if q.voided { l.voided } else if q.weak { l.weak } else if q.easy { l.easy } else { "" }.into(),
         ]);
     }
     out
@@ -1001,6 +1013,76 @@ mod tests {
         assert_eq!(export(&w.conn, &w.admin, &w.exam, "csv", "nonsense", "ar", NOW).unwrap_err().0, StatusCode::BAD_REQUEST);
         let log: String = w.conn.query_row("SELECT group_concat(action) FROM audit_log", [], |r| r.get(0)).unwrap();
         assert!(log.contains("results_exported"), "exports are audited");
+    }
+
+    // ───── phase 3-3: a question worth 0 points (voided by an answer-key correction) ─────
+
+    fn void(w: &W, qid: &str) {
+        let r = crate::platform_exam_key::CorrectReq { mode: Some("void".into()), ..Default::default() };
+        crate::platform_exam_key::correct_question(&w.conn, &w.admin, &w.exam, qid, &r, NOW + 99 * 60_000).unwrap();
+    }
+
+    #[test]
+    fn a_voided_question_has_no_rate_no_flags_and_nothing_left_to_grade() {
+        let w = scenario();
+        let before = analytics(&w.conn, &w.admin, &w.exam, NOW + 99 * 60_000).unwrap();
+        let q = |a: &Analytics, id: &str| a.questions.iter().position(|x| x.id == id).unwrap();
+        assert!(before.questions[q(&before, "q5")].weak, "q5 was the weak question before");
+        assert!(!before.questions.iter().any(|x| x.voided));
+        void(&w, "q5");
+        void(&w, "s1");
+        let a = analytics(&w.conn, &w.admin, &w.exam, NOW + 99 * 60_000).unwrap();
+        for id in ["q5", "s1"] {
+            let s = &a.questions[q(&a, id)];
+            assert_eq!((s.voided, s.max, s.rate, s.weak, s.easy), (true, 0.0, None, false, false), "{id}");
+            assert!(s.avg_points.map_or(true, f64::is_finite), "{id}");
+        }
+        assert!(!a.questions[q(&a, "q1")].voided && a.questions[q(&a, "q1")].easy, "the others are unaffected");
+        assert_eq!(a.info.total_points, 4.0, "10 − 1 (q5) − 5 (s1)");
+        for v in [a.average, a.average_pct, a.median, a.highest, a.lowest, a.avg_duration_sec] {
+            assert!(v.map_or(true, f64::is_finite), "{v:?}");
+        }
+        assert_eq!(a.awaiting_grading, 0, "the answer that waited for grading was the voided one");
+        // nothing to grade any more: no queue entry, no questions on the grading sheet
+        assert!(pending_exams(&w.conn, &w.admin).unwrap().is_empty());
+        assert!(grading_sheet(&w.conn, &w.admin, &w.exam, false).unwrap().questions.is_empty());
+        // the table: percentages are of the new total, pass flags follow, no division by zero anywhere
+        let t = attempts_table(&w.conn, &w.admin, &w.exam, &TableQuery::default(), NOW + 99 * 60_000, false).unwrap();
+        assert!(t.items.iter().all(|r| r.percent.map_or(true, f64::is_finite) && r.pending == 0), "{:?}", t.items);
+        // exports: the flag column says so, in both languages
+        let ar = export(&w.conn, &w.admin, &w.exam, "csv", "questions", "ar", NOW + 99 * 60_000).unwrap();
+        let en = export(&w.conn, &w.admin, &w.exam, "csv", "questions", "en", NOW + 99 * 60_000).unwrap();
+        assert!(String::from_utf8(ar.bytes).unwrap().contains("ملغى") && String::from_utf8(en.bytes).unwrap().contains("Voided"));
+        assert!(export(&w.conn, &w.admin, &w.exam, "xlsx", "", "ar", NOW + 99 * 60_000).is_ok());
+        let json = serde_json::to_value(&a).unwrap();
+        assert_eq!(json["questions"][q(&a, "q5")]["voided"], serde_json::json!(true), "the wire carries `voided`");
+    }
+
+    #[test]
+    fn an_exam_whose_every_question_was_voided_still_produces_every_report() {
+        let w = scenario();
+        for id in ["q1", "q2", "q3", "q4", "q5", "s1"] {
+            void(&w, id);
+        }
+        let now = NOW + 99 * 60_000;
+        let a = analytics(&w.conn, &w.admin, &w.exam, now).unwrap();
+        assert_eq!(a.info.total_points, 0.0);
+        assert!(a.questions.iter().all(|q| q.voided && q.rate.is_none() && !q.weak && !q.easy));
+        assert_eq!((a.passed, a.failed, a.highest, a.lowest), (0, 0, Some(0.0), Some(0.0)), "no points to pass or fail on");
+        assert_eq!(a.average_pct, Some(0.0));
+        assert_eq!(a.distribution.iter().map(|b| b.count).sum::<i64>(), a.graded_students, "every graded student is in exactly one bin");
+        let t = attempts_table(&w.conn, &w.admin, &w.exam, &TableQuery::default(), now, false).unwrap();
+        assert!(t.items.iter().all(|r| r.percent.is_none() && r.passed.is_none() && r.total == 0.0));
+        for result in ["passed", "failed", "pending"] {
+            assert!(attempts_table(&w.conn, &w.admin, &w.exam, &TableQuery { result: Some(result.into()), ..Default::default() }, now, false).is_ok(), "{result}");
+        }
+        for (format, part) in [("csv", "results"), ("csv", "questions"), ("xlsx", "")] {
+            assert!(export(&w.conn, &w.admin, &w.exam, format, part, "en", now).is_ok(), "{format}/{part}");
+        }
+        let r = crate::platform_exams::results_summary(&w.conn, &w.admin, &w.exam, now).unwrap();
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v["average"].as_f64().unwrap().is_finite() && v["highest"].as_f64().unwrap() == 0.0);
+        assert_eq!(v["passed"], serde_json::json!(0));
     }
 
     #[test]

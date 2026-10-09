@@ -57,7 +57,7 @@ const QUICK: Quick[] = [
   { id: 'post', to: '/platform/posts/new', label: 'newPost', icon: DocumentTextIcon, testid: 'quick-post' },
   { id: 'course', to: '/platform/courses/new', label: 'newCourse', icon: AcademicCapIcon, testid: 'quick-course' },
   { id: 'live', to: '/platform/live/new', label: 'newLive', icon: VideoCameraIcon, testid: 'quick-live' },
-  { id: 'exam', to: '/platform/assessments/new', label: 'exNew', icon: ClipboardDocumentListIcon, testid: 'quick-exam' },
+  { id: 'exam', to: '/platform/exams/new', label: 'exNew', icon: ClipboardDocumentListIcon, testid: 'quick-exam' },
 ]
 const quick = computed(() => QUICK.map((q) => ({ ...q, block: quickBlock(stats.value, q.id) })))
 const BLOCK_REASON = { no_subject: 'tchQuickNoSubject', exams_off: 'examsOffReason' } as const

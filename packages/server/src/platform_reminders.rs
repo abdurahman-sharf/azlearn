@@ -383,12 +383,14 @@ mod tests {
         let w = world();
         let teacher = insert_test_user(&w.conn, "t@x.com", "teacher", "active");
         w.conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at) VALUES (?1,'s1','approved',0)", params![teacher.id]).unwrap();
-        let r: crate::platform_exams::AssessmentReq = serde_json::from_value(serde_json::json!({
+        let r: crate::platform_exam_admin::ExamReq = serde_json::from_value(serde_json::json!({
             "subject_id": "s1", "title": "امتحان المعلم", "status": "published", "closes_at": T0 + 30 * H,
             "questions": [{"id": "q1", "type": "single_choice", "stem": "س", "options": ["a", "b"], "answer": "A", "score": 1}]
         })).unwrap();
-        let id = crate::platform_exams::create_assessment(&w.conn, &teacher, &r).unwrap().id();
-        // `create_assessment` stamps the real clock; pretend it was announced long ago
+        // (the builder takes the clock as a parameter; the legacy `create_assessment` uses the real one and, like the
+        // builder, refuses to publish an exam whose closing time has passed — which `T0 + 30 h` is, in real time)
+        let id = crate::platform_exam_admin::create_exam(&w.conn, &teacher, &r, T0).unwrap().info_id();
+        // pretend it was announced long ago
         w.conn.execute("UPDATE assessments SET published_at = ?2 WHERE id = ?1", params![id, T0 - 100 * H]).unwrap();
         w.conn.execute("UPDATE users SET status = 'suspended' WHERE id = ?1", params![teacher.id]).unwrap();
         assert_eq!(sweep(&w.conn, T0 + 10 * H), Sweep::default(), "suspended teacher: the exam is hidden, so no reminders");

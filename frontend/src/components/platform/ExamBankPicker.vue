@@ -45,7 +45,7 @@ const isCorrect = (it: BankItem, i: number) => (it.type === 'single_choice' || i
 
 <template>
   <section class="card-filled p-5 space-y-3" data-testid="bank-picker">
-    <h3 class="text-title-md font-bold">{{ pt('exSourceBank') }}</h3>
+    <h2 class="text-title-md font-bold">{{ pt('exSourceBank') }}</h2>
     <form class="grid grid-cols-2 md:grid-cols-4 gap-2" @submit.prevent="submitSearch">
       <input v-model="search" type="search" :placeholder="pt('bankSearch')" class="input-outlined col-span-2 md:col-span-4" data-testid="pick-search" />
       <select v-model="filter.type" class="input-outlined" :aria-label="pt('bankFormType')" data-testid="pick-type" @change="refilter">

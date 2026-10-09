@@ -127,6 +127,46 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     crate::platform::add_column_if_missing(conn, "assessments", "source_map", "TEXT")?;
     // When students were last told about the exam (phase 1-8): the closing reminder never lands on top of it.
     crate::platform::add_column_if_missing(conn, "assessments", "published_at", "INTEGER")?;
+    // Who closed / archived the exam (phase 3-3): user ids with no foreign key, so a deleted account just leaves a
+    // dangling id (which never equals the owner's). `NULL` = the system (report auto-hide) or a row from before this
+    // column existed. They decide `AssessmentInfo::is_locked`.
+    crate::platform::add_column_if_missing(conn, "assessments", "closed_by", "TEXT")?;
+    crate::platform::add_column_if_missing(conn, "assessments", "archived_by", "TEXT")?;
+    settle_zero_point_answers(conn)?;
+    Ok(())
+}
+
+/// A written answer to a question worth 0 points can never be graded (there is nothing to give, and the grading sheet
+/// no longer lists such a question), yet before phase 3-3 it was left "pending" at submission — so the exam sat in the
+/// grading queue and on the sidebar badge for good. Settles those stored outcomes (0 of 0, nothing to mark) and
+/// recomputes `attempts.pending`. Idempotent: once settled, nothing matches any more; scores do not change.
+fn settle_zero_point_answers(conn: &Connection) -> Result<(), String> {
+    let e = |x: rusqlite::Error| x.to_string();
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT id, results FROM attempts WHERE status = 'submitted' AND pending > 0")
+        .map_err(e)?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(e)?
+        .collect::<Result<_, _>>()
+        .map_err(e)?;
+    for (id, raw) in rows {
+        let Ok(mut outcomes) = serde_json::from_str::<Vec<Outcome>>(&raw) else { continue };
+        let mut touched = false;
+        for o in outcomes.iter_mut().filter(|o| o.correct.is_none() && o.max <= 0.0) {
+            o.correct = Some(true);
+            o.points = 0.0;
+            touched = true;
+        }
+        if !touched {
+            continue;
+        }
+        let pending = outcomes.iter().filter(|o| o.correct.is_none()).count() as i64;
+        conn.execute(
+            "UPDATE attempts SET results = ?2, pending = ?3 WHERE id = ?1",
+            params![id, serde_json::to_string(&outcomes).map_err(|x| x.to_string())?, pending],
+        )
+        .map_err(e)?;
+    }
     Ok(())
 }
 
@@ -160,7 +200,7 @@ fn canon_tf(s: &str) -> String {
 }
 
 /// Some(true/false) for objective questions, None for short answers (teacher grades those).
-fn auto_grade(q: &Question, user: Option<&str>) -> Option<bool> {
+pub(crate) fn auto_grade(q: &Question, user: Option<&str>) -> Option<bool> {
     match q.qtype {
         QuestionType::ShortAnswer => None,
         QuestionType::TrueFalse => {
@@ -193,29 +233,47 @@ pub(crate) struct Outcome {
     pub(crate) correct: Option<bool>,
     pub(crate) points: f64,
     pub(crate) max: f64,
+    /// The points a teacher gave a written answer by hand, set aside while the question is worth 0 points (voided by an
+    /// answer-key correction, or set to 0), so that counting the question again gives the same grade back instead of
+    /// asking for the grading anew. `None` everywhere else (and absent from the stored JSON).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kept: Option<f64>,
+}
+
+/// Grades one question from what the student wrote (`None` = nothing given): objective questions are marked right
+/// or wrong, a short answer that was written waits for the teacher (`correct: None`), a blank one is 0. A question
+/// worth 0 points (voided by an answer-key correction, or set to 0 by the teacher) is settled for everybody
+/// (`correct: Some(true)`, 0 of 0): there is nothing to mark.
+pub(crate) fn grade_one(q: &Question, user: Option<&str>) -> Outcome {
+    let max = points_of(q);
+    if max <= 0.0 {
+        return Outcome { id: q.id.clone(), correct: Some(true), points: 0.0, max: 0.0, kept: None };
+    }
+    let (correct, points) = match auto_grade(q, user) {
+        Some(true) => (Some(true), max),
+        Some(false) => (Some(false), 0.0),
+        None => {
+            // short answer: pending only if the student wrote something
+            if user.map_or(false, |u| !u.trim().is_empty()) {
+                (None, 0.0)
+            } else {
+                (Some(false), 0.0)
+            }
+        }
+    };
+    Outcome { id: q.id.clone(), correct, points, max, kept: None }
 }
 
 fn grade_all(questions: &[Question], answers: &HashMap<String, String>) -> (Vec<Outcome>, f64, i64) {
     let mut outcomes = Vec::with_capacity(questions.len());
     let (mut score, mut pending) = (0.0, 0);
     for q in questions {
-        let max = points_of(q);
-        let user = answers.get(&q.id).map(String::as_str);
-        let (correct, points) = match auto_grade(q, user) {
-            Some(true) => (Some(true), max),
-            Some(false) => (Some(false), 0.0),
-            None => {
-                // short answer: pending only if the student wrote something
-                if user.map_or(false, |u| !u.trim().is_empty()) {
-                    pending += 1;
-                    (None, 0.0)
-                } else {
-                    (Some(false), 0.0)
-                }
-            }
-        };
-        score += points;
-        outcomes.push(Outcome { id: q.id.clone(), correct, points, max });
+        let o = grade_one(q, answers.get(&q.id).map(String::as_str));
+        score += o.points;
+        if o.correct.is_none() {
+            pending += 1;
+        }
+        outcomes.push(o);
     }
     (outcomes, round2(score), pending)
 }
@@ -255,11 +313,118 @@ pub(crate) fn validate_questions(qs: &[Question]) -> Res<()> {
     Ok(())
 }
 
+/// Publishing (or saving a published, unfrozen exam) needs a closing time still ahead: an exam that is already over
+/// must not be announced as a new one. **The one rule**, used by the builder's `check_publishable` and by the legacy
+/// `POST/PATCH /assessments` routes alike.
+pub(crate) fn check_closing_ahead(closes_at: Option<i64>, now: i64) -> Res<()> {
+    if closes_at.map_or(false, |c| c <= now) {
+        return Err(bad("invalid_time"));
+    }
+    Ok(())
+}
+
 pub(crate) fn check_window(opens: Option<i64>, closes: Option<i64>) -> Res<()> {
     if let (Some(o), Some(c)) = (opens, closes) {
         if c <= o {
             return Err(bad("invalid_time"));
         }
+    }
+    Ok(())
+}
+
+fn with_question(e: crate::relay::Err, q: &Question, index: usize) -> crate::relay::Err {
+    let mut v: serde_json::Value = serde_json::from_str(&e.1).unwrap_or_else(|_| json!({ "error": "invalid_question" }));
+    v["question_id"] = serde_json::Value::String(q.id.clone());
+    v["index"] = serde_json::Value::from(index);
+    (e.0, v.to_string())
+}
+
+/// Cleans and checks an exam's questions (ids unique, answers brought to the canonical form and *checkable*, shapes
+/// valid). Empty is fine here (a draft); callers that need questions check for that themselves. **Every way of
+/// storing an exam's questions goes through this** — the builder API and the legacy routes alike — so an answer the
+/// grader cannot check never gets in.
+pub(crate) fn clean_questions(qs: &[Question]) -> Res<Vec<Question>> {
+    if qs.len() > MAX_QUESTIONS {
+        return Err(bad("invalid_question_count"));
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(qs.len());
+    for (i, q) in qs.iter().enumerate() {
+        let c = crate::platform_bank::clean_exam_question(q).map_err(|e| with_question(e, q, i))?;
+        if c.id.is_empty() || c.id.chars().count() > 100 || !seen.insert(c.id.clone()) {
+            return Err(with_question(bad("invalid_question_id"), q, i));
+        }
+        out.push(c);
+    }
+    Ok(out)
+}
+
+/// The validated, effective settings of an exam (what the freeze rule compares).
+#[derive(Clone, Debug)]
+pub(crate) struct Cfg {
+    pub(crate) duration_min: Option<i64>,
+    pub(crate) opens_at: Option<i64>,
+    pub(crate) closes_at: Option<i64>,
+    pub(crate) max_attempts: i64,
+    pub(crate) show_answers: bool,
+    pub(crate) shuffle_questions: bool,
+    pub(crate) shuffle_options: bool,
+    pub(crate) pass_mark: Option<f64>,
+    pub(crate) release_mode: String,
+}
+
+impl Cfg {
+    pub(crate) fn defaults() -> Cfg {
+        Cfg {
+            duration_min: None,
+            opens_at: None,
+            closes_at: None,
+            max_attempts: 1,
+            show_answers: true,
+            shuffle_questions: false,
+            shuffle_options: false,
+            pass_mark: None,
+            release_mode: "immediate".into(),
+        }
+    }
+    pub(crate) fn of(i: &AssessmentInfo) -> Cfg {
+        Cfg {
+            duration_min: i.duration_min,
+            opens_at: i.opens_at,
+            closes_at: i.closes_at,
+            max_attempts: i.max_attempts,
+            show_answers: i.show_answers,
+            shuffle_questions: i.shuffle_questions,
+            shuffle_options: i.shuffle_options,
+            pass_mark: i.pass_mark,
+            release_mode: i.release_mode.clone(),
+        }
+    }
+}
+
+/// PRD E6: once the first attempt exists only some things may change: the title and description, a later (or no)
+/// closing time, show-answers, release timing, the pass mark and *more* attempts. Everything that changes what the
+/// students sat or how it is dealt (the questions, the subject, the duration, the opening time, shuffling) answers
+/// 409 `has_attempts`; shortening the closing time or lowering the attempts answers 409 `only_extend`.
+/// `content_changed` = the request touches the questions, their sources or the subject. **The one freeze guard**,
+/// used by the builder API and the legacy `PATCH /assessments/{id}` alike; callers apply it when `attempt_count > 0`.
+pub(crate) fn check_freeze(base: &Cfg, next: &Cfg, content_changed: bool) -> Res<()> {
+    let moved_start = next.opens_at != base.opens_at;
+    let shortened = match (base.closes_at, next.closes_at) {
+        (Some(old), Some(new)) => new < old,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    if content_changed
+        || next.duration_min != base.duration_min
+        || moved_start
+        || next.shuffle_questions != base.shuffle_questions
+        || next.shuffle_options != base.shuffle_options
+    {
+        return Err(err(StatusCode::CONFLICT, "has_attempts"));
+    }
+    if shortened || next.max_attempts < base.max_attempts {
+        return Err(err(StatusCode::CONFLICT, "only_extend"));
     }
     Ok(())
 }
@@ -296,6 +461,12 @@ pub struct AssessmentInfo {
     pub(crate) closed_at: Option<i64>,
     pub(crate) archived_at: Option<i64>,
     pub(crate) created_by: Option<String>,
+    /// Who closed / archived it (user ids; `None` = the system or a row from before they were recorded). Internal:
+    /// the wire only carries the verdict, [`AssessmentInfo::is_locked`].
+    #[serde(skip)]
+    pub(crate) closed_by: Option<String>,
+    #[serde(skip)]
+    pub(crate) archived_by: Option<String>,
 }
 
 impl AssessmentInfo {
@@ -303,9 +474,42 @@ impl AssessmentInfo {
     pub(crate) fn id(&self) -> String {
         self.id.clone()
     }
+
+    /// Whether `user` is the owner: the owning teacher of a teacher's exam, or any admin for an exam created by an
+    /// admin (no teacher). This is the single ownership rule of the exam builder, the lifecycle and the answer-key
+    /// correction; whoever else may *see* the exam (graders, moderators) is a different question ([`can_grade`]).
+    pub(crate) fn owned_by(&self, user: &User) -> bool {
+        match user.role.as_str() {
+            "teacher" => self.teacher_id.as_deref() == Some(user.id.as_str()),
+            "admin" => self.teacher_id.is_none(),
+            _ => false,
+        }
+    }
+
+    /// A teacher's exam whose closed / archived state was set by somebody other than its owner (an admin, the report
+    /// auto-hide, or a row from before the actor was recorded). Its owner can then only look at it, duplicate it or
+    /// delete it (when nobody sat it): moderation is not theirs to undo (an admin hands it back with reopen, restore or
+    /// `unlock`). Admin exams are never locked, and a live (draft / published) exam never is. **The only place this rule
+    /// is written.**
+    pub(crate) fn is_locked(&self) -> bool {
+        let Some(owner) = self.teacher_id.as_deref() else { return false };
+        let actor = match self.status.as_str() {
+            "closed" => &self.closed_by,
+            "archived" => &self.archived_by,
+            _ => return false,
+        };
+        actor.as_deref() != Some(owner)
+    }
+
+    /// The viewer may correct this exam's answer key right now: they own it and it is neither archived nor locked (what
+    /// `platform_exam_key::correct_question` enforces). The results and analytics pages carry it so the UI offers the
+    /// button only to those who can use it.
+    pub(crate) fn can_correct_key(&self, user: &User) -> bool {
+        self.owned_by(user) && self.status != "archived" && !self.is_locked()
+    }
 }
 
-/// The column list `map_info` reads (24 columns), as a macro so `INFO_SELECT` can be built with `concat!` while
+/// The column list `map_info` reads (26 columns), as a macro so `INFO_SELECT` can be built with `concat!` while
 /// `INFO_COLS`/`INFO_FROM` stay available to queries that add a column of their own (e.g. the hidden reason).
 macro_rules! info_cols {
     () => {
@@ -313,7 +517,8 @@ macro_rules! info_cols {
         a.total_points, a.duration_min, a.opens_at, a.closes_at, a.max_attempts, a.show_answers, a.status,
         (SELECT count(*) FROM attempts t WHERE t.assessment_id = a.id AND t.student_id = ?1),
         (SELECT count(*) FROM attempts t WHERE t.assessment_id = a.id),
-        a.shuffle_questions, a.shuffle_options, a.pass_mark, a.release_mode, a.closed_at, a.archived_at, a.created_by"
+        a.shuffle_questions, a.shuffle_options, a.pass_mark, a.release_mode, a.closed_at, a.archived_at, a.created_by,
+        a.closed_by, a.archived_by"
     };
 }
 macro_rules! info_from {
@@ -351,6 +556,8 @@ pub(crate) fn map_info(r: &rusqlite::Row) -> rusqlite::Result<AssessmentInfo> {
         closed_at: r.get(21)?,
         archived_at: r.get(22)?,
         created_by: r.get(23)?,
+        closed_by: r.get(24)?,
+        archived_by: r.get(25)?,
     })
 }
 
@@ -421,6 +628,8 @@ pub(crate) fn create_assessment(conn: &Connection, teacher: &User, r: &Assessmen
     let description = opt_text(&r.description, 2000, "description_too_long")?;
     let questions = r.questions.as_ref().ok_or_else(|| bad("invalid_question_count"))?;
     validate_questions(questions)?;
+    // the same normalisation as the builder: an answer the grader cannot check is refused here too
+    let questions = &clean_questions(questions)?;
     check_duration(r.duration_min)?;
     check_window(r.opens_at, r.closes_at)?;
     let max_attempts = r.max_attempts.unwrap_or(1);
@@ -431,9 +640,12 @@ pub(crate) fn create_assessment(conn: &Connection, teacher: &User, r: &Assessmen
     if !["draft", "published"].contains(&status) {
         return Err(bad("invalid_status"));
     }
+    let now = now_ms();
+    if status == "published" {
+        check_closing_ahead(r.closes_at, now)?;
+    }
     let total: f64 = round2(questions.iter().map(points_of).sum());
     let id = new_id();
-    let now = now_ms();
     conn.execute(
         "INSERT INTO assessments(id, teacher_id, created_by, subject_id, title, description, questions, question_count, total_points, duration_min,
            opens_at, closes_at, max_attempts, show_answers, status, created_at, updated_at)
@@ -529,6 +741,13 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
     if !(1..=10).contains(&max_attempts) {
         return Err(bad("invalid_attempts"));
     }
+    // Students already sat (or are sitting) this exam: the same freeze as the builder (questions, duration and opening
+    // time are fixed; the closing time and the attempts can only grow; `show_answers` stays changeable).
+    if cur.attempt_count > 0 {
+        let base = Cfg::of(&cur);
+        let next = Cfg { duration_min: duration, opens_at: opens, closes_at: closes, max_attempts, ..base.clone() };
+        check_freeze(&base, &next, r.questions.is_some())?;
+    }
     let status = r.status.clone().unwrap_or_else(|| cur.status.clone());
     if !["draft", "published"].contains(&status.as_str()) {
         return Err(bad("invalid_status"));
@@ -537,6 +756,11 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
     // Closing it is the way to stop new attempts (admins have their own lifecycle actions for that).
     if status == "draft" && cur.status != "draft" && cur.attempt_count > 0 {
         return Err(err(StatusCode::CONFLICT, "has_attempts"));
+    }
+    // Like the builder: turning an exam on (or saving a published one nobody sat yet) needs a closing time still ahead.
+    // A published exam that students already sat may keep a closing time that has passed (it simply reads as closed).
+    if status == "published" && (cur.status != "published" || cur.attempt_count == 0) {
+        check_closing_ahead(closes, now_ms())?;
     }
     // Whoever turns it on (the owner on any save that leaves it published, an admin on a transition) needs the owning
     // teacher to hold a live assignment: nothing is published into a subject it cannot be seen in. An admin exam
@@ -547,14 +771,13 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
         }
     }
     if let Some(qs) = &r.questions {
-        if cur.attempt_count > 0 {
-            return Err(err(StatusCode::CONFLICT, "has_attempts")); // never change questions under existing attempts
-        }
+        // (never under existing attempts: `check_freeze` above)
         validate_questions(qs)?;
+        let qs = clean_questions(qs)?;
         let total: f64 = round2(qs.iter().map(points_of).sum());
         conn.execute(
             "UPDATE assessments SET questions = ?1, question_count = ?2, total_points = ?3 WHERE id = ?4",
-            params![serde_json::to_string(qs).map_err(db_err)?, qs.len() as i64, total, id],
+            params![serde_json::to_string(&qs).map_err(db_err)?, qs.len() as i64, total, id],
         )
         .map_err(db_err)?;
     }
@@ -624,11 +847,11 @@ pub(crate) fn update_checked(conn: &Connection, crypto: &crate::platform_setting
 
 #[derive(Serialize, Debug)]
 pub struct PublicQuestion {
-    id: String,
+    pub(crate) id: String,
     #[serde(rename = "type")]
     qtype: QuestionType,
     stem: String,
-    options: Vec<String>,
+    pub(crate) options: Vec<String>,
     points: f64,
 }
 
@@ -1040,7 +1263,7 @@ pub(crate) fn submit_attempt(conn: &Connection, student: &User, attempt_id: &str
 
 /// Builds the result view. Students only see per-question detail when the assessment allows it;
 /// the owner/admin always see everything.
-fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str) -> Res<AttemptResult> {
+pub(crate) fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str) -> Res<AttemptResult> {
     let row = conn
         .query_row(
             "SELECT t.assessment_id, t.student_id, t.status, t.score, t.pending, t.started_at, t.submitted_at, t.answers, t.results,
@@ -1204,9 +1427,13 @@ pub struct ResultsSummary {
     /// Number of submitted attempts that reached the pass mark (0 when the exam has none).
     passed: i64,
     attempts: Vec<AttemptRow>,
+    /// The caller may correct this exam's answer key right now (the owner, exam not archived or locked); see
+    /// `platform_exam_key`. Graders who are not the owner (an admin looking at a teacher's exam, a colleague approved
+    /// for the subject of an admin exam) see the results but cannot change the key.
+    can_correct: bool,
 }
 
-fn results_summary(conn: &Connection, user: &User, id: &str, now: i64) -> Res<ResultsSummary> {
+pub(crate) fn results_summary(conn: &Connection, user: &User, id: &str, now: i64) -> Res<ResultsSummary> {
     if !can_grade(conn, user, id)? {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
@@ -1235,7 +1462,9 @@ fn results_summary(conn: &Connection, user: &User, id: &str, now: i64) -> Res<Re
         .map_err(db_err)?;
     let scores: Vec<f64> = attempts.iter().filter(|a| a.status == "submitted").map(|a| a.score).collect();
     let n = scores.len();
+    let can_correct = info.can_correct_key(user);
     Ok(ResultsSummary {
+        can_correct,
         info,
         submitted: n as i64,
         average: if n == 0 { 0.0 } else { round2(scores.iter().sum::<f64>() / n as f64) },
@@ -1273,15 +1502,15 @@ pub struct MineExam {
 
 /// Students see `published` and `closed` exams (a closed one keeps its results); a draft or archived one is simply
 /// not shown and has no reason.
-fn shown_state(status: &str) -> bool {
+pub(crate) fn shown_state(status: &str) -> bool {
     matches!(status, "published" | "closed")
 }
 
 fn list_mine(conn: &Connection, teacher_id: &str) -> Res<Vec<MineExam>> {
-    // column 24 (after the 24 of `map_info`) is the reason; `?1` = the teacher, which is also the viewer
+    // column 26 (after the 26 of `map_info`) is the reason; `?1` = the teacher, which is also the viewer
     conn.prepare(&format!("SELECT {INFO_COLS}, ({}) {INFO_FROM} WHERE a.teacher_id = ?1 ORDER BY a.updated_at DESC LIMIT 100", exam_reason_sql("a")))
         .map_err(db_err)?
-        .query_map(params![teacher_id], |r| Ok((map_info(r)?, r.get::<_, Option<String>>(24)?)))
+        .query_map(params![teacher_id], |r| Ok((map_info(r)?, r.get::<_, Option<String>>(26)?)))
         .map_err(db_err)?
         .map(|row| {
             let (info, reason) = row.map_err(db_err)?;
@@ -1372,6 +1601,9 @@ pub async fn delete_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(i
 pub struct AssessmentDetail {
     #[serde(flatten)]
     info: AssessmentInfo,
+    /// A teacher's exam that an admin (or the report auto-hide) closed or archived — shown to staff only, so the admin
+    /// screen can offer "hand it back" exactly when it applies.
+    locked: bool,
     can_start: bool,
     in_progress_attempt: Option<String>,
     attempts: Vec<MyAttempt>,
@@ -1398,7 +1630,8 @@ pub async fn detail_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(i
             && (open_attempt.is_some()
                 || (info.status == "published" && used < info.max_attempts && info.opens_at.map_or(true, |o| now >= o) && info.closes_at.map_or(true, |c| now <= c)));
     }
-    Ok(Json(AssessmentDetail { info, can_start, in_progress_attempt: open_attempt, attempts }))
+    let locked = u.role != "student" && info.is_locked();
+    Ok(Json(AssessmentDetail { info, locked, can_start, in_progress_attempt: open_attempt, attempts }))
 }
 
 pub async fn start_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>) -> Res<Json<StartRes>> {
@@ -1968,6 +2201,255 @@ mod tests {
         let other = insert_test_user(&w.conn, "o@x.com", "teacher", "active");
         assert!(list_mine(&w.conn, &other.id).unwrap().is_empty());
     }
+
+    // ───── phase 3-3: the legacy routes may not be a way around the builder's rules ─────
+
+    fn mc(id: &str, answer: &str) -> serde_json::Value {
+        json!({"id": id, "type": "single_choice", "stem": format!("سؤال {id}"), "options": ["أ", "ب", "ج"], "answer": answer})
+    }
+
+    fn count_exams(w: &W) -> i64 {
+        w.conn.query_row("SELECT count(*) FROM assessments", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn the_legacy_routes_store_the_same_normalised_questions_and_refuse_keys_nobody_can_grade() {
+        let w = world(true, None, 1);
+        let create = |qs: serde_json::Value| create_assessment(&w.conn, &w.teacher, &patch_json(json!({ "subject_id": "s1", "title": "x", "questions": qs })));
+        for (label, qs) in [
+            ("a letter outside the options", json!([mc("a", "Z")])),
+            ("two letters for a single choice", json!([mc("a", "AB")])),
+            ("prose for a choice", json!([mc("a", "القاهرة")])),
+            ("a true/false answer nobody can grade", json!([{"id": "t", "type": "true_false", "stem": "ص", "answer": "ربما"}])),
+            ("the offending question among good ones", json!([mc("a", "A"), mc("b", "Q")])),
+        ] {
+            let e = create(qs).unwrap_err();
+            assert_eq!((e.0, code(&e).as_str()), (StatusCode::BAD_REQUEST, "invalid_answer"), "{label}");
+        }
+        assert_eq!(count_exams(&w), 1, "only the fixture world's exam: nothing was stored by the refused requests");
+        // what is accepted is stored in the canonical form (graders and the answer-key correction rely on it)
+        let id = create(json!([
+            mc("a", "b"),
+            {"id": "m", "type": "multi_choice", "stem": "م", "options": ["1", "2", "3"], "answer": "c, a"},
+            {"id": "t", "type": "true_false", "stem": "ص", "answer": "خطأ"},
+            {"id": "f", "type": "fill_blank", "stem": "ف", "answer": "  مصر | القاهرة "}
+        ]))
+        .unwrap()
+        .id;
+        let stored = load_questions(&w.conn, &id).unwrap();
+        assert_eq!(stored.iter().map(|q| q.answer.as_str()).collect::<Vec<_>>(), vec!["B", "AC", "B", "مصر | القاهرة"]);
+        assert_eq!(stored[2].options, vec!["صحيح", "خطأ"], "true/false get their default options");
+        // the legacy PATCH is no different
+        let e = update_assessment(&w.conn, &w.teacher, &id, &patch_json(json!({ "questions": [mc("a", "Z")] }))).unwrap_err();
+        assert_eq!((e.0, code(&e).as_str()), (StatusCode::BAD_REQUEST, "invalid_answer"));
+        update_assessment(&w.conn, &w.teacher, &id, &patch_json(json!({ "questions": [mc("a", "c")] }))).unwrap();
+        assert_eq!(load_questions(&w.conn, &id).unwrap()[0].answer, "C");
+    }
+
+    #[test]
+    fn the_legacy_owner_patch_is_frozen_by_the_same_guard_once_students_have_sat() {
+        let w = world(true, None, 2);
+        let hour = now_ms() + 3_600_000;
+        w.conn.execute("UPDATE assessments SET closes_at = ?2, duration_min = 30 WHERE id = ?1", params![w.id, hour]).unwrap();
+        start_attempt(&w.conn, &w.student, &w.id, now_ms()).unwrap();
+        let go = |v: serde_json::Value| update_assessment(&w.conn, &w.teacher, &w.id, &patch_json(v));
+        let refused = |v: serde_json::Value| {
+            let e = go(v).unwrap_err();
+            (e.0, code(&e))
+        };
+        let conflict = |c: &str| (StatusCode::CONFLICT, c.to_string());
+        assert_eq!(refused(json!({ "closes_at": hour - 1000 })), conflict("only_extend"), "a shorter closing time");
+        assert_eq!(refused(json!({ "max_attempts": 1 })), conflict("only_extend"), "fewer attempts");
+        assert_eq!(refused(json!({ "duration_min": 5 })), conflict("has_attempts"), "another duration");
+        assert_eq!(refused(json!({ "clear_duration": true })), conflict("has_attempts"), "no duration at all");
+        assert_eq!(refused(json!({ "opens_at": now_ms() - 60_000 })), conflict("has_attempts"), "an opening time that was not there");
+        assert_eq!(refused(json!({ "questions": questions() })), conflict("has_attempts"), "the questions");
+        let stored = get_info(&w.conn, "", &w.id).unwrap();
+        assert_eq!((stored.closes_at, stored.max_attempts, stored.duration_min, stored.opens_at), (Some(hour), 2, Some(30), None), "none of the refused edits got through");
+        // what stays possible: wording, show-answers, more time, more attempts, dropping the closing time
+        let ok = go(json!({ "title": "عنوان معدل", "description": "وصف", "show_answers": false, "closes_at": hour + 1000, "max_attempts": 3 })).unwrap();
+        assert_eq!((ok.title.as_str(), ok.show_answers, ok.closes_at, ok.max_attempts), ("عنوان معدل", false, Some(hour + 1000), 3));
+        let open_ended = go(json!({ "clear_window": true })).unwrap();
+        assert_eq!((open_ended.opens_at, open_ended.closes_at), (None, None), "removing the closing time is an extension");
+        // an admin's legacy moderation is unchanged: status only, and still not back to a draft under attempts
+        assert_eq!(update_assessment(&w.conn, &w.admin, &w.id, &status_patch("draft")).unwrap_err().0, StatusCode::CONFLICT);
+        // before the first attempt the same edits are all fine
+        let fresh = world(true, Some(30), 2);
+        update_assessment(&fresh.conn, &fresh.teacher, &fresh.id, &patch_json(json!({ "duration_min": 5, "max_attempts": 1, "opens_at": now_ms() - 60_000, "questions": questions() }))).unwrap();
+    }
+
+    #[test]
+    fn the_legacy_routes_do_not_announce_an_exam_that_is_already_over() {
+        let w = world(true, None, 1);
+        let (past, ahead) = (now_ms() - 3_600_000, now_ms() + 3_600_000);
+        let told = announcements(&w); // the fixture exam announced itself once
+        let new_exam = |extra: serde_json::Value| {
+            let mut v = json!({ "subject_id": "s1", "title": "منتهٍ", "questions": questions() });
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            create_assessment(&w.conn, &w.teacher, &patch_json(v))
+        };
+        // publishing on create with a closing time that has passed: refused like the builder, nothing stored or announced
+        let e = new_exam(json!({ "status": "published", "closes_at": past })).unwrap_err();
+        assert_eq!((e.0, code(&e).as_str()), (StatusCode::BAD_REQUEST, "invalid_time"));
+        assert_eq!((count_exams(&w), announcements(&w)), (1, told));
+        // a draft may carry any closing time (it can be fixed before publishing)…
+        let draft = new_exam(json!({ "closes_at": past })).unwrap().id;
+        // …but publishing it that way is refused, by the owner and by an admin alike
+        for who in [&w.teacher, &w.admin] {
+            let e = update_assessment(&w.conn, who, &draft, &status_patch("published")).unwrap_err();
+            assert_eq!((e.0, code(&e).as_str()), (StatusCode::BAD_REQUEST, "invalid_time"), "{}", who.role);
+        }
+        assert_eq!((status_of(&w, &draft), announcements(&w)), ("draft".to_string(), told));
+        // giving it a closing time ahead in the same request publishes and announces, once
+        let ok = update_assessment(&w.conn, &w.teacher, &draft, &patch_json(json!({ "closes_at": ahead, "status": "published" }))).unwrap();
+        assert_eq!((ok.status.as_str(), announcements(&w)), ("published", told + 1));
+        // a published exam nobody sat cannot be saved with a closing time in the past either…
+        let e = update_assessment(&w.conn, &w.teacher, &draft, &patch_json(json!({ "closes_at": past, "opens_at": past - 1000 }))).unwrap_err();
+        assert_eq!((e.0, code(&e).as_str()), (StatusCode::BAD_REQUEST, "invalid_time"));
+        // …while one that students already sat may keep a closing time that has passed (it simply reads as closed)
+        start_attempt(&w.conn, &w.student, &draft, now_ms()).unwrap();
+        w.conn.execute("UPDATE assessments SET closes_at = ?2 WHERE id = ?1", params![draft, past]).unwrap();
+        assert_eq!(update_assessment(&w.conn, &w.teacher, &draft, &patch_json(json!({ "title": "عنوان جديد" }))).unwrap().title, "عنوان جديد");
+    }
+
+    #[test]
+    fn answers_left_pending_on_zero_point_questions_by_older_versions_are_settled_by_the_upgrade() {
+        let w = world(true, None, 2);
+        let st = start_attempt(&w.conn, &w.student, &w.id, now_ms()).unwrap();
+        submit_attempt(&w.conn, &w.student, &st.attempt_id, &ans(&[("q1", "B"), ("q4", "مصر"), ("q5", "كتبت")]), now_ms() + 10).unwrap();
+        // what an older version stored: the short question q5 worth 0 points, its written answer left "pending", and a
+        // second pending answer on a question that really can be graded (q4 is treated as one for the purpose)
+        let rewrite = |q5_live: bool| {
+            let raw: String = w.conn.query_row("SELECT results FROM attempts WHERE id = ?1", params![st.attempt_id], |r| r.get(0)).unwrap();
+            let mut outcomes: Vec<Outcome> = serde_json::from_str(&raw).unwrap();
+            let pos = |id: &str| outcomes.iter().position(|o| o.id == id).unwrap();
+            let (i5, i4) = (pos("q5"), pos("q4"));
+            outcomes[i5].max = 0.0;
+            outcomes[i5].points = 0.0;
+            outcomes[i5].correct = None;
+            if q5_live {
+                outcomes[i4].correct = None; // a genuinely pending one
+                outcomes[i4].points = 0.0;
+            }
+            let pending = outcomes.iter().filter(|o| o.correct.is_none()).count() as i64;
+            w.conn.execute("UPDATE attempts SET results = ?2, pending = ?3 WHERE id = ?1", params![st.attempt_id, serde_json::to_string(&outcomes).unwrap(), pending]).unwrap();
+            pending
+        };
+        let queue = || crate::platform_grading::pending_exams(&w.conn, &w.admin).unwrap();
+        // case 1: the zero-point answer is the only thing pending — the exam sits in the queue for good
+        assert_eq!(rewrite(false), 1);
+        assert_eq!(queue().len(), 1, "the stuck state");
+        let score_before: f64 = w.conn.query_row("SELECT score FROM attempts WHERE id = ?1", params![st.attempt_id], |r| r.get(0)).unwrap();
+        migrate(&w.conn).unwrap();
+        let (pending, score): (i64, f64) = w.conn.query_row("SELECT pending, score FROM attempts WHERE id = ?1", params![st.attempt_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((pending, score), (0, score_before), "settled, and the score is untouched");
+        assert!(queue().is_empty(), "the queue and the sidebar badge clear");
+        let r = attempt_result(&w.conn, &w.student, &st.attempt_id).unwrap();
+        assert_eq!(serde_json::to_value(&r).unwrap()["pending"], json!(0));
+        // case 2: a real pending answer next to it stays pending, only the zero-point one is settled
+        assert_eq!(rewrite(true), 2);
+        migrate(&w.conn).unwrap();
+        let pending: i64 = w.conn.query_row("SELECT pending FROM attempts WHERE id = ?1", params![st.attempt_id], |r| r.get(0)).unwrap();
+        assert_eq!(pending, 1);
+        let raw: String = w.conn.query_row("SELECT results FROM attempts WHERE id = ?1", params![st.attempt_id], |r| r.get(0)).unwrap();
+        let outcomes: Vec<Outcome> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(outcomes.iter().filter(|o| o.correct.is_none()).map(|o| o.id.as_str()).collect::<Vec<_>>(), vec!["q4"]);
+        // idempotent: running it again changes nothing
+        migrate(&w.conn).unwrap();
+        let again: String = w.conn.query_row("SELECT results FROM attempts WHERE id = ?1", params![st.attempt_id], |r| r.get(0)).unwrap();
+        assert_eq!(again, raw);
+        // attempts that are not submitted, or have nothing pending, are never touched
+        let ip = start_attempt(&w.conn, &insert_enrolled(&w), &w.id, now_ms()).unwrap();
+        let before: String = w.conn.query_row("SELECT results FROM attempts WHERE id = ?1", params![ip.attempt_id], |r| r.get(0)).unwrap();
+        migrate(&w.conn).unwrap();
+        assert_eq!(w.conn.query_row::<String, _, _>("SELECT results FROM attempts WHERE id = ?1", params![ip.attempt_id], |r| r.get(0)).unwrap(), before);
+    }
+
+    fn insert_enrolled(w: &W) -> User {
+        let u = insert_test_user(&w.conn, "extra@x.com", "student", "active");
+        w.conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![u.id]).unwrap();
+        u
+    }
+
+    #[test]
+    fn a_question_worth_nothing_is_settled_for_everybody_and_never_pending() {
+        let voided = |t: QuestionType, answer: &str| q("v", t, answer, &["أ", "ب"], Some(0.0));
+        for (t, given) in [(QuestionType::SingleChoice, Some("A")), (QuestionType::SingleChoice, Some("B")), (QuestionType::SingleChoice, None), (QuestionType::FillBlank, Some("خطأ")), (QuestionType::ShortAnswer, Some("كتبت شيئًا")), (QuestionType::ShortAnswer, None)] {
+            let o = grade_one(&voided(t.clone(), "A"), given);
+            assert_eq!((o.correct, o.points, o.max), (Some(true), 0.0, 0.0), "{t:?} / {given:?}");
+        }
+        // a question with points keeps the old behaviour: a written short answer waits, a blank one is 0
+        let live = q("s", QuestionType::ShortAnswer, "x", &[], Some(3.0));
+        assert_eq!(grade_one(&live, Some("كتب")).correct, None);
+        assert_eq!(grade_one(&live, Some("  ")).correct, Some(false));
+        let (outcomes, score, pending) = grade_all(&[voided(QuestionType::ShortAnswer, "x"), live], &[("v".to_string(), "a".to_string()), ("s".to_string(), "b".to_string())].into());
+        assert_eq!((outcomes.len(), score, pending), (2, 0.0, 1), "only the real short answer is pending");
+        assert_eq!(passed_flag(0.0, 0.0, 0, Some(50.0)), None, "an exam with no points left has no pass/fail");
+    }
+
+    #[test]
+    fn only_the_owner_of_a_live_exam_is_told_they_can_correct_its_key() {
+        let w = world(true, None, 1);
+        start_attempt(&w.conn, &w.student, &w.id, now_ms()).unwrap();
+        let can = |who: &User, id: &str| results_summary(&w.conn, who, id, now_ms()).map(|s| s.can_correct);
+        assert_eq!(can(&w.teacher, &w.id).unwrap(), true, "the owning teacher");
+        assert_eq!(can(&w.admin, &w.id).unwrap(), false, "an admin sees the results of a teacher's exam but moderates it");
+        let colleague = insert_test_user(&w.conn, "c@x.com", "teacher", "active");
+        w.conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at) VALUES (?1,'s1','approved',0)", params![colleague.id]).unwrap();
+        assert_eq!(can(&colleague, &w.id).unwrap_err().0, StatusCode::FORBIDDEN, "a colleague cannot even read them");
+        admin_exam(&w, "ea", "published");
+        assert_eq!(can(&w.admin, "ea").unwrap(), true, "any admin owns an admin exam");
+        assert_eq!(can(&colleague, "ea").unwrap(), false, "a teacher approved for the subject grades an admin exam but cannot change its key");
+        // archived or locked: read-only
+        w.conn.execute("UPDATE assessments SET status = 'archived', archived_by = ?2 WHERE id = ?1", params![w.id, w.teacher.id]).unwrap();
+        assert_eq!(can(&w.teacher, &w.id).unwrap(), false, "archived");
+        w.conn.execute("UPDATE assessments SET status = 'closed', closed_by = ?2 WHERE id = ?1", params![w.id, w.admin.id]).unwrap();
+        assert_eq!(can(&w.teacher, &w.id).unwrap(), false, "closed by an admin = locked");
+        w.conn.execute("UPDATE assessments SET closed_by = ?2 WHERE id = ?1", params![w.id, w.teacher.id]).unwrap();
+        assert_eq!(can(&w.teacher, &w.id).unwrap(), true, "closed by the owner: still theirs");
+        let json = serde_json::to_value(results_summary(&w.conn, &w.teacher, &w.id, now_ms()).unwrap()).unwrap();
+        assert_eq!(json["can_correct"], serde_json::json!(true));
+        // the analytics carry the same bit (the results page reads it from there instead of fetching every attempt)
+        let bit = |who: &User, id: &str| serde_json::to_value(crate::platform_grading::analytics(&w.conn, who, id, now_ms()).unwrap()).unwrap()["can_correct"].clone();
+        assert_eq!((bit(&w.teacher, &w.id), bit(&w.admin, &w.id), bit(&w.admin, "ea"), bit(&colleague, "ea")), (serde_json::json!(true), serde_json::json!(false), serde_json::json!(true), serde_json::json!(false)));
+        w.conn.execute("UPDATE assessments SET status = 'closed', closed_by = ?2 WHERE id = ?1", params![w.id, w.admin.id]).unwrap();
+        assert_eq!(bit(&w.teacher, &w.id), serde_json::json!(false), "locked: the same answer as the results summary");
+    }
+
+    #[test]
+    fn locked_is_decided_in_one_place_from_who_closed_or_archived_a_teachers_exam() {
+        let w = world(true, None, 1);
+        let info = |w: &W| get_info(&w.conn, "", &w.id).unwrap();
+        let set = |w: &W, status: &str, closed_by: Option<&str>, archived_by: Option<&str>| {
+            w.conn.execute("UPDATE assessments SET status = ?2, closed_by = ?3, archived_by = ?4 WHERE id = ?1", params![w.id, status, closed_by, archived_by]).unwrap();
+        };
+        let (t, a) = (w.teacher.id.clone(), w.admin.id.clone());
+        // live exams are never locked, whatever stale actor columns say
+        for status in ["draft", "published"] {
+            set(&w, status, Some(&a), Some(&a));
+            assert!(!info(&w).is_locked(), "{status}");
+        }
+        // closed: by the owner = free, by anybody else / nobody = locked
+        set(&w, "closed", Some(&t), None);
+        assert!(!info(&w).is_locked());
+        for by in [Some(a.as_str()), None, Some("gone")] {
+            set(&w, "closed", by, Some(&t));
+            assert!(info(&w).is_locked(), "closed by {by:?} (an archiver does not matter while it is only closed)");
+        }
+        // archived: the archiver counts, not the closer
+        set(&w, "archived", Some(&a), Some(&t));
+        assert!(!info(&w).is_locked());
+        set(&w, "archived", Some(&t), Some(&a));
+        assert!(info(&w).is_locked());
+        set(&w, "archived", Some(&t), None);
+        assert!(info(&w).is_locked(), "a legacy archive with no recorded actor");
+        // an admin exam has no owner to lock out
+        w.conn.execute("UPDATE assessments SET teacher_id = NULL WHERE id = ?1", params![w.id]).unwrap();
+        assert!(!info(&w).is_locked());
+        assert!(info(&w).owned_by(&w.admin) && !info(&w).owned_by(&w.teacher) && !info(&w).owned_by(&w.student));
+    }
 }
 
 /// Phase 1-0: upgrading a database produced by the previous server version must never lose data.
@@ -2088,6 +2570,32 @@ mod migration_tests {
         apply_schema(&c).unwrap();
         apply_schema(&c).unwrap();
         assert_eq!(snapshot(&c), first);
+    }
+
+    #[test]
+    fn upgrade_adds_the_actor_columns_idempotently_and_leaves_old_rows_without_an_actor() {
+        let c = old_db();
+        assert!(!crate::platform::column_exists(&c, "assessments", "closed_by").unwrap() && !crate::platform::column_exists(&c, "assessments", "archived_by").unwrap());
+        apply_schema(&c).unwrap();
+        for col in ["closed_by", "archived_by"] {
+            assert!(crate::platform::column_exists(&c, "assessments", col).unwrap(), "{col}");
+        }
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM assessments WHERE closed_by IS NOT NULL OR archived_by IS NOT NULL"), 0, "nobody is recorded for rows from before");
+        let before = counts(&c);
+        apply_schema(&c).unwrap();
+        apply_schema(&c).unwrap();
+        assert_eq!(counts(&c), before, "running it again changes nothing and does not fail on the existing columns");
+        // the fixture's exams belong to a teacher: live ones are not locked, but once an old row is closed (by an admin or
+        // the report auto-hide in the previous version) it has no recorded actor, so its owner is locked out of it
+        let (id, teacher): (String, String) = c.query_row("SELECT id, teacher_id FROM assessments WHERE status = 'published'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let info = get_info(&c, &teacher, &id).unwrap();
+        assert_eq!(info.teacher_id.as_deref(), Some(teacher.as_str()));
+        assert!(!info.is_locked());
+        c.execute("UPDATE assessments SET status = 'closed' WHERE id = ?1", params![id]).unwrap();
+        assert!(get_info(&c, &teacher, &id).unwrap().is_locked(), "a legacy closed exam is locked for its owner");
+        // closing it as the owner (what the lifecycle now does) stamps the owner and unlocks it
+        c.execute("UPDATE assessments SET closed_by = ?2 WHERE id = ?1", params![id, teacher]).unwrap();
+        assert!(!get_info(&c, &teacher, &id).unwrap().is_locked());
     }
 
     #[test]

@@ -218,8 +218,8 @@ onMounted(async () => {
       <router-link to="/platform/posts/new" class="btn-filled" data-testid="new-post">{{ pt('newPost') }}</router-link>
       <router-link to="/platform/courses/new" class="btn-tonal" data-testid="new-course">{{ pt('newCourse') }}</router-link>
       <router-link to="/platform/live/new" class="btn-tonal" data-testid="new-live">{{ pt('newLive') }}</router-link>
-      <router-link v-if="!examsOff" to="/platform/assessments/new" class="btn-tonal" data-testid="new-exam">{{ pt('newAssessment') }}</router-link>
-      <button v-else type="button" class="btn-tonal" disabled aria-describedby="exams-off-reason" data-testid="new-exam-disabled">{{ pt('newAssessment') }}</button>
+      <router-link v-if="!examsOff" to="/platform/exams/new" class="btn-tonal" data-testid="new-exam">{{ pt('exNew') }}</router-link>
+      <button v-else type="button" class="btn-tonal" disabled aria-describedby="exams-off-reason" data-testid="new-exam-disabled">{{ pt('exNew') }}</button>
     </div>
     <section v-else class="card-filled p-4 mb-5 space-y-2" aria-labelledby="content-need-subject-title" data-testid="content-need-subject">
       <h2 id="content-need-subject-title" class="text-title-md font-bold">{{ pt('hubNeedSubjectTitle') }}</h2>

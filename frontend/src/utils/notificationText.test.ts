@@ -13,6 +13,7 @@ const templates: Record<string, string> = {
   n_teaching_revoked_none: 'Withdrawn from {subject}.',
   n_teaching_revoked_none_reason: 'Withdrawn from {subject}. Note: {reason}',
   n_exam_closing: 'Closes {closes_at}.',
+  n_score_changed: 'Score on {title} went from {old} to {new} out of {total}.',
 }
 const lookup = (k: string): string => templates[k] ?? ''
 
@@ -44,3 +45,7 @@ eq(renderNotification(lookup, 'teaching_approved', { subject: "Q$'A" }), "Approv
 eq(renderNotification(lookup, 'teaching_approved', { reason: '{subject}', subject: 'Math' }), 'Approved for Math. Note: {subject}', 'no second pass')
 // a placeholder with no data stays visible rather than turning into "undefined"
 eq(renderNotification(lookup, 'teaching_approved', {}), 'Approved for {subject}.', 'missing data')
+
+// an answer-key correction tells the student the old and new score; `new` is an ordinary placeholder name, the title is data
+eq(renderNotification(lookup, 'score_changed', { title: 'Midterm', old: 7, new: 9, total: 10 }), 'Score on Midterm went from 7 to 9 out of 10.', 'score changed')
+eq(renderNotification(lookup, 'score_changed', { title: "Q$&A {new}", old: 0, new: 2.5, total: 4 }), "Score on Q$&A {new} went from 0 to 2.5 out of 4.", 'a title with a dollar sign and a placeholder is printed as written')

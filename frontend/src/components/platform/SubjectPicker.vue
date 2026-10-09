@@ -3,7 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { usePt, platformErrorMessage, type PlatformKey } from '@/i18n/platform'
 import { getStructure, listInstitutions, type Institution, type Structure, type Unit } from '@/api/platformAdmin'
 import { buildIndex, children, pathToSubject, subtreeSubjects } from '@/utils/structureTree'
-import { activeSubset, subjectSelectable, type AssignmentStatus } from '@/utils/subjectPicker'
+import { activeSubset, restrictToSubjects, subjectSelectable, type AssignmentStatus } from '@/utils/subjectPicker'
 
 // Institution → level/department/year/term (one list per depth, as deep as the structure goes) → subject. The model is
 // the subject id; the last subject is remembered per browser (`remember`, admin screens only: with `remember=false` the
@@ -11,7 +11,14 @@ import { activeSubset, subjectSelectable, type AssignmentStatus } from '@/utils/
 // - `statusBySubject`: a teacher's assignment per subject id. Subjects that are pending or approved are listed with
 //   their status and cannot be picked (they are already requested); rejected ones stay pickable for a new request.
 // - `activeOnly`: hide inactive institutions, units and subjects (and everything below an inactive unit).
-const props = withDefaults(defineProps<{ remember?: boolean; statusBySubject?: Record<string, AssignmentStatus>; activeOnly?: boolean }>(), { remember: true, statusBySubject: undefined, activeOnly: false })
+// - `allowedSubjectIds`: offer only these subjects (a teacher's approved ones) and the units on the way to them.
+//   `subjectInstitutions` (subject id → institution id) lets the picker also offer only the institutions that hold one
+//   of them, select the only one, and show the institution of a subject that is already chosen when it opens. Without
+//   `allowedSubjectIds` neither has any effect.
+const props = withDefaults(defineProps<{
+  remember?: boolean; statusBySubject?: Record<string, AssignmentStatus>; activeOnly?: boolean
+  allowedSubjectIds?: string[]; subjectInstitutions?: Record<string, string>
+}>(), { remember: true, statusBySubject: undefined, activeOnly: false, allowedSubjectIds: undefined, subjectInstitutions: undefined })
 const subjectId = defineModel<string>({ default: '' })
 const pt = usePt()
 const KEY = 'exameow-admin-subject'
@@ -25,13 +32,24 @@ const institutionId = ref('')
 const unitPath = ref<string[]>([])
 const error = ref('')
 
+const allowed = computed(() => (props.allowedSubjectIds ? new Set(props.allowedSubjectIds) : null))
+/** institutions that hold at least one allowed subject (null = no restriction or unknown) */
+const allowedInstitutions = computed(() => {
+  if (!allowed.value || !props.subjectInstitutions) return null
+  return new Set([...allowed.value].map((id) => props.subjectInstitutions?.[id]).filter((x): x is string => !!x))
+})
 const shown = computed(() => {
   const st = structure.value
   if (!st) return null
-  return props.activeOnly ? activeSubset(st.units, st.subjects) : { units: st.units, subjects: st.subjects }
+  const base = props.activeOnly ? activeSubset(st.units, st.subjects) : { units: st.units, subjects: st.subjects }
+  return allowed.value ? restrictToSubjects(base.units, base.subjects, allowed.value) : base
 })
 const idx = computed(() => (shown.value ? buildIndex(shown.value.units, shown.value.subjects) : null))
-const shownInstitutions = computed(() => (props.activeOnly ? institutions.value.filter((i) => i.is_active) : institutions.value))
+const shownInstitutions = computed(() => {
+  const active = props.activeOnly ? institutions.value.filter((i) => i.is_active) : institutions.value
+  const only = allowedInstitutions.value
+  return only ? active.filter((i) => only.has(i.id)) : active
+})
 const suffix = (active: boolean) => (active ? '' : ` (${pt('inactive')})`)
 const statusOf = (id: string): AssignmentStatus | undefined => props.statusBySubject?.[id]
 const statusSuffix = (id: string) => {
@@ -109,6 +127,23 @@ onMounted(async () => {
     institutions.value = await listInstitutions()
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
+    return
+  }
+  // A subject that is already chosen (a link with ?subject=) is shown with its institution and units.
+  const preset = subjectId.value
+  const presetInstitution = preset ? props.subjectInstitutions?.[preset] : undefined
+  if (presetInstitution && shownInstitutions.value.some((i) => i.id === presetInstitution)) {
+    institutionId.value = presetInstitution
+    await loadStructure()
+    if (shown.value?.subjects.some((s) => s.id === preset)) onSubject()
+    else subjectId.value = ''
+    return
+  }
+  // A single possible institution is selected for the person (and a single subject in it too).
+  if (allowedInstitutions.value && shownInstitutions.value.length === 1 && !institutionId.value) {
+    institutionId.value = shownInstitutions.value[0]!.id
+    await loadStructure()
+    pickOnlySubject()
     return
   }
   let saved: { i?: string; s?: string } = {}

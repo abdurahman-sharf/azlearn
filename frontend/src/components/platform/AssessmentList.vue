@@ -23,7 +23,7 @@ const pt = usePt()
         </router-link>
         <OwnerStateChip v-if="own" :row="{ status: a.status, visible: a.visible, hidden_reason: a.hidden_reason }" />
         <span v-else-if="showStatus" class="text-xs font-semibold px-2 py-0.5 rounded-full" style="background-color: rgb(var(--md-surface-container-high))">{{ a.status === 'published' ? pt('statusPublished') : a.status === 'closed' ? pt('exPhase_closed') : a.status === 'archived' ? pt('exPhase_archived') : pt('statusDraft') }}</span>
-        <router-link v-if="own && showEdit && a.status !== 'archived'" :to="`/platform/assessments/${a.id}/edit`" class="btn-text" :aria-label="`${pt('edit')}: ${a.title}`" :data-testid="`content-exam-edit-${a.id}`">{{ pt('edit') }}</router-link>
+        <router-link v-if="own && showEdit && a.status !== 'archived'" :to="`/platform/exams/${a.id}/edit`" class="btn-text" :aria-label="`${pt('edit')}: ${a.title}`" :data-testid="`content-exam-edit-${a.id}`">{{ pt('edit') }}</router-link>
         <router-link v-if="showEdit" :to="`/platform/assessments/${a.id}/results`" class="btn-text" :aria-label="`${pt('results')}: ${a.title}`">{{ pt('results') }}</router-link>
       </div>
       <HiddenWhy v-if="own && (a.status === 'published' || a.status === 'closed')" :reason="a.hidden_reason" class="mt-1" />

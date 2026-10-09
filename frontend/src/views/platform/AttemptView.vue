@@ -47,10 +47,16 @@ async function saveGrades() {
 /** Turns the reviewed assessment into a local practice bank (uses the existing practice mode). */
 function practiceThese() {
   if (!r.value?.items) return
-  const questions: Question[] = r.value.items.map(i => ({
+  // A voided question (worth 0 points) was dropped because its key was wrong: practising it would grade the student
+  // against that same faulty key.
+  const questions: Question[] = r.value.items.filter(i => i.max > 0).map(i => ({
     id: i.id, type: i.type as QuestionType, stem: i.stem, options: i.options,
     answer: i.correct_answer ?? '', analysis: i.analysis ?? '',
   }))
+  if (!questions.length) {
+    msg.value = pt('practiceNoneLeft')
+    return
+  }
   practice.addBank({ id: `platform-${r.value.assessment_id}-${Date.now().toString(36)}`, name: r.value.title, questions, createdAt: Date.now(), source: 'ai-generated' })
   msg.value = pt('practiceAdded')
   router.push('/practice')
@@ -95,7 +101,8 @@ onMounted(load)
           <span class="font-bold">{{ i + 1 }}.</span>
           <p class="flex-1 whitespace-pre-wrap break-words" dir="auto">{{ it.stem }}</p>
           <span class="shrink-0 font-bold" :style="{ color: it.correct === true ? 'rgb(var(--md-primary))' : it.correct === false ? 'rgb(var(--md-error))' : undefined }">
-            <span dir="ltr" class="inline-block">{{ it.correct === true ? '✓' : it.correct === false ? '✗' : '…' }} {{ it.points }}/{{ it.max }}</span>
+            <span v-if="it.max === 0" data-testid="item-voided">⊘ {{ pt('keyVoided') }}</span>
+            <span v-else dir="ltr" class="inline-block">{{ it.correct === true ? '✓' : it.correct === false ? '✗' : '…' }} {{ it.points }}/{{ it.max }}</span>
           </span>
         </div>
         <ul v-if="it.options.length" class="text-body-sm space-y-0.5">

@@ -1,15 +1,28 @@
-//! Admin exam builder backend: create/edit exams with the full 1-5 settings, lifecycle
-//! (draft → published → closed → archived), duplication and guarded deletion.
+//! The exam builder engine: create/edit exams with the full 1-5 settings, the lifecycle
+//! (draft → published → closed → archived), duplication and guarded deletion — for **both** actors.
 //!
-//! Exams created here have no owning teacher (`teacher_id` NULL, `created_by` = the admin). An exam
-//! is a fixed *snapshot* of its questions: nothing here references the question bank, and a bank
-//! item's id is only remembered in `source_map` for statistics. Once the first attempt exists the
-//! questions, scores and fairness settings are frozen (PRD E6); an admin may moderate (close,
-//! archive, delete) a teacher's exam but never rewrite it.
+//! One engine, two doors: the admin routes (`/admin/exams*`, this module's handlers) and the teacher routes
+//! (`/teacher/exams*`, `platform_exam_teacher`) call the same functions with the signed-in `User`, and the rules below
+//! branch on who is acting:
+//!
+//! * **Ownership** ([`AssessmentInfo::owned_by`]): a teacher owns the exams with their id; any admin owns the exams
+//!   created by an admin (`teacher_id` NULL). Content and settings are only ever changed by the owner — an admin
+//!   *moderates* a teacher's exam (unpublish, close, reopen, archive, restore, delete, duplicate) but never rewrites it.
+//! * **Locked** ([`AssessmentInfo::is_locked`]): a teacher's exam that somebody else closed or archived stays closed for
+//!   its owner (they may duplicate or, when nobody sat it, delete it); only an admin lifts it — by reopening it, or by
+//!   `unlock`, which hands it back without touching its state (and so works after the closing time has passed, and for
+//!   rows from before the actor was recorded). An admin's change to a teacher's exam notifies the owner.
+//! * An exam is a fixed *snapshot* of its questions: nothing here references the question bank, and a bank item's id
+//!   is only remembered in `source_map` for statistics. Once the first attempt exists the questions, scores and fairness
+//!   settings are frozen (PRD E6, [`check_freeze`]); the answer key is then corrected through `platform_exam_key`.
+//! * Anything that turns an exam on needs its owner's live assignment ([`require_assignment`]); whether teachers may
+//!   create new exams at all (`teachers.can_create_exams`) is decided by the teacher HTTP handlers, not here.
 
 use crate::platform::{audit, bad, db_err, lock, new_id, opt_text, require_admin, text, Res, User};
-use crate::platform_bank::clean_exam_question;
-use crate::platform_exams::{announce, check_duration, check_window, get_info, map_info, points_of, round2, AssessmentInfo, INFO_SELECT, MAX_QUESTIONS};
+use crate::platform_content::{exam_reason_sql, presence, require_assignment, HiddenReason};
+use crate::platform_exams::{
+    announce, check_closing_ahead, check_duration, check_freeze, check_window, clean_questions, get_info, points_of, round2, shown_state, AssessmentInfo, Cfg, INFO_COLS, INFO_FROM,
+};
 use crate::relay::{err, now_ms};
 use crate::routes::AppState;
 use axum::{
@@ -27,74 +40,31 @@ const COPY_SUFFIX: &str = " (نسخة)";
 
 // ───────── settings ─────────
 
-/// The validated, effective settings of an exam.
-#[derive(Clone, Debug)]
-struct Cfg {
-    duration_min: Option<i64>,
-    opens_at: Option<i64>,
-    closes_at: Option<i64>,
-    max_attempts: i64,
-    show_answers: bool,
-    shuffle_questions: bool,
-    shuffle_options: bool,
-    pass_mark: Option<f64>,
-    release_mode: String,
-}
-
-impl Cfg {
-    fn defaults() -> Cfg {
-        Cfg {
-            duration_min: None,
-            opens_at: None,
-            closes_at: None,
-            max_attempts: 1,
-            show_answers: true,
-            shuffle_questions: false,
-            shuffle_options: false,
-            pass_mark: None,
-            release_mode: "immediate".into(),
-        }
-    }
-    fn of(i: &AssessmentInfo) -> Cfg {
-        Cfg {
-            duration_min: i.duration_min,
-            opens_at: i.opens_at,
-            closes_at: i.closes_at,
-            max_attempts: i.max_attempts,
-            show_answers: i.show_answers,
-            shuffle_questions: i.shuffle_questions,
-            shuffle_options: i.shuffle_options,
-            pass_mark: i.pass_mark,
-            release_mode: i.release_mode.clone(),
-        }
-    }
-}
-
 #[derive(Deserialize, Default, Clone)]
 pub struct ExamReq {
-    subject_id: Option<String>,
-    title: Option<String>,
-    description: Option<String>,
-    questions: Option<Vec<Question>>,
+    pub(crate) subject_id: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) questions: Option<Vec<Question>>,
     /// Question id → bank item id it was copied from (statistics only).
-    sources: Option<HashMap<String, String>>,
-    duration_min: Option<i64>,
-    clear_duration: Option<bool>,
-    opens_at: Option<i64>,
-    clear_opens: Option<bool>,
-    closes_at: Option<i64>,
-    clear_closes: Option<bool>,
-    max_attempts: Option<i64>,
-    show_answers: Option<bool>,
-    shuffle_questions: Option<bool>,
-    shuffle_options: Option<bool>,
+    pub(crate) sources: Option<HashMap<String, String>>,
+    pub(crate) duration_min: Option<i64>,
+    pub(crate) clear_duration: Option<bool>,
+    pub(crate) opens_at: Option<i64>,
+    pub(crate) clear_opens: Option<bool>,
+    pub(crate) closes_at: Option<i64>,
+    pub(crate) clear_closes: Option<bool>,
+    pub(crate) max_attempts: Option<i64>,
+    pub(crate) show_answers: Option<bool>,
+    pub(crate) shuffle_questions: Option<bool>,
+    pub(crate) shuffle_options: Option<bool>,
     /// Percentage of the total points (1–100).
-    pass_mark: Option<f64>,
-    clear_pass_mark: Option<bool>,
+    pub(crate) pass_mark: Option<f64>,
+    pub(crate) clear_pass_mark: Option<bool>,
     /// `immediate` or `after_close`.
-    release_mode: Option<String>,
+    pub(crate) release_mode: Option<String>,
     /// Create only: `draft` (default) or `published`. Later changes go through the lifecycle actions.
-    status: Option<String>,
+    pub(crate) status: Option<String>,
 }
 
 /// Applies the request on top of `base`, validating every field.
@@ -153,30 +123,6 @@ fn merge(base: &Cfg, r: &ExamReq) -> Res<Cfg> {
     Ok(c)
 }
 
-fn with_question(e: crate::relay::Err, q: &Question, index: usize) -> crate::relay::Err {
-    let mut v: serde_json::Value = serde_json::from_str(&e.1).unwrap_or_else(|_| serde_json::json!({ "error": "invalid_question" }));
-    v["question_id"] = serde_json::Value::String(q.id.clone());
-    v["index"] = serde_json::Value::from(index);
-    (e.0, v.to_string())
-}
-
-/// Cleans and checks the exam's questions (ids unique, shapes valid). Empty is fine for a draft only.
-fn clean_questions(qs: &[Question]) -> Res<Vec<Question>> {
-    if qs.len() > MAX_QUESTIONS {
-        return Err(bad("invalid_question_count"));
-    }
-    let mut seen = HashSet::new();
-    let mut out = Vec::with_capacity(qs.len());
-    for (i, q) in qs.iter().enumerate() {
-        let c = clean_exam_question(q).map_err(|e| with_question(e, q, i))?;
-        if c.id.is_empty() || c.id.chars().count() > 100 || !seen.insert(c.id.clone()) {
-            return Err(with_question(bad("invalid_question_id"), q, i));
-        }
-        out.push(c);
-    }
-    Ok(out)
-}
-
 fn clean_sources(sources: &Option<HashMap<String, String>>, questions: &[Question]) -> Res<HashMap<String, String>> {
     let ids: HashSet<&str> = questions.iter().map(|q| q.id.as_str()).collect();
     let mut out = HashMap::new();
@@ -210,11 +156,24 @@ fn total_of(qs: &[Question]) -> f64 {
 #[derive(Serialize, Debug)]
 pub struct ExamRow {
     #[serde(flatten)]
-    info: AssessmentInfo,
+    pub(crate) info: AssessmentInfo,
     /// Effective lifecycle phase: a published exam past its closing time reads as `closed`.
-    phase: String,
-    /// Admin-created exams can be edited; teachers' exams only moderated.
-    can_edit: bool,
+    pub(crate) phase: String,
+    /// The viewer may change this exam's content and settings right now: they own it, it is not archived and not locked.
+    pub(crate) can_edit: bool,
+    /// The viewer owns it (see [`AssessmentInfo::owned_by`]).
+    pub(crate) owned: bool,
+    /// A teacher's exam whose closed / archived state was set by someone other than its owner (see
+    /// [`AssessmentInfo::is_locked`]); only meaningful to the owner, but the same for every viewer.
+    pub(crate) locked: bool,
+    /// Submitted attempts.
+    pub(crate) submitted: i64,
+    /// Written answers of submitted attempts still waiting for a grade.
+    pub(crate) pending_answers: i64,
+    /// Whether students can see the exam right now, and when it is published / closed but not shown, why — the same
+    /// answer as `GET /assessments/mine` (one rule: `platform_content::standing`).
+    pub(crate) visible: bool,
+    pub(crate) hidden_reason: Option<HiddenReason>,
 }
 
 impl ExamDetail {
@@ -228,9 +187,9 @@ impl ExamDetail {
 #[derive(Serialize, Debug)]
 pub struct ExamDetail {
     #[serde(flatten)]
-    row: ExamRow,
-    questions: Vec<Question>,
-    sources: HashMap<String, String>,
+    pub(crate) row: ExamRow,
+    pub(crate) questions: Vec<Question>,
+    pub(crate) sources: HashMap<String, String>,
 }
 
 fn phase_of(i: &AssessmentInfo, now: i64) -> String {
@@ -241,8 +200,49 @@ fn phase_of(i: &AssessmentInfo, now: i64) -> String {
     }
 }
 
-fn row_of(i: AssessmentInfo, now: i64) -> ExamRow {
-    ExamRow { phase: phase_of(&i, now), can_edit: i.teacher_id.is_none(), info: i }
+/// What one query returns per exam: the info, its submitted / pending counts and the hidden reason.
+type RowData = (AssessmentInfo, i64, i64, Option<String>);
+
+/// `SELECT` of everything an [`ExamRow`] needs in ONE statement (counts and the reason are correlated subqueries, so a
+/// page of exams costs one query, not one per row). `?1` = the viewer (for `attempts_used`). Columns: the 26 of
+/// `map_info`, then `submitted` (26), `pending_answers` (27) and the reason (28).
+fn row_select() -> String {
+    format!(
+        "SELECT {INFO_COLS},
+           (SELECT count(*) FROM attempts x WHERE x.assessment_id = a.id AND x.status = 'submitted'),
+           (SELECT COALESCE(sum(x.pending), 0) FROM attempts x WHERE x.assessment_id = a.id AND x.status = 'submitted'),
+           ({}) {INFO_FROM}",
+        exam_reason_sql("a")
+    )
+}
+
+fn map_row(r: &rusqlite::Row) -> rusqlite::Result<RowData> {
+    Ok((crate::platform_exams::map_info(r)?, r.get(26)?, r.get(27)?, r.get(28)?))
+}
+
+fn row_of(viewer: &User, (info, submitted, pending_answers, reason): RowData, now: i64) -> ExamRow {
+    let (visible, hidden_reason) = presence(shown_state(&info.status), reason);
+    let owned = info.owned_by(viewer);
+    let locked = info.is_locked();
+    ExamRow {
+        phase: phase_of(&info, now),
+        can_edit: owned && info.status != "archived" && !locked,
+        owned,
+        locked,
+        submitted,
+        pending_answers,
+        visible,
+        hidden_reason,
+        info,
+    }
+}
+
+fn load_row(conn: &Connection, viewer: &User, id: &str, now: i64) -> Res<ExamRow> {
+    conn.query_row(&format!("{} WHERE a.id = ?2", row_select()), params![viewer.id, id], map_row)
+        .optional()
+        .map_err(db_err)?
+        .map(|d| row_of(viewer, d, now))
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))
 }
 
 fn load_snapshot(conn: &Connection, id: &str) -> Res<(Vec<Question>, HashMap<String, String>)> {
@@ -252,16 +252,35 @@ fn load_snapshot(conn: &Connection, id: &str) -> Res<(Vec<Question>, HashMap<Str
     Ok((serde_json::from_str(&q).map_err(db_err)?, s.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()))
 }
 
-pub fn get_exam(conn: &Connection, admin: &User, id: &str, now: i64) -> Res<ExamDetail> {
-    let info = get_info(conn, &admin.id, id)?;
+/// An admin reads any exam; a teacher only their own (the questions come with their answers) — 403 otherwise.
+pub fn get_exam(conn: &Connection, user: &User, id: &str, now: i64) -> Res<ExamDetail> {
+    let row = load_row(conn, user, id, now)?;
+    if user.role == "teacher" && !row.owned {
+        return Err(err(StatusCode::FORBIDDEN, "forbidden"));
+    }
     let (questions, sources) = load_snapshot(conn, id)?;
-    Ok(ExamDetail { row: row_of(info, now), questions, sources })
+    Ok(ExamDetail { row, questions, sources })
+}
+
+/// The `teacher_id` a new exam gets: the teacher themself, nobody for an admin (an admin exam). Anyone else: 403.
+fn owner_for(user: &User) -> Res<Option<&str>> {
+    match user.role.as_str() {
+        "teacher" => Ok(Some(user.id.as_str())),
+        "admin" => Ok(None),
+        _ => Err(err(StatusCode::FORBIDDEN, "forbidden")),
+    }
 }
 
 // ───────── create / update ─────────
 
-pub fn create_exam(conn: &Connection, admin: &User, r: &ExamReq, now: i64) -> Res<ExamDetail> {
+pub fn create_exam(conn: &Connection, user: &User, r: &ExamReq, now: i64) -> Res<ExamDetail> {
+    let owner = owner_for(user)?;
     let subject_id = r.subject_id.as_deref().unwrap_or("");
+    // A teacher creates only in a subject they are approved for (active subject, active institution): 403
+    // `not_assigned` before anything about the content is looked at.
+    if let Some(teacher) = owner {
+        require_assignment(conn, teacher, subject_id)?;
+    }
     let subject_active = subject_state(conn, subject_id)?;
     let title = text(r.title.as_deref().unwrap_or(""), 200, "invalid_title")?;
     let description = opt_text(&r.description, 2000, "description_too_long")?;
@@ -279,20 +298,20 @@ pub fn create_exam(conn: &Connection, admin: &User, r: &ExamReq, now: i64) -> Re
     conn.execute(
         "INSERT INTO assessments(id, teacher_id, created_by, subject_id, title, description, questions, question_count, total_points, duration_min,
            opens_at, closes_at, max_attempts, show_answers, shuffle_questions, shuffle_options, pass_mark, release_mode, status, source_map, created_at, updated_at)
-         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)",
         params![
-            id, admin.id, subject_id, title, description, serde_json::to_string(&questions).map_err(db_err)?, questions.len() as i64, total_of(&questions),
+            id, owner, user.id, subject_id, title, description, serde_json::to_string(&questions).map_err(db_err)?, questions.len() as i64, total_of(&questions),
             cfg.duration_min, cfg.opens_at, cfg.closes_at, cfg.max_attempts, cfg.show_answers, cfg.shuffle_questions, cfg.shuffle_options, cfg.pass_mark,
             cfg.release_mode, status, serde_json::to_string(&sources).map_err(db_err)?, now
         ],
     )
     .map_err(db_err)?;
-    audit(conn, &admin.id, &id, "exam_create", status);
+    audit(conn, &user.id, &id, "exam_create", status);
     if status == "published" {
-        audit(conn, &admin.id, &id, "exam_publish", "on create");
-        announce(conn, admin, subject_id, &id, &title, now);
+        audit(conn, &user.id, &id, "exam_publish", "on create");
+        announce(conn, user, subject_id, &id, &title, now);
     }
-    get_exam(conn, admin, &id, now)
+    get_exam(conn, user, &id, now)
 }
 
 /// What publishing requires: at least one question, an active subject and a closing time still ahead.
@@ -303,25 +322,27 @@ fn check_publishable(questions: &[Question], subject_active: bool, cfg: &Cfg, no
     if !subject_active {
         return Err(bad("subject_inactive"));
     }
-    if cfg.closes_at.map_or(false, |c| c <= now) {
-        return Err(bad("invalid_time"));
-    }
-    Ok(())
+    check_closing_ahead(cfg.closes_at, now)
 }
 
-fn editable(info: &AssessmentInfo) -> Res<()> {
-    if info.teacher_id.is_some() {
-        return Err(err(StatusCode::FORBIDDEN, "forbidden")); // moderation only for teachers' exams
+/// Content and settings are the owner's alone: 403 for anyone else (an admin moderates a teacher's exam, a teacher
+/// never touches another's), 409 `archived` for an archived exam and 409 `locked` for one somebody else closed.
+fn editable(user: &User, info: &AssessmentInfo) -> Res<()> {
+    if !info.owned_by(user) {
+        return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
     if info.status == "archived" {
         return Err(err(StatusCode::CONFLICT, "archived"));
     }
+    if info.is_locked() {
+        return Err(err(StatusCode::CONFLICT, "locked"));
+    }
     Ok(())
 }
 
-pub fn update_exam(conn: &Connection, admin: &User, id: &str, r: &ExamReq, now: i64) -> Res<ExamDetail> {
-    let cur = get_info(conn, &admin.id, id)?;
-    editable(&cur)?;
+pub fn update_exam(conn: &Connection, user: &User, id: &str, r: &ExamReq, now: i64) -> Res<ExamDetail> {
+    let cur = get_info(conn, &user.id, id)?;
+    editable(user, &cur)?;
     if r.status.is_some() {
         return Err(bad("invalid_status")); // lifecycle changes use their own actions
     }
@@ -329,28 +350,17 @@ pub fn update_exam(conn: &Connection, admin: &User, id: &str, r: &ExamReq, now: 
     let base = Cfg::of(&cur);
     let cfg = merge(&base, r)?;
 
+    let new_subject = r.subject_id.as_deref().filter(|s| *s != cur.subject_id);
     if frozen {
-        // PRD E6: after the first attempt only these may change: title/description, a later (or no) closing
-        // time, show-answers, release timing, pass mark, and more attempts.
-        let moved_start = cfg.opens_at != base.opens_at;
-        let shortened = match (base.closes_at, cfg.closes_at) {
-            (Some(old), Some(new)) => new < old,
-            (None, Some(_)) => true,
-            _ => false,
-        };
-        if r.questions.is_some() || r.sources.is_some() || r.subject_id.as_deref().map_or(false, |s| s != cur.subject_id)
-            || cfg.duration_min != base.duration_min || moved_start || cfg.shuffle_questions != base.shuffle_questions
-            || cfg.shuffle_options != base.shuffle_options
-        {
-            return Err(err(StatusCode::CONFLICT, "has_attempts"));
-        }
-        if shortened || cfg.max_attempts < base.max_attempts {
-            return Err(err(StatusCode::CONFLICT, "only_extend"));
-        }
+        check_freeze(&base, &cfg, r.questions.is_some() || r.sources.is_some() || new_subject.is_some())?;
     }
 
     let subject_id = match r.subject_id.as_deref() {
         Some(s) => {
+            // moving a teacher's exam into another subject needs an approved assignment there, like creating one
+            if new_subject.is_some() && user.role == "teacher" {
+                require_assignment(conn, &user.id, s)?;
+            }
             subject_state(conn, s)?;
             s.to_string()
         }
@@ -397,56 +407,104 @@ pub fn update_exam(conn: &Connection, admin: &User, id: &str, r: &ExamReq, now: 
     if base.closes_at.map_or(false, |c| c <= now) && cfg.closes_at.map_or(true, |c| c > now) {
         crate::platform_reminders::reset_results(conn, id);
     }
-    audit(conn, &admin.id, id, "exam_update", if frozen { "frozen" } else { "" });
-    get_exam(conn, admin, id, now)
+    audit(conn, &user.id, id, "exam_update", if frozen { "frozen" } else { "" });
+    get_exam(conn, user, id, now)
 }
 
 // ───────── lifecycle ─────────
 
-pub fn act(conn: &Connection, admin: &User, id: &str, action: &str, now: i64) -> Res<ExamDetail> {
-    let cur = get_info(conn, &admin.id, id)?;
-    let phase = phase_of(&cur, now);
-    let set = |status: &str, closed: Option<i64>, archived: Option<i64>| -> Res<()> {
-        conn.execute("UPDATE assessments SET status = ?2, closed_at = ?3, archived_at = ?4, updated_at = ?5 WHERE id = ?1", params![id, status, closed, archived, now])
-            .map_err(db_err)?;
+/// A new lifecycle state together with who put the exam there (`closed_by` / `archived_by`: what `is_locked` reads).
+struct Move<'a> {
+    status: &'a str,
+    closed_at: Option<i64>,
+    closed_by: Option<&'a str>,
+    archived_at: Option<i64>,
+    archived_by: Option<&'a str>,
+}
+
+impl<'a> Move<'a> {
+    /// A state with no closing or archiving record (draft / published).
+    fn live(status: &'a str) -> Self {
+        Move { status, closed_at: None, closed_by: None, archived_at: None, archived_by: None }
+    }
+}
+
+/// The state-changing actions of [`act`] (`duplicate` creates a new exam and is [`duplicate`]). `unlock` is the admin's
+/// way to hand a locked exam back to its owner without changing its state (reopening needs a closing time still ahead
+/// and the owner's live assignment, so on its own it cannot always lift a lock).
+const ACTIONS: [&str; 7] = ["publish", "unpublish", "close", "reopen", "archive", "restore", "unlock"];
+
+/// Who may run a lifecycle action on `cur` at all: a teacher only on their own exam and not while it is locked; an
+/// admin on any exam (each action below then decides what an admin may do to a teacher's exam).
+fn may_act(user: &User, cur: &AssessmentInfo) -> Res<()> {
+    match user.role.as_str() {
+        "admin" => Ok(()),
+        "teacher" if !cur.owned_by(user) => Err(err(StatusCode::FORBIDDEN, "forbidden")),
+        "teacher" if cur.is_locked() => Err(err(StatusCode::CONFLICT, "locked")),
+        "teacher" => Ok(()),
+        _ => Err(err(StatusCode::FORBIDDEN, "forbidden")),
+    }
+}
+
+pub fn act(conn: &Connection, user: &User, id: &str, action: &str, now: i64) -> Res<ExamDetail> {
+    let cur = get_info(conn, &user.id, id)?;
+    if !ACTIONS.contains(&action) {
+        return Err(bad("invalid_action"));
+    }
+    may_act(user, &cur)?;
+    let set = |s: Move| -> Res<()> {
+        conn.execute(
+            "UPDATE assessments SET status = ?2, closed_at = ?3, closed_by = ?4, archived_at = ?5, archived_by = ?6, updated_at = ?7 WHERE id = ?1",
+            params![id, s.status, s.closed_at, s.closed_by, s.archived_at, s.archived_by, now],
+        )
+        .map_err(db_err)?;
         Ok(())
     };
     let conflict = |code: &str| Err(err(StatusCode::CONFLICT, code));
+    let actor = user.id.as_str();
     match action {
         "publish" => {
-            editable(&cur)?;
+            editable(user, &cur)?;
             if cur.status != "draft" {
                 return conflict("invalid_transition");
             }
+            // turning an exam on needs its OWNER's live assignment (an admin exam has no owner to check)
+            if let Some(owner) = cur.teacher_id.as_deref() {
+                require_assignment(conn, owner, &cur.subject_id)?;
+            }
             let (questions, _) = load_snapshot(conn, id)?;
             check_publishable(&questions, subject_state(conn, &cur.subject_id)?, &Cfg::of(&cur), now)?;
-            set("published", None, None)?;
-            announce(conn, admin, &cur.subject_id, id, &cur.title, now);
+            set(Move::live("published"))?;
+            announce(conn, user, &cur.subject_id, id, &cur.title, now);
         }
         "unpublish" => {
-            if cur.status != "published" || cur.teacher_id.is_some() && false {
+            if cur.status != "published" {
                 return conflict("invalid_transition");
             }
             if cur.attempt_count > 0 {
                 return conflict("has_attempts"); // close it instead
             }
-            set("draft", None, None)?;
+            set(Move::live("draft"))?;
         }
         "close" => {
             if cur.status != "published" {
                 return conflict("invalid_transition");
             }
-            set("closed", Some(now), None)?;
+            set(Move { status: "closed", closed_at: Some(now), closed_by: Some(actor), archived_at: None, archived_by: None })?;
         }
         "reopen" => {
             if cur.status != "closed" {
                 return conflict("invalid_transition");
             }
-            editable(&cur)?;
             if cur.closes_at.map_or(false, |c| c <= now) {
                 return Err(bad("invalid_time")); // extend the closing time first
             }
-            set("published", None, None)?;
+            // it goes live again, so (as for publishing) its owner must still hold the assignment; an admin reopening a
+            // teacher's exam is subject to the same rule. Reopening does not need the "teachers may create exams" switch.
+            if let Some(owner) = cur.teacher_id.as_deref() {
+                require_assignment(conn, owner, &cur.subject_id)?;
+            }
+            set(Move::live("published"))?;
             // results are withheld again until the next close, so "results available" will be due again then
             crate::platform_reminders::reset_results(conn, id);
         }
@@ -457,56 +515,122 @@ pub fn act(conn: &Connection, admin: &User, id: &str, action: &str, now: i64) ->
             if cur.status == "archived" {
                 return conflict("invalid_transition");
             }
-            set("archived", cur.closed_at, Some(now))?;
+            set(Move { status: "archived", closed_at: cur.closed_at, closed_by: cur.closed_by.as_deref(), archived_at: Some(now), archived_by: Some(actor) })?;
         }
         "restore" => {
             if cur.status != "archived" {
                 return conflict("invalid_transition");
             }
-            // back to where it came from: closed if it ever ran, otherwise a draft
-            let back = if cur.closed_at.is_some() || cur.attempt_count > 0 { "closed" } else { "draft" };
-            let closed_at = if back == "closed" { cur.closed_at.or(Some(now)) } else { None };
-            set(back, closed_at, None)?;
+            // back to where it came from: closed if it ever ran, otherwise a draft. A restored exam that had been closed
+            // keeps whoever closed it; one that merely has attempts counts as closed by whoever restores it.
+            if cur.closed_at.is_some() || cur.attempt_count > 0 {
+                let by = if cur.closed_at.is_some() { cur.closed_by.as_deref() } else { Some(actor) };
+                set(Move { status: "closed", closed_at: cur.closed_at.or(Some(now)), closed_by: by, archived_at: None, archived_by: None })?;
+            } else {
+                set(Move::live("draft"))?;
+            }
         }
-        _ => return Err(bad("invalid_action")),
+        "unlock" => {
+            // Admins only (a teacher's locked exam never gets this far: `may_act` answered 409 `locked`). It changes no
+            // state: the actor columns that made the exam locked simply name its owner from now on.
+            if user.role != "admin" {
+                return Err(err(StatusCode::FORBIDDEN, "forbidden"));
+            }
+            let owner = match cur.teacher_id.as_deref() {
+                Some(owner) if cur.is_locked() => owner,
+                _ => return conflict("invalid_transition"), // an admin exam, or one that is not locked
+            };
+            let closed_by = if cur.closed_at.is_some() { Some(owner) } else { cur.closed_by.as_deref() };
+            if cur.status == "archived" {
+                set(Move { status: "archived", closed_at: cur.closed_at, closed_by, archived_at: cur.archived_at, archived_by: Some(owner) })?;
+            } else {
+                set(Move { status: "closed", closed_at: cur.closed_at, closed_by: Some(owner), archived_at: None, archived_by: None })?;
+            }
+        }
+        _ => unreachable!("validated against ACTIONS"),
     }
-    let _ = phase;
-    audit(conn, &admin.id, id, &format!("exam_{action}"), &cur.status);
-    get_exam(conn, admin, id, now)
+    audit(conn, &user.id, id, &format!("exam_{action}"), &cur.status);
+    tell_owner(conn, user, &cur, id, action);
+    get_exam(conn, user, id, now)
 }
 
-pub fn duplicate(conn: &Connection, admin: &User, id: &str, now: i64) -> Res<ExamDetail> {
-    let cur = get_info(conn, &admin.id, id)?;
-    let (questions, sources) = load_snapshot(conn, id)?;
+/// An admin changed the state of a teacher's exam: the owner is told (they cannot tell otherwise why it closed, or that
+/// they may manage it again). Teachers acting on their own exams, and admins on admin exams, notify nobody.
+fn tell_owner(conn: &Connection, actor: &User, cur: &AssessmentInfo, id: &str, action: &str) {
+    let Some(owner) = cur.teacher_id.as_deref().filter(|o| *o != actor.id.as_str()) else { return };
+    let kind = match action {
+        "unpublish" => "content_unpublished",
+        "close" => "exam_admin_closed",
+        "archive" => "exam_admin_archived",
+        "reopen" | "restore" | "unlock" => "exam_admin_released",
+        _ => return,
+    };
+    crate::platform_engage::notify(conn, owner, kind, serde_json::json!({ "title": cur.title }), &format!("/platform/assessments/{id}"));
+}
+
+/// A fresh draft copy for `user`: same snapshot and settings, no stale opening/closing times, owned by whoever copies
+/// it. A teacher copies only their own exam (even a locked one) and needs the assignment to publish the copy later.
+pub fn duplicate(conn: &Connection, user: &User, id: &str, now: i64) -> Res<ExamDetail> {
+    let cur = get_info(conn, &user.id, id)?;
+    let owner = owner_for(user)?;
+    if let Some(teacher) = owner {
+        if !cur.owned_by(user) {
+            return Err(err(StatusCode::FORBIDDEN, "forbidden"));
+        }
+        require_assignment(conn, teacher, &cur.subject_id)?;
+    }
+    let (_, sources) = load_snapshot(conn, id)?;
     let mut title = cur.title.clone();
     if title.chars().count() + COPY_SUFFIX.chars().count() > 200 {
         title = title.chars().take(200 - COPY_SUFFIX.chars().count()).collect();
     }
     title.push_str(COPY_SUFFIX);
     let new = new_id();
-    // A copy is a fresh draft: same snapshot and settings, but no stale opening/closing times and owned by the admin.
     conn.execute(
         "INSERT INTO assessments(id, teacher_id, created_by, subject_id, title, description, questions, question_count, total_points, duration_min,
            opens_at, closes_at, max_attempts, show_answers, shuffle_questions, shuffle_options, pass_mark, release_mode, status, source_map, created_at, updated_at)
-         SELECT ?2, NULL, ?3, subject_id, ?4, description, questions, question_count, total_points, duration_min,
+         SELECT ?2, ?3, ?4, subject_id, ?5, description, questions, question_count, total_points, duration_min,
            NULL, NULL, max_attempts, show_answers, shuffle_questions, shuffle_options, pass_mark,
-           CASE WHEN release_mode = 'after_close' THEN 'immediate' ELSE release_mode END, 'draft', ?5, ?6, ?6 FROM assessments WHERE id = ?1",
-        params![id, new, admin.id, title, serde_json::to_string(&sources).map_err(db_err)?, now],
+           CASE WHEN release_mode = 'after_close' THEN 'immediate' ELSE release_mode END, 'draft', ?6, ?7, ?7 FROM assessments WHERE id = ?1",
+        params![id, new, owner, user.id, title, serde_json::to_string(&sources).map_err(db_err)?, now],
     )
     .map_err(db_err)?;
-    let _ = questions;
-    audit(conn, &admin.id, &new, "exam_duplicate", id);
-    get_exam(conn, admin, &new, now)
+    audit(conn, &user.id, &new, "exam_duplicate", id);
+    get_exam(conn, user, &new, now)
 }
 
-/// Deleting an exam that has attempts needs the exam's exact title as confirmation (and is audited).
-pub fn delete_exam(conn: &Connection, admin: &User, id: &str, confirm_title: Option<&str>) -> Res<()> {
-    let cur = get_info(conn, &admin.id, id)?;
-    if cur.attempt_count > 0 && confirm_title.map(str::trim) != Some(cur.title.trim()) {
-        return Err(err(StatusCode::CONFLICT, "confirm_required"));
+/// Runs a lifecycle action — including `duplicate`, which answers 201 with the new draft — for either actor.
+pub fn lifecycle(conn: &Connection, user: &User, id: &str, action: &str, now: i64) -> Res<(StatusCode, ExamDetail)> {
+    if action == "duplicate" {
+        duplicate(conn, user, id, now).map(|d| (StatusCode::CREATED, d))
+    } else {
+        act(conn, user, id, action, now).map(|d| (StatusCode::OK, d))
+    }
+}
+
+/// Deleting an exam that has attempts takes them and every grade with it. An **admin** may do it after typing the
+/// exam's exact title (and the deletion is audited with the attempt count); a **teacher** never can — any attempt means
+/// 409 `has_attempts` and the way out is closing or archiving. A teacher deletes only their own exam.
+pub fn delete_exam(conn: &Connection, user: &User, id: &str, confirm_title: Option<&str>) -> Res<()> {
+    let cur = get_info(conn, &user.id, id)?;
+    match user.role.as_str() {
+        "admin" => {
+            if cur.attempt_count > 0 && confirm_title.map(str::trim) != Some(cur.title.trim()) {
+                return Err(err(StatusCode::CONFLICT, "confirm_required"));
+            }
+        }
+        "teacher" => {
+            if !cur.owned_by(user) {
+                return Err(err(StatusCode::FORBIDDEN, "forbidden"));
+            }
+            if cur.attempt_count > 0 {
+                return Err(err(StatusCode::CONFLICT, "has_attempts"));
+            }
+        }
+        _ => return Err(err(StatusCode::FORBIDDEN, "forbidden")),
     }
     conn.execute("DELETE FROM assessments WHERE id = ?1", params![id]).map_err(db_err)?;
-    audit(conn, &admin.id, id, "exam_delete", &format!("attempts={}", cur.attempt_count));
+    audit(conn, &user.id, id, "exam_delete", &format!("attempts={}", cur.attempt_count));
     Ok(())
 }
 
@@ -514,26 +638,44 @@ pub fn delete_exam(conn: &Connection, admin: &User, id: &str, confirm_title: Opt
 
 #[derive(Deserialize, Default)]
 pub struct ListQuery {
-    subject_id: Option<String>,
+    pub(crate) subject_id: Option<String>,
     /// `draft`, `published`, `closed`, `archived` (effective phase) or `all`. Default: everything except archived.
-    status: Option<String>,
-    q: Option<String>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    pub(crate) status: Option<String>,
+    pub(crate) q: Option<String>,
+    pub(crate) limit: Option<i64>,
+    pub(crate) offset: Option<i64>,
+    /// Teachers only: `mine` (default) or `admin` (read-only list of the admin's published / closed exams in the
+    /// subjects the teacher is approved for). Ignored for admins.
+    pub(crate) scope: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
 pub struct ExamPage {
-    items: Vec<ExamRow>,
-    total: i64,
+    pub(crate) items: Vec<ExamRow>,
+    pub(crate) total: i64,
 }
 
 const PHASE_SQL: &str = "CASE WHEN a.status = 'published' AND a.closes_at IS NOT NULL AND a.closes_at <= ?2 THEN 'closed' ELSE a.status END";
 
-pub fn list_exams(conn: &Connection, admin: &User, f: &ListQuery, now: i64) -> Res<ExamPage> {
-    // ?1 = viewer (for attempts_used in INFO_SELECT), ?2 = now; filters follow.
-    let mut args: Vec<Value> = vec![Value::Text(admin.id.clone()), Value::Integer(now)];
+/// An admin lists every exam; a teacher `scope=mine` their own (default) or `scope=admin` the admin's published /
+/// closed exams for their approved subjects (never drafts or archived ones, never editable).
+pub fn list_exams(conn: &Connection, user: &User, f: &ListQuery, now: i64) -> Res<ExamPage> {
+    // ?1 = viewer (for attempts_used in the row select), ?2 = now; filters follow.
+    let mut args: Vec<Value> = vec![Value::Text(user.id.clone()), Value::Integer(now)];
     let mut conds: Vec<String> = vec![];
+    match user.role.as_str() {
+        "admin" => {}
+        "teacher" => match f.scope.as_deref().unwrap_or("mine") {
+            "mine" => conds.push("a.teacher_id = ?1".into()),
+            "admin" => conds.push(
+                "a.teacher_id IS NULL AND a.status IN ('published','closed') AND EXISTS(SELECT 1 FROM teacher_subjects ts
+                   WHERE ts.teacher_id = ?1 AND ts.subject_id = a.subject_id AND ts.status = 'approved')"
+                    .into(),
+            ),
+            _ => return Err(bad("invalid_filter")),
+        },
+        _ => return Err(err(StatusCode::FORBIDDEN, "forbidden")),
+    }
     if let Some(s) = f.subject_id.as_deref().filter(|s| !s.is_empty()) {
         args.push(Value::Text(s.to_string()));
         conds.push(format!("a.subject_id = ?{}", args.len()));
@@ -560,19 +702,19 @@ pub fn list_exams(conn: &Connection, admin: &User, f: &ListQuery, now: i64) -> R
         .query_row(&format!("SELECT count(*) FROM assessments a {wh} AND (?1 IS NOT NULL)"), params_from_iter(args.iter()), |r| r.get(0))
         .map_err(db_err)?;
     let items = conn
-        .prepare(&format!("{INFO_SELECT} {wh} ORDER BY a.updated_at DESC, a.id LIMIT {limit} OFFSET {offset}"))
+        .prepare(&format!("{} {wh} ORDER BY a.updated_at DESC, a.id LIMIT {limit} OFFSET {offset}", row_select()))
         .map_err(db_err)?
-        .query_map(params_from_iter(args.iter()), map_info)
+        .query_map(params_from_iter(args.iter()), map_row)
         .map_err(db_err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?
         .into_iter()
-        .map(|i| row_of(i, now))
+        .map(|d| row_of(user, d, now))
         .collect();
     Ok(ExamPage { items, total })
 }
 
-// ───────── handlers ─────────
+// ───────── admin handlers ─────────
 
 pub async fn list_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Query(f): Query<ListQuery>) -> Res<Json<ExamPage>> {
     let a = require_admin(&s, &h)?;
@@ -607,11 +749,7 @@ pub async fn delete_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(i
 
 pub async fn action_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path((id, action)): Path<(String, String)>) -> Res<(StatusCode, Json<ExamDetail>)> {
     let a = require_admin(&s, &h)?;
-    let conn = lock(&s)?;
-    if action == "duplicate" {
-        return duplicate(&conn, &a, &id, now_ms()).map(|d| (StatusCode::CREATED, Json(d)));
-    }
-    act(&conn, &a, &id, &action, now_ms()).map(|d| (StatusCode::OK, Json(d)))
+    lifecycle(&*lock(&s)?, &a, &id, &action, now_ms()).map(|(code, d)| (code, Json(d)))
 }
 
 #[cfg(test)]
@@ -861,6 +999,44 @@ mod tests {
         assert_eq!((page.items.len(), page.total), (2, 4));
         let page2 = list_exams(&w.conn, &w.admin, &ListQuery { limit: Some(2), offset: Some(2), status: Some("all".into()), ..Default::default() }, NOW).unwrap();
         assert!(page.items.iter().all(|a| page2.items.iter().all(|b| a.info.id != b.info.id)));
+    }
+
+    #[test]
+    fn rows_carry_ownership_counts_and_visibility_and_the_lifecycle_records_who_acted() {
+        let w = world();
+        let id = create_exam(&w.conn, &w.admin, &basic(json!({"status": "published", "closes_at": NOW + 100_000})), NOW).unwrap().row.info.id;
+        let r = get_exam(&w.conn, &w.admin, &id, NOW).unwrap().row;
+        assert_eq!((r.owned, r.can_edit, r.locked, r.submitted, r.pending_answers, r.visible, r.hidden_reason), (true, true, false, 0, 0, true, None));
+        let a1 = add_attempt(&w, &id);
+        add_attempt(&w, &id);
+        w.conn.execute("UPDATE attempts SET pending = 2 WHERE student_id = ?1", params![a1]).unwrap();
+        w.conn.execute("INSERT INTO attempts(id, assessment_id, student_id, started_at, status, pending) VALUES ('open', ?1, ?2, 0, 'in_progress', 5)", params![id, a1]).unwrap();
+        let r = get_exam(&w.conn, &w.admin, &id, NOW).unwrap().row;
+        assert_eq!((r.submitted, r.pending_answers, r.info.attempt_count), (2, 2, 3), "only submitted attempts count, and an unfinished one's pending never does");
+        // who acted is recorded on every transition into closed / archived, and cleared when the state is left
+        let by = || -> (Option<String>, Option<String>) { w.conn.query_row("SELECT closed_by, archived_by FROM assessments WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap() };
+        let admin = Some(w.admin.id.clone());
+        assert_eq!(by(), (None, None));
+        act(&w.conn, &w.admin, &id, "close", NOW + 1).unwrap();
+        assert_eq!(by(), (admin.clone(), None));
+        act(&w.conn, &w.admin, &id, "reopen", NOW + 2).unwrap();
+        assert_eq!(by(), (None, None));
+        act(&w.conn, &w.admin, &id, "close", NOW + 3).unwrap();
+        let archived = act(&w.conn, &w.admin, &id, "archive", NOW + 4).unwrap().row;
+        assert_eq!((by(), archived.can_edit, archived.locked, archived.owned), ((admin.clone(), admin.clone()), false, false, true), "an archived admin exam is read-only for everybody, but never 'locked'");
+        act(&w.conn, &w.admin, &id, "restore", NOW + 5).unwrap();
+        assert_eq!(by(), (admin.clone(), None), "restoring clears the archiver and keeps the closer");
+        // the JSON of a row carries every field of the contract and none of the internals
+        let v = serde_json::to_value(get_exam(&w.conn, &w.admin, &id, NOW).unwrap()).unwrap();
+        for key in ["id", "phase", "can_edit", "owned", "locked", "submitted", "pending_answers", "visible", "hidden_reason", "questions", "sources"] {
+            assert!(v.get(key).is_some(), "{key}");
+        }
+        assert!(v.get("closed_by").is_none() && v.get("archived_by").is_none());
+        // visibility reasons come from the same rule students are served by
+        act(&w.conn, &w.admin, &id, "reopen", NOW + 6).unwrap();
+        w.conn.execute("UPDATE institutions SET is_active = 0", []).unwrap();
+        let hidden = get_exam(&w.conn, &w.admin, &id, NOW).unwrap().row;
+        assert_eq!((hidden.visible, hidden.hidden_reason), (false, Some(HiddenReason::InstitutionInactive)));
     }
 
     #[test]

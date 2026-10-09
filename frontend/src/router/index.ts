@@ -5,6 +5,9 @@ import { pendingTeacherMayEnter } from '@/utils/platformGuard'
 import { resetAdminStats } from '@/lib/adminStats'
 import { resetTeacherStats } from '@/lib/teacherStats'
 
+/** Empty page for the old exam-editor addresses: the guard below always redirects away from them. */
+const LEGACY_EDITOR = { render: () => null }
+
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
@@ -370,16 +373,36 @@ const router = createRouter({
       meta: { title: 'Notifications', requiresAuth: true, requiresActive: true },
     },
     {
+      // My exams (the teacher's list) and the shared exam builder in teacher mode.
+      path: '/platform/exams',
+      name: 'platform-my-exams',
+      component: () => import('@/views/platform/MyExamsView.vue'),
+      meta: { title: 'platform-my-exams', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+    },
+    {
+      path: '/platform/exams/new',
+      name: 'platform-exam-new',
+      component: () => import('@/views/platform/TeacherExamEditorView.vue'),
+      meta: { title: 'platform-exam-new', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+    },
+    {
+      path: '/platform/exams/:id/edit',
+      name: 'platform-exam-edit',
+      component: () => import('@/views/platform/TeacherExamEditorView.vue'),
+      meta: { title: 'platform-exam-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+    },
+    {
+      // The old exam editor is gone: its addresses lead to the new builder (an admin to the admin builder), keeping ?subject=.
       path: '/platform/assessments/new',
       name: 'platform-assessment-new',
-      component: () => import('@/views/platform/AssessmentEditorView.vue'),
-      meta: { title: 'platform-assessment-new', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      component: LEGACY_EDITOR,
+      meta: { title: 'platform-assessment-new', requiresAuth: true, requiresActive: true, legacyEditor: 'new' },
     },
     {
       path: '/platform/assessments/:id/edit',
       name: 'platform-assessment-edit',
-      component: () => import('@/views/platform/AssessmentEditorView.vue'),
-      meta: { title: 'platform-assessment-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      component: LEGACY_EDITOR,
+      meta: { title: 'platform-assessment-edit', requiresAuth: true, requiresActive: true, legacyEditor: 'edit' },
     },
     {
       path: '/platform/assessments/:id/take',
@@ -449,6 +472,12 @@ router.beforeEach(async (to) => {
   if (to.name === 'auth-pending' && auth.isActive) return '/platform'
   const pendingOk = pendingTeacherMayEnter(to.meta, auth.role, auth.profile?.status)
   if (to.meta.requiresActive && auth.profile && !auth.isActive && !pendingOk) return '/auth/pending'
+  // The old exam-editor addresses lead to the new builder (an admin to the admin's), keeping the query (?subject=).
+  const legacy = to.meta.legacyEditor as 'new' | 'edit' | undefined
+  if (legacy) {
+    const tail = legacy === 'new' ? 'new' : `${String(to.params.id)}/edit`
+    return { path: `${auth.role === 'admin' ? '/platform/admin/exams' : '/platform/exams'}/${tail}`, query: to.query, replace: true }
+  }
   const roles = to.meta.roles as string[] | undefined
   if (roles && (!auth.role || !roles.includes(auth.role))) return '/platform'
   return true

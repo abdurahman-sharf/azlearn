@@ -6,6 +6,7 @@ import { useI18nStore } from '@/stores/i18n'
 import { usePt, platformErrorMessage, type PlatformKey } from '@/i18n/platform'
 import { attemptsTable, downloadExport, examAnalytics, type Analytics, type ResultFilter, type SortKey, type StudentRow } from '@/api/platformGrading'
 import PageError from '@/components/platform/PageError.vue'
+import AnswerKeyDialog from '@/components/platform/AnswerKeyDialog.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -21,6 +22,10 @@ const page = ref(0)
 const error = ref('')
 const loadingRows = ref(false)
 const search = ref('')
+// Answer-key correction: only the exam's owner may (the server decides and says so in `can_correct`)
+const canCorrect = ref(false)
+const fixing = ref('')
+const notice = ref('')
 const f = reactive({ result: '' as ResultFilter, sort: 'submitted_at' as SortKey, dir: 'desc' as 'asc' | 'desc', q: '' })
 
 const fmt = (ms: number) => new Date(ms).toLocaleString(i18n.locale === 'ar' ? 'ar' : undefined, { dateStyle: 'medium', timeStyle: 'short' })
@@ -45,15 +50,31 @@ const refilter = () => { page.value = 0; loadRows() }
 const submitSearch = () => { f.q = search.value; refilter() }
 const go = (d: number) => { page.value += d; loadRows() }
 
-onMounted(async () => {
+/** The page's numbers; the analytics also say whether the caller may correct the key (`can_correct`, decided by the server). */
+async function loadAnalytics(): Promise<boolean> {
   try {
-    a.value = await examAnalytics(id)
+    const an = await examAnalytics(id)
+    a.value = an
+    canCorrect.value = an.can_correct === true
+    return true
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
-    return
+    return false
   }
+}
+
+onMounted(async () => {
+  if (!(await loadAnalytics())) return
   await loadRows()
 })
+
+/** The key was corrected: every figure on the page changed, so all of it is read again. */
+async function onApplied() {
+  fixing.value = ''
+  error.value = ''
+  notice.value = pt('keyDone')
+  if (await loadAnalytics()) await loadRows()
+}
 
 async function exportAs(format: 'xlsx' | 'csv', part: 'results' | 'questions') {
   error.value = ''
@@ -79,6 +100,7 @@ const SORTS: { key: SortKey; label: PlatformKey }[] = [
       <router-link :to="`/platform/assessments/${id}`" class="text-body-sm underline">{{ pt('back') }}</router-link>
       <h1 class="text-display-sm font-bold tracking-tight mt-3 break-words">{{ a.info.title }} — {{ pt('results') }}</h1>
     </div>
+    <p v-if="notice" class="text-body-sm font-semibold" role="status" data-testid="key-notice">{{ notice }}</p>
     <p v-if="error" class="text-body-sm" role="alert" style="color: rgb(var(--md-error))" data-testid="results-error">{{ error }}</p>
 
     <!-- headline numbers -->
@@ -122,16 +144,20 @@ const SORTS: { key: SortKey; label: PlatformKey }[] = [
           <div class="flex items-start gap-2">
             <span dir="ltr" class="inline-block font-bold shrink-0">{{ q.position }}.</span>
             <span class="flex-1 min-w-0 break-words" dir="auto">{{ q.stem }}</span>
+            <span v-if="q.voided" class="text-xs font-bold px-2 py-0.5 rounded-full shrink-0" style="background-color: rgb(var(--md-surface-container-high))" data-testid="flag-voided">⊘ {{ pt('keyVoided') }}</span>
             <span v-if="q.weak" class="text-xs font-bold px-2 py-0.5 rounded-full shrink-0" style="background-color: rgb(var(--md-error-container, var(--md-surface-container-high))); color: rgb(var(--md-on-error-container, var(--md-on-surface)))" data-testid="flag-weak">▼ {{ pt('rsWeak') }}</span>
             <span v-if="q.easy" class="text-xs font-bold px-2 py-0.5 rounded-full shrink-0" style="background-color: rgb(var(--md-surface-container-high))" data-testid="flag-easy">▲ {{ pt('rsEasy') }}</span>
           </div>
           <div class="flex items-center gap-3 text-body-sm" style="color: rgb(var(--md-on-surface-variant))">
             <span>{{ typeLabel(q.type) }}</span>
-            <span class="flex-1 h-2 rounded-sm" style="background-color: rgb(var(--md-surface-container-high))" :title="q.rate === null ? '' : `${Math.round(q.rate * 100)}%`">
-              <span v-if="q.rate !== null" class="block h-2" :style="{ width: q.rate * 100 + '%', backgroundColor: 'rgb(var(--md-primary))', borderRadius: '0 4px 4px 0', minWidth: q.rate > 0 ? '4px' : '0' }"></span>
+            <span class="flex-1 h-2 rounded-sm" style="background-color: rgb(var(--md-surface-container-high))" :title="q.rate === null || q.voided ? '' : `${Math.round(q.rate * 100)}%`">
+              <span v-if="q.rate !== null && !q.voided" class="block h-2" :style="{ width: q.rate * 100 + '%', backgroundColor: 'rgb(var(--md-primary))', borderRadius: '0 4px 4px 0', minWidth: q.rate > 0 ? '4px' : '0' }"></span>
             </span>
-            <span dir="ltr" class="shrink-0 font-bold" style="color: rgb(var(--md-on-surface))" data-testid="q-rate">{{ q.rate === null ? '—' : Math.round(q.rate * 100) + '%' }}</span>
+            <span dir="ltr" class="shrink-0 font-bold" style="color: rgb(var(--md-on-surface))" data-testid="q-rate">{{ q.rate === null || q.voided ? '—' : Math.round(q.rate * 100) + '%' }}</span>
             <span dir="ltr" class="shrink-0">{{ q.graded }} {{ pt('rsGradedN') }}</span>
+          </div>
+          <div v-if="canCorrect" class="flex justify-end">
+            <button type="button" class="btn-text" :aria-label="`${pt('keyFix')}: ${q.position}`" :data-testid="`key-fix-${q.id}`" @click="fixing = q.id">{{ pt('keyFix') }}</button>
           </div>
         </li>
       </ul>
@@ -180,6 +206,7 @@ const SORTS: { key: SortKey; label: PlatformKey }[] = [
         <button class="btn-outlined" :disabled="page + 1 >= pages || loadingRows" data-testid="tbl-next" @click="go(1)">{{ pt('nextPage') }}</button>
       </nav>
     </section>
+    <AnswerKeyDialog v-if="fixing" :exam-id="id" :question-id="fixing" @close="fixing = ''" @applied="onApplied" />
     <span v-if="auth.role === 'admin' && a.tab_leaves_total" class="text-body-sm" data-testid="leaves-total">{{ pt('rsLeavesTotal') }}: <span dir="ltr" class="inline-block">{{ a.tab_leaves_total }}</span> ({{ a.tab_leave_students }} {{ pt('rsStudentsCount') }})</span>
   </div>
   <PageError v-else-if="error" :message="error" />

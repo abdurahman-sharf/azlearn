@@ -127,7 +127,8 @@ fn auto_hide_if_needed(conn: &Connection, ttype: &str, id: &str, target: &Target
             let sat: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE assessment_id = ?1)", params![id], |r| r.get(0)).map_err(db_err)?;
             if sat {
                 let now = now_ms();
-                conn.execute("UPDATE assessments SET status = 'closed', closed_at = ?2, updated_at = ?2 WHERE id = ?1 AND status = 'published'", params![id, now])
+                // `closed_by` NULL = the system: the exam stays locked for its owner until an admin reopens or unlocks it
+                conn.execute("UPDATE assessments SET status = 'closed', closed_at = ?2, closed_by = NULL, updated_at = ?2 WHERE id = ?1 AND status = 'published'", params![id, now])
             } else {
                 conn.execute("UPDATE assessments SET status = 'draft' WHERE id = ?1 AND status = 'published'", params![id])
             }
@@ -855,6 +856,27 @@ mod tests {
         // a closed exam is not hidden a second time by a fourth report
         create_report(&w.conn, &w.students[3], &rep("assessment", "e-sat")).unwrap();
         assert_eq!(n(&w.conn, "SELECT count(*) FROM audit_log WHERE action = 'auto_hidden_by_reports'"), 2);
+    }
+
+    #[test]
+    fn auto_hide_closes_with_no_actor_so_the_owner_stays_locked_out_until_an_admin_reopens() {
+        let w = world();
+        exam_of(&w.conn, "e-sat", Some(&w.teacher));
+        // a stale actor from an earlier close / reopen must not survive: the system closed it this time
+        w.conn.execute("UPDATE assessments SET closed_by = ?1, archived_by = ?1 WHERE id = 'e-sat'", params![w.teacher.id]).unwrap();
+        attempt_on(&w.conn, "a1", "e-sat", &w.students[3], "submitted");
+        for s in &w.students[..3] {
+            create_report(&w.conn, s, &rep("assessment", "e-sat")).unwrap();
+        }
+        assert_eq!(status_of_exam(&w.conn, "e-sat").0, "closed");
+        let (closed_by, archived_by): (Option<String>, Option<String>) = w.conn.query_row("SELECT closed_by, archived_by FROM assessments WHERE id = 'e-sat'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(closed_by, None, "NULL = the system");
+        assert_eq!(archived_by.as_deref(), Some(w.teacher.id.as_str()), "only the closing actor is rewritten");
+        let info = crate::platform_exams::get_info(&w.conn, &w.teacher.id, "e-sat").unwrap();
+        assert!(info.is_locked(), "an exam the reports took down is not the owner's to put back");
+        // an admin reopening it lifts the lock
+        let reopened = crate::platform_exam_admin::act(&w.conn, &w.admin, "e-sat", "reopen", 5).unwrap();
+        assert_eq!((reopened.row.info.status.as_str(), reopened.row.locked), ("published", false));
     }
 
     #[test]

@@ -48,3 +48,22 @@ export function activeSubset<U extends TreeUnit, S extends TreeSubject>(units: U
     subjects: subjects.filter((s) => s.is_active && (s.unit_id === null || !byId.has(s.unit_id) || check(s.unit_id))),
   }
 }
+
+/**
+ * Keeps only the given subjects and the units on the way to them (a unit's ancestors stay so the cascade of lists can
+ * still be walked down to the subject). Used when a teacher may only pick the subjects they are approved for. The relative
+ * order is kept; a looping or broken parent chain ends at the repeated or missing unit, so bad data never hangs the page.
+ */
+export function restrictToSubjects<U extends TreeUnit, S extends TreeSubject>(units: U[], subjects: S[], allowed: ReadonlySet<string>): { units: U[]; subjects: S[] } {
+  const kept = subjects.filter((s) => allowed.has(s.id))
+  const byId = new Map(units.map((u) => [u.id, u]))
+  const keep = new Set<string>()
+  for (const s of kept) {
+    let cur = s.unit_id !== null ? byId.get(s.unit_id) : undefined
+    while (cur && !keep.has(cur.id)) {
+      keep.add(cur.id)
+      cur = cur.parent_id !== null ? byId.get(cur.parent_id) : undefined
+    }
+  }
+  return { units: units.filter((u) => keep.has(u.id)), subjects: kept }
+}

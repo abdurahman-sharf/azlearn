@@ -3,10 +3,12 @@ import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useI18nStore } from '@/stores/i18n'
-import { usePt, platformErrorMessage } from '@/i18n/platform'
+import { usePt, platformErrorMessage, platformAdminErrorMessage } from '@/i18n/platform'
 import ReportButton from '@/components/platform/ReportButton.vue'
-import { getAssessment, updateAssessment, deleteAssessment, type AssessmentDetail } from '@/api/platformExams'
+import { getAssessment, type AssessmentDetail } from '@/api/platformExams'
+import { adminExams, type ExamAction } from '@/api/platformExamAdmin'
 import PageError from '@/components/platform/PageError.vue'
+import ConfirmDeleteDialog from '@/components/platform/ConfirmDeleteDialog.vue'
 import { PlatformError } from '@/lib/platformApi'
 
 const pt = usePt()
@@ -28,21 +30,61 @@ async function load() {
     error.value = platformErrorMessage(pt, e)
   }
 }
-// Students have started the exam: this page's Unpublish/Delete would be refused (409 has_attempts) for everyone, admins
-// included — closing or archiving it is done from the admin exams screen. Also set when the server says so after the
+// Students have started the exam: deleting it would erase their results, so the admin's delete asks for the exam's title
+// (the server demands it too) and closing or archiving is the better choice. Also set when the server says so after the
 // page was loaded (a student started in the meantime).
 const started = ref(false)
 const hasStarted = computed(() => started.value || (a.value?.attempt_count ?? 0) > 0)
+const isAdmin = computed(() => auth.role === 'admin')
+/** an exam the admin made himself (a teacher's is only moderated: closed, archived, reopened, deleted) */
+const adminOwned = computed(() => !a.value?.teacher_id)
+const editLink = computed(() => (isOwner.value ? `/platform/exams/${id}/edit` : isAdmin.value && adminOwned.value ? `/platform/admin/exams/${id}/edit` : ''))
+const busy = ref(false)
+/** The server says attempts exist (`has_attempts`, or `confirm_required` = the typed title is needed): the page was loaded before the first student started. */
+const startedMeanwhile = (e: unknown) => e instanceof PlatformError && (e.code === 'has_attempts' || e.code === 'confirm_required')
 function fail(e: unknown) {
-  if (e instanceof PlatformError && e.code === 'has_attempts') started.value = true
-  error.value = platformErrorMessage(pt, e)
+  if (startedMeanwhile(e)) started.value = true
+  error.value = platformAdminErrorMessage(pt, e)
 }
-async function unpublish() {
-  try { await updateAssessment(id, { status: 'draft' }); await load() } catch (e) { fail(e) }
+/** The admin's lifecycle actions: the same server rules as the admin exams screen. */
+async function act(action: ExamAction) {
+  if (busy.value) return
+  busy.value = true
+  error.value = ''
+  try {
+    await adminExams.action(id, action)
+    await load()
+  } catch (e) {
+    fail(e)
+    await load()
+  } finally {
+    busy.value = false
+  }
+}
+const removing = ref(false)
+const removeError = ref('')
+function askRemove() {
+  removeError.value = ''
+  removing.value = true
 }
 async function remove() {
-  if (!window.confirm(pt('confirmDelete'))) return
-  try { await deleteAssessment(id); router.replace('/platform') } catch (e) { fail(e) }
+  if (!a.value || busy.value) return
+  busy.value = true
+  removeError.value = ''
+  try {
+    await adminExams.remove(id, hasStarted.value ? a.value.title : undefined)
+    removing.value = false
+    await router.replace('/platform/admin/exams')
+  } catch (e) {
+    removeError.value = platformAdminErrorMessage(pt, e)
+    if (startedMeanwhile(e)) {
+      // a student started after this page loaded: the dialog now asks for the exam's title, with the real attempt count
+      started.value = true
+      await load()
+    }
+  } finally {
+    busy.value = false
+  }
 }
 onMounted(load)
 </script>
@@ -92,18 +134,33 @@ onMounted(load)
 
     <div v-if="!isOwner" class="mt-4"><ReportButton target-type="assessment" :target-id="a.id" /></div>
 
-    <div v-if="isOwner || auth.role === 'admin' || (auth.role === 'teacher' && !a.teacher_id)" class="flex flex-wrap gap-2 mt-4">
+    <div v-if="isOwner || isAdmin || (auth.role === 'teacher' && !a.teacher_id)" class="flex flex-wrap gap-2 mt-4">
       <router-link :to="`/platform/assessments/${a.id}/results`" class="btn-filled">{{ pt('results') }} ({{ a.attempt_count }})</router-link>
-      <router-link v-if="isOwner" :to="`/platform/assessments/${a.id}/edit`" class="btn-outlined">{{ pt('edit') }}</router-link>
-      <template v-if="auth.role === 'admin'">
-        <template v-if="!hasStarted">
-          <button v-if="a.status === 'published'" class="btn-outlined" data-testid="exam-unpublish" @click="unpublish">{{ pt('unpublish') }}</button>
-          <button class="btn-outlined" data-testid="exam-delete" @click="remove">{{ pt('del') }}</button>
-        </template>
-        <router-link v-else to="/platform/admin/exams" class="btn-outlined" data-testid="exam-open-admin">{{ pt('openAdminExams') }}</router-link>
+      <router-link v-if="editLink" :to="editLink" class="btn-outlined" data-testid="exam-edit">{{ pt('edit') }}</router-link>
+      <router-link v-if="isOwner" to="/platform/exams" class="btn-text" data-testid="exam-open-mine">{{ pt('mexTitle') }}</router-link>
+      <template v-if="isAdmin">
+        <button v-if="a.status === 'published' && !hasStarted" class="btn-outlined" :disabled="busy" data-testid="exam-unpublish" @click="act('unpublish')">{{ pt('unpublish') }}</button>
+        <button v-if="a.status === 'published'" class="btn-outlined" :disabled="busy" data-testid="exam-close" @click="act('close')">{{ pt('exClose') }}</button>
+        <button v-if="a.status === 'closed'" class="btn-outlined" :disabled="busy" data-testid="exam-reopen" @click="act('reopen')">{{ pt('exReopen') }}</button>
+        <button v-if="a.status === 'draft' || a.status === 'closed'" class="btn-outlined" :disabled="busy" data-testid="exam-archive" @click="act('archive')">{{ pt('exArchive') }}</button>
+        <button v-if="a.status === 'archived'" class="btn-outlined" :disabled="busy" data-testid="exam-restore" @click="act('restore')">{{ pt('exRestore') }}</button>
+        <button v-if="a.locked" class="btn-outlined" :disabled="busy" data-testid="exam-unlock" @click="act('unlock')">{{ pt('exUnlock') }}</button>
+        <button class="btn-outlined" :disabled="busy" data-testid="exam-delete" @click="askRemove">{{ pt('del') }}</button>
+        <router-link to="/platform/admin/exams" class="btn-text" data-testid="exam-open-admin">{{ pt('openAdminExams') }}</router-link>
       </template>
     </div>
-    <p v-if="auth.role === 'admin' && hasStarted" class="text-body-sm mt-2" data-testid="exam-admin-hint" style="color: rgb(var(--md-on-surface-variant))">{{ pt('adminExamsHint') }}</p>
+    <p v-if="isAdmin && hasStarted" class="text-body-sm mt-2" data-testid="exam-admin-hint" style="color: rgb(var(--md-on-surface-variant))">{{ pt('adminExamsHint') }}</p>
+    <ConfirmDeleteDialog
+      v-if="removing"
+      :title="`${pt('del')}: ${a.title}`"
+      :message="hasStarted ? pt('exDeleteMsgAttempts') : pt('exDeleteMsg')"
+      :counts="[{ label: pt('exAttemptsCount'), value: a.attempt_count }, { label: pt('questionsCount'), value: a.question_count }]"
+      :confirm-name="hasStarted ? a.title : undefined"
+      :busy="busy"
+      :error="removeError"
+      @confirm="remove"
+      @close="removing = false"
+    />
   </div>
   <PageError v-else-if="error" :message="error" />
 </template>
