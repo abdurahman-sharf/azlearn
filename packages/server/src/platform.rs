@@ -134,6 +134,8 @@ pub fn apply_schema(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(extra).map_err(|e| e.to_string())?;
     }
     crate::platform_exams::migrate(conn)?;
+    // when a post / course was first announced (phase 3-4)
+    crate::platform_content::migrate(conn)?;
     // Columns added after the first release.
     add_column_if_missing(conn, "users", "bio", "TEXT")?;
     add_column_if_missing(conn, "users", "consented_at", "INTEGER")?;

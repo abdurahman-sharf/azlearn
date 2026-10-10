@@ -269,6 +269,7 @@ async fn main() {
         .route("/api/platform/assessments/{id}/grade-batch", post(platform_grading::batch_handler))
         .route("/api/platform/assessments/{id}/analytics", get(platform_grading::analytics_handler))
         .route("/api/platform/assessments/{id}/attempts", get(platform_grading::table_handler))
+        .route("/api/platform/assessments/{id}/absent", get(platform_grading::absent_handler))
         .route("/api/platform/assessments/{id}/export", get(platform_grading::export_handler))
         .route("/api/platform/admin/branding", axum::routing::put(platform_public::set_branding_handler))
         .route(

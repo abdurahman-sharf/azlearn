@@ -139,8 +139,24 @@ fn auto_hide_if_needed(conn: &Connection, ttype: &str, id: &str, target: &Target
     .map_err(db_err)?;
     if changed > 0 {
         audit(conn, "", id, "auto_hidden_by_reports", ttype);
+        // The owner hears that REPORTS took it down (`content_auto_hidden`); `content_unpublished` stays for an admin
+        // doing it by hand.
         if !target.owner_id.is_empty() {
-            crate::platform_engage::notify(conn, &target.owner_id, "content_unpublished", json!({ "title": target.title }), &target.link);
+            crate::platform_engage::notify(conn, &target.owner_id, "content_auto_hidden", json!({ "title": target.title }), &target.link);
+        }
+        // A live session that was cancelled is cancelled for the people who were going to join it as well.
+        if ttype == "live" {
+            let session: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT l.subject_id, u.full_name FROM live_sessions l JOIN users u ON u.id = l.teacher_id WHERE l.id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(db_err)?;
+            if let Some((subject_id, teacher_name)) = session {
+                crate::platform_engage::notify_audience(conn, &target.owner_id, &subject_id, "live_cancelled", json!({ "title": target.title, "teacher": teacher_name }), &target.link);
+            }
         }
     }
     Ok(())
@@ -530,8 +546,10 @@ fn purge_dangling_references(conn: &Connection, user_id: &str) -> Res<()> {
     const GONE_REVIEWS: &str = "SELECT id FROM reviews WHERE student_id = ?1
          OR (target_type = 'course' AND target_id IN (SELECT id FROM courses WHERE teacher_id = ?1))
          OR (target_type = 'teacher' AND target_id = ?1)";
-    // Reports about those reviews first (the subquery reads `reviews`, so it must run before they are deleted).
+    // Reports about those reviews first (the subquery reads `reviews`, so it must run before they are deleted), and the
+    // teachers' "new review" notices that quote them.
     conn.execute(&format!("DELETE FROM reports WHERE target_type = 'review' AND target_id IN ({GONE_REVIEWS})"), params![user_id]).map_err(db_err)?;
+    crate::platform_engage::purge_review_notices(conn, GONE_REVIEWS, user_id)?;
     conn.execute(
         "DELETE FROM reviews WHERE (target_type = 'course' AND target_id IN (SELECT id FROM courses WHERE teacher_id = ?1))
             OR (target_type = 'teacher' AND target_id = ?1)",
@@ -564,6 +582,7 @@ pub(crate) fn purge_target_references(conn: &Connection, target_type: &str, targ
                 params![target_id],
             )
             .map_err(db_err)?;
+            crate::platform_engage::purge_review_notices(conn, "SELECT id FROM reviews WHERE target_type = 'course' AND target_id = ?1", target_id)?;
             conn.execute("DELETE FROM reviews WHERE target_type = 'course' AND target_id = ?1", params![target_id]).map_err(db_err)?;
         }
         "post" | "live" => {}
@@ -651,8 +670,8 @@ mod tests {
         let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
         let students: Vec<User> = (0..4).map(|i| insert_test_user(&conn, &format!("s{i}@x.com"), "student", "active")).collect();
         conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,'s1','approved',0,0)", params![teacher.id]).unwrap();
-        conn.execute("INSERT INTO posts VALUES ('p1', ?1, 's1', 'article', 'مقال عن البرمجة', 'نص', 'published', NULL, 0, 0)", params![teacher.id]).unwrap();
-        conn.execute("INSERT INTO courses VALUES ('c1', ?1, 's1', 'دورة بايثون', NULL, 'published', 0, 0)", params![teacher.id]).unwrap();
+        conn.execute("INSERT INTO posts VALUES ('p1', ?1, 's1', 'article', 'مقال عن البرمجة', 'نص', 'published', NULL, 0, 0, NULL)", params![teacher.id]).unwrap();
+        conn.execute("INSERT INTO courses VALUES ('c1', ?1, 's1', 'دورة بايثون', NULL, 'published', 0, 0, NULL)", params![teacher.id]).unwrap();
         conn.execute("UPDATE users SET full_name = 'د. خالد البرمجي' WHERE id = ?1", params![teacher.id]).unwrap();
         W { conn, teacher, admin, students }
     }
@@ -675,7 +694,7 @@ mod tests {
         assert_eq!(status(), "published", "two reporters: still visible");
         create_report(&w.conn, &w.students[2], &rep("post", "p1")).unwrap();
         assert_eq!(status(), "draft", "three distinct reporters hide it");
-        let n: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE user_id = ?1 AND kind = 'content_unpublished'", params![w.teacher.id], |r| r.get(0)).unwrap();
+        let n: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE user_id = ?1 AND kind = 'content_auto_hidden'", params![w.teacher.id], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
         // other targets are unaffected; teacher reports never auto-hide
         for s in &w.students[..3] {
@@ -818,7 +837,7 @@ mod tests {
         create_report(&w.conn, &w.students[1], &rep("assessment", "e-admin")).unwrap();
         create_report(&w.conn, &w.students[2], &rep("assessment", "e-admin")).unwrap();
         assert_eq!(status_of_exam(&w.conn, "e-admin").0, "draft");
-        let told: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE user_id = ?1 AND kind = 'content_unpublished'", params![w.admin.id], |r| r.get(0)).unwrap();
+        let told: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE user_id = ?1 AND kind = 'content_auto_hidden'", params![w.admin.id], |r| r.get(0)).unwrap();
         assert_eq!(told, 1);
     }
 
@@ -851,7 +870,7 @@ mod tests {
         assert_eq!(n(&w.conn, "SELECT count(*) FROM attempts WHERE id = 'a1' AND status = 'in_progress'"), 1, "the sitting in progress is untouched");
         assert_eq!(status_of_exam(&w.conn, "e-fresh"), ("draft".to_string(), None));
         // the teacher is told about both
-        let told: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE user_id = ?1 AND kind = 'content_unpublished'", params![w.teacher.id], |r| r.get(0)).unwrap();
+        let told: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE user_id = ?1 AND kind = 'content_auto_hidden'", params![w.teacher.id], |r| r.get(0)).unwrap();
         assert_eq!(told, 2);
         // a closed exam is not hidden a second time by a fourth report
         create_report(&w.conn, &w.students[3], &rep("assessment", "e-sat")).unwrap();
@@ -883,8 +902,8 @@ mod tests {
     fn deletion_impact_counts_only_the_callers_own_rows() {
         let w = world();
         let other = insert_test_user(&w.conn, "t2@x.com", "teacher", "active");
-        w.conn.execute("INSERT INTO posts VALUES ('p-other', ?1, 's1', 'article', 'منشور', 'نص', 'draft', NULL, 0, 0)", params![other.id]).unwrap();
-        w.conn.execute("INSERT INTO courses VALUES ('c-other', ?1, 's1', 'دورة', NULL, 'draft', 0, 0)", params![other.id]).unwrap();
+        w.conn.execute("INSERT INTO posts VALUES ('p-other', ?1, 's1', 'article', 'منشور', 'نص', 'draft', NULL, 0, 0, NULL)", params![other.id]).unwrap();
+        w.conn.execute("INSERT INTO courses VALUES ('c-other', ?1, 's1', 'دورة', NULL, 'draft', 0, 0, NULL)", params![other.id]).unwrap();
         exam_of(&w.conn, "e1", Some(&w.teacher));
         exam_of(&w.conn, "e2", Some(&w.teacher));
         exam_of(&w.conn, "e-other", Some(&other));
@@ -956,8 +975,8 @@ mod tests {
         let w = world();
         let (s0, s1, s2) = (&w.students[0], &w.students[1], &w.students[2]);
         let other = insert_test_user(&w.conn, "t2@x.com", "teacher", "active");
-        w.conn.execute("INSERT INTO posts VALUES ('p2', ?1, 's1', 'article', 'منشور آخر', 'نص', 'published', NULL, 0, 0)", params![other.id]).unwrap();
-        w.conn.execute("INSERT INTO courses VALUES ('c2', ?1, 's1', 'دورة أخرى', NULL, 'published', 0, 0)", params![other.id]).unwrap();
+        w.conn.execute("INSERT INTO posts VALUES ('p2', ?1, 's1', 'article', 'منشور آخر', 'نص', 'published', NULL, 0, 0, NULL)", params![other.id]).unwrap();
+        w.conn.execute("INSERT INTO courses VALUES ('c2', ?1, 's1', 'دورة أخرى', NULL, 'published', 0, 0, NULL)", params![other.id]).unwrap();
         exam_of(&w.conn, "e1", Some(&w.teacher));
         exam_of(&w.conn, "e2", Some(&other));
         w.conn.execute(
@@ -992,6 +1011,41 @@ mod tests {
                  OR (r.target_type = 'teacher' AND NOT EXISTS(SELECT 1 FROM users WHERE id = r.target_id))"),
             0
         );
+    }
+
+    /// The notice a teacher got for a review (`platform_engage::upsert_review` writes it: the quoted comment and the review's id).
+    fn review_notice(conn: &Connection, to: &User, review_id: &str, comment: &str) {
+        conn.execute(
+            "INSERT INTO notifications(id, user_id, kind, data, link, created_at) VALUES (?1,?2,'new_review',?3,'/platform/courses/c1',1)",
+            params![format!("n-{review_id}"), to.id, serde_json::json!({ "rating": 5, "target": "course", "title": "دورة", "comment": comment, "review": review_id }).to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_quoted_comment_of_a_review_goes_with_the_review_when_its_author_or_its_course_is_deleted() {
+        let w = world();
+        let (author, other) = (&w.students[0], &w.students[1]);
+        review(&w.conn, "r-mine", author, "course", "c1");
+        review(&w.conn, "r-theirs", other, "course", "c1");
+        review_notice(&w.conn, &w.teacher, "r-mine", "تعليق شخصي");
+        review_notice(&w.conn, &w.teacher, "r-theirs", "تعليق آخر");
+        w.conn.execute("UPDATE notifications SET read_at = 5 WHERE id = 'n-r-mine'", []).unwrap(); // a READ notice keeps the text too
+        // a notice from before the link existed has no review id and is left alone
+        w.conn.execute("INSERT INTO notifications(id, user_id, kind, data, created_at) VALUES ('old', ?1, 'new_review', '{\"rating\":4,\"target\":\"teacher\"}', 1)", params![w.teacher.id]).unwrap();
+        let left = |w: &W| -> Vec<String> {
+            w.conn.prepare("SELECT id FROM notifications WHERE kind = 'new_review' ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(left(&w).len(), 3);
+        // the author's account goes: their review, and what the teacher was told about it, go with it
+        delete_account(&w.conn, author).unwrap();
+        assert_eq!(left(&w), ["n-r-theirs", "old"]);
+        // the course goes: the other student's review does, and so does the quote
+        let tx = w.conn.unchecked_transaction().unwrap();
+        purge_target_references(&tx, "course", "c1").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(n(&w.conn, "SELECT count(*) FROM reviews WHERE target_id = 'c1'"), 0);
+        assert_eq!(left(&w), ["old"]);
     }
 
     #[test]
@@ -1135,5 +1189,46 @@ mod tests {
             assert_eq!(purge_target_references(&w.conn, unknown, "x").unwrap_err().0, StatusCode::BAD_REQUEST, "{unknown:?}");
         }
         purge_target_references(&w.conn, "live", "nothing").unwrap(); // nothing to remove is fine
+    }
+
+    // ───── phase 3-4: `content_auto_hidden` is not `content_unpublished` ─────
+
+    #[test]
+    fn auto_hide_tells_the_owner_content_auto_hidden_for_every_kind_and_never_content_unpublished() {
+        let w = world();
+        exam_of(&w.conn, "e1", Some(&w.teacher));
+        w.conn.execute("INSERT INTO live_sessions VALUES ('l1', ?1, 's1', 'بث مباشر', NULL, ?2, 60, 'https://meet.example.com/x', 'scheduled', 0)", params![w.teacher.id, now_ms() + 3_600_000]).unwrap();
+        w.conn.execute("INSERT INTO subject_enrollments VALUES (?1, 's1', 0)", params![w.students[3].id]).unwrap();
+        for (kind, id) in [("post", "p1"), ("course", "c1"), ("live", "l1"), ("assessment", "e1")] {
+            for s in &w.students[..3] {
+                create_report(&w.conn, s, &rep(kind, id)).unwrap();
+            }
+        }
+        let mine = |kind: &str| -> Vec<(String, String)> {
+            w.conn
+                .prepare("SELECT data, link FROM notifications WHERE user_id = ?1 AND kind = ?2 ORDER BY link")
+                .unwrap()
+                .query_map(params![w.teacher.id, kind], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let hidden = mine("content_auto_hidden");
+        assert_eq!(hidden.len(), 4, "one per piece of content that went down: {hidden:?}");
+        let links: Vec<&str> = hidden.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(links, ["/platform/assessments/e1", "/platform/courses/c1", "/platform/posts/p1", "/platform/subjects/s1"], "the link of each target is the one it always had");
+        for (data, _) in &hidden {
+            let d: serde_json::Value = serde_json::from_str(data).unwrap();
+            assert_eq!(d.as_object().unwrap().keys().collect::<Vec<_>>(), ["title"], "just the title");
+        }
+        assert!(mine("content_unpublished").is_empty(), "that kind is for an admin doing it by hand");
+        // the exam still closes / drafts exactly as before
+        assert_eq!(status_of_exam(&w.conn, "e1").0, "draft");
+        // a cancelled live session is cancelled for the people who were going to join as well - not for its teacher
+        let (told, title): (i64, String) = w.conn.query_row("SELECT count(*), max(data) FROM notifications WHERE user_id = ?1 AND kind = 'live_cancelled'", params![w.students[3].id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(told, 1);
+        let d: serde_json::Value = serde_json::from_str(&title).unwrap();
+        assert_eq!((d["title"].as_str(), d["teacher"].as_str()), (Some("بث مباشر"), Some("د. خالد البرمجي")));
+        assert_eq!(n(&w.conn, &format!("SELECT count(*) FROM notifications WHERE user_id = '{}' AND kind = 'live_cancelled'", w.teacher.id)), 0);
     }
 }

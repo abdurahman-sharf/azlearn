@@ -1,11 +1,14 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePracticeStore } from '@/stores/practice'
 import { useI18nStore } from '@/stores/i18n'
-import { usePt, platformErrorMessage } from '@/i18n/platform'
-import { getAttempt, gradeAttempt, type AttemptResult } from '@/api/platformExams'
+import { usePt, platformErrorMessage, gradingErrorMessage } from '@/i18n/platform'
+import { getAttempt, gradeAttempt, type AttemptResult, type ItemResult } from '@/api/platformExams'
+import GradeInput from '@/components/platform/GradeInput.vue'
+import { fillTemplate } from '@/utils/notificationText'
+import { buildItems, mergeSheet, sheetFromAttempt, toAttemptBody, validateItems, type CellMap, type GradeCell, type ServerMap } from '@/utils/gradeSheet'
 import type { Question, QuestionType } from '@exameow/shared'
 
 const pt = usePt()
@@ -19,28 +22,60 @@ const id = route.params.id as string
 const r = ref<AttemptResult | null>(null)
 const error = ref('')
 const msg = ref('')
-const grades = ref<Record<string, number>>({})
+const saving = ref(false)
 const LABELS = 'ABCDEFGHIJ'.split('')
 
 const isGrader = computed(() => auth.role === 'teacher' || auth.role === 'admin')
-const pendingItems = computed(() => r.value?.items?.filter(i => i.correct === null) ?? [])
+const fmt = (ms: number) => new Date(ms).toLocaleString(i18n.locale === 'ar' ? 'ar' : undefined, { dateStyle: 'medium', timeStyle: 'short' })
+
+// A grader can write points and a comment on EVERY written answer of the attempt, also on one that was graded already
+// (a correction). `state` holds what is typed, `base` what the server has; only the differences are sent.
+const state = reactive<CellMap>(new Map())
+const base = reactive<ServerMap>(new Map())
+const changes = computed(() => buildItems(state, base))
+/** Written, non-blank, counted answers: the only ones the server accepts a grade or a comment for (anything else is `not_gradable`). */
+const editable = (it: ItemResult): boolean =>
+  isGrader.value && it.type === 'short_answer' && it.max > 0 && (it.your_answer ?? '').trim() !== ''
+/** "Graded by Sara on 3 May": the grader's name may be gone (a deleted account), the time stays. */
+const gradedBy = (it: ItemResult): string =>
+  it.graded_by_name ? fillTemplate(pt('gdGradedBy'), { name: it.graded_by_name, date: fmt(it.graded_at ?? 0) }) : fillTemplate(pt('gdGradedAt'), { date: fmt(it.graded_at ?? 0) })
+const editableItems = computed(() => r.value?.items?.filter(editable) ?? [])
+const hasGraded = computed(() => editableItems.value.some((it) => it.correct !== null))
+const cellOf = (qid: string): GradeCell => state.get(qid)?.get(r.value?.attempt_id ?? '') ?? { points: '', feedback: '' }
+const setCell = (qid: string, v: GradeCell) => { state.get(qid)?.set(r.value?.attempt_id ?? '', v) }
+
+function seed(res: AttemptResult) {
+  state.clear()
+  base.clear()
+  if (res.items) mergeSheet(state, base, sheetFromAttempt(res.attempt_id, res.items.filter(editable)))
+}
 
 async function load() {
   try {
     r.value = await getAttempt(id)
+    seed(r.value)
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
   }
 }
 
 async function saveGrades() {
+  if (saving.value || !r.value) return
   error.value = ''
-  const payload = Object.fromEntries(Object.entries(grades.value).filter(([, v]) => v !== undefined && !Number.isNaN(v)))
+  msg.value = ''
+  const list = changes.value
+  if (!list.length) { error.value = pt('gdNothingToSave'); return }
+  const bad = validateItems(list, base)
+  if (bad) { error.value = bad.code === 'points' ? pt('gdBadPoints') : pt('gdFeedbackTooLong'); return }
+  saving.value = true
   try {
-    r.value = await gradeAttempt(id, payload)
-    grades.value = {}
+    r.value = await gradeAttempt(id, toAttemptBody(list))
+    seed(r.value)
+    msg.value = pt('gdSaved')
   } catch (e) {
-    error.value = platformErrorMessage(pt, e)
+    error.value = gradingErrorMessage(pt, e)
+  } finally {
+    saving.value = false
   }
 }
 
@@ -89,8 +124,8 @@ onMounted(load)
       <div v-else>{{ pt('expiredAttempt') }}</div>
     </div>
 
-    <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
-    <p v-if="msg" class="text-body-sm mb-3" role="status">{{ msg }}</p>
+    <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))" data-testid="attempt-error">{{ error }}</p>
+    <p v-if="msg" class="text-body-sm mb-3" role="status" data-testid="attempt-notice">{{ msg }}</p>
     <p v-if="!r.items && r.status === 'submitted' && r.released" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))">{{ pt('answersHidden') }}</p>
 
     <button v-if="r.items && auth.role === 'student'" class="btn-tonal mb-4" @click="practiceThese">{{ pt('practiceThese') }}</button>
@@ -100,7 +135,7 @@ onMounted(load)
         <div class="flex items-start gap-2">
           <span class="font-bold">{{ i + 1 }}.</span>
           <p class="flex-1 whitespace-pre-wrap break-words" dir="auto">{{ it.stem }}</p>
-          <span class="shrink-0 font-bold" :style="{ color: it.correct === true ? 'rgb(var(--md-primary))' : it.correct === false ? 'rgb(var(--md-error))' : undefined }">
+          <span class="shrink-0 font-bold" :style="{ color: it.correct === true ? 'rgb(var(--azl-success-text, var(--md-primary)))' : it.correct === false ? 'rgb(var(--md-error))' : undefined }">
             <span v-if="it.max === 0" data-testid="item-voided">⊘ {{ pt('keyVoided') }}</span>
             <span v-else dir="ltr" class="inline-block">{{ it.correct === true ? '✓' : it.correct === false ? '✗' : '…' }} {{ it.points }}/{{ it.max }}</span>
           </span>
@@ -111,14 +146,21 @@ onMounted(load)
         <div class="text-body-sm"><span class="font-semibold">{{ pt('yourAnswer') }}:</span> <span dir="auto" class="whitespace-pre-wrap break-words">{{ show(it.your_answer) }}</span></div>
         <div v-if="it.correct_answer" class="text-body-sm"><span class="font-semibold">{{ pt('correctAnswer') }}:</span> <span dir="auto">{{ it.correct_answer }}</span></div>
         <div v-if="it.analysis" class="text-body-sm"><span class="font-semibold">{{ pt('explanation') }}:</span> <span dir="auto" class="whitespace-pre-wrap break-words">{{ it.analysis }}</span></div>
-        <label v-if="isGrader && it.correct === null" class="block text-body-sm">
-          {{ pt('gradeShort').replace('{max}', String(it.max)) }}
-          <input v-model.number="grades[it.id]" type="number" min="0" :max="it.max" step="0.5" class="input-outlined mt-1 w-full" :data-testid="`grade-${it.id}`" />
-        </label>
+        <div v-if="it.feedback && !editable(it)" class="text-body-sm" data-testid="item-feedback"><span class="font-semibold">{{ pt('gdTeacherFeedback') }}:</span> <span dir="auto" class="whitespace-pre-wrap break-words">{{ it.feedback }}</span></div>
+        <p v-if="isGrader && it.graded_at" class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))" data-testid="item-graded-by">{{ gradedBy(it) }}</p>
+        <GradeInput
+          v-if="editable(it)" :id-prefix="`at-${it.id}`" :max="it.max" :label="`${r.student_name} - ${pt('gdQuestion')} ${i + 1}`"
+          :model-value="cellOf(it.id)" :points-testid="`grade-${it.id}`" :feedback-testid="`grade-feedback-${it.id}`"
+          @update:model-value="setCell(it.id, $event)"
+        />
       </li>
     </ol>
 
-    <button v-if="isGrader && pendingItems.length" class="btn-filled mt-4" data-testid="save-grades" @click="saveGrades">{{ pt('saveGrades') }}</button>
+    <p v-if="isGrader && !r.show_answers && editableItems.length" class="text-body-sm mt-4" data-testid="item-comments-hidden">{{ pt('gdCommentsHidden') }}</p>
+    <p v-if="hasGraded" class="text-body-sm mt-4" style="color: rgb(var(--md-on-surface-variant))" data-testid="correction-hint">{{ pt('gdCorrectionHint') }}</p>
+    <button v-if="editableItems.length" class="btn-filled mt-4" :disabled="saving" data-testid="save-grades" @click="saveGrades">
+      {{ saving ? pt('gdSaving') : pt('saveGrades') }}<template v-if="changes.length && !saving"> <span dir="ltr" class="inline-block">({{ changes.length }})</span></template>
+    </button>
   </div>
   <div v-else-if="error" class="max-w-3xl mx-auto">
     <h1 class="sr-only">{{ pt('attemptPageTitle') }}</h1>

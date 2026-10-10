@@ -735,11 +735,18 @@ fn enroll(conn: &Connection, student: &User, subject_id: &str) -> Res<()> {
     if active != Some(true) {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
-    conn.execute(
-        "INSERT OR IGNORE INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1, ?2, ?3)",
-        params![student.id, subject_id, now_ms()],
-    )
-    .map_err(db_err)?;
+    let now = now_ms();
+    let added = conn
+        .execute(
+            "INSERT OR IGNORE INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1, ?2, ?3)",
+            params![student.id, subject_id, now],
+        )
+        .map_err(db_err)?;
+    // Only a NEW enrolment is news for the subject's teachers (enrolling again changes nothing). The enrolment is
+    // already stored: a notice that cannot be written must not turn it into an error.
+    if added == 1 {
+        let _ = crate::platform_engage::tell_new_enrollment(conn, subject_id, now);
+    }
     Ok(())
 }
 
@@ -778,11 +785,16 @@ fn follow(conn: &Connection, student: &User, teacher_id: &str) -> Res<()> {
     if !is_teacher {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
-    conn.execute(
-        "INSERT OR IGNORE INTO teacher_follows(student_id, teacher_id, created_at) VALUES (?1, ?2, ?3)",
-        params![student.id, teacher_id, now_ms()],
-    )
-    .map_err(db_err)?;
+    let now = now_ms();
+    let added = conn
+        .execute(
+            "INSERT OR IGNORE INTO teacher_follows(student_id, teacher_id, created_at) VALUES (?1, ?2, ?3)",
+            params![student.id, teacher_id, now],
+        )
+        .map_err(db_err)?;
+    if added == 1 {
+        let _ = crate::platform_engage::tell_new_follower(conn, teacher_id, now);
+    }
     Ok(())
 }
 
@@ -1194,7 +1206,7 @@ mod tests {
         assert_eq!(crate::platform::ensure_role(after, "teacher").unwrap_err().0, StatusCode::FORBIDDEN);
 
         // content of a pending teacher stays invisible even with an approved assignment: posts and exams alike
-        conn.execute("INSERT INTO posts VALUES ('p1', ?1, 's1', 'article', 'منشور', 'نص', 'published', NULL, 0, 0)", params![pending.id]).unwrap();
+        conn.execute("INSERT INTO posts VALUES ('p1', ?1, 's1', 'article', 'منشور', 'نص', 'published', NULL, 0, 0, NULL)", params![pending.id]).unwrap();
         conn.execute(
             "INSERT INTO assessments(id,teacher_id,subject_id,title,questions,question_count,total_points,status,created_at,updated_at) VALUES ('e1',?1,'s1','امتحان','[]',1,1,'published',0,0)",
             params![pending.id],
@@ -1359,7 +1371,7 @@ mod tests {
     }
 
     fn put_post(conn: &Connection, id: &str, teacher: &User, subject: &str, status: &str) {
-        raw_item(conn, "INSERT INTO posts VALUES (?1, ?2, ?3, 'article', 'منشور', 'نص', ?4, NULL, 0, 0)", &[&id, &teacher.id, &subject, &status]);
+        raw_item(conn, "INSERT INTO posts VALUES (?1, ?2, ?3, 'article', 'منشور', 'نص', ?4, NULL, 0, 0, NULL)", &[&id, &teacher.id, &subject, &status]);
     }
 
     fn put_course(conn: &Connection, id: &str, teacher: &User, subject: &str, status: &str) {
@@ -1793,5 +1805,187 @@ mod tests {
         assert_eq!(unit_path(&conn, Some("d1".into())).unwrap(), ["كلية الحاسوب"]);
         assert!(unit_path(&conn, None).unwrap().is_empty());
         assert!(unit_path(&conn, Some("gone".into())).unwrap().is_empty());
+    }
+
+    // ───── phase 3-4: teachers hear about new students and followers (coalesced, anonymous) ─────
+
+    /// (data, link, read, created_at) of `kind` notices of `user`, oldest first.
+    fn notices(conn: &Connection, user: &User, kind: &str) -> Vec<(serde_json::Value, String, bool, i64)> {
+        conn.prepare("SELECT data, link, read_at, created_at FROM notifications WHERE user_id = ?1 AND kind = ?2 ORDER BY rowid")
+            .unwrap()
+            .query_map(params![user.id, kind], |r| Ok((serde_json::from_str(&r.get::<_, String>(0)?).unwrap(), r.get(1)?, r.get::<_, Option<i64>>(2)?.is_some(), r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn approve_for(conn: &Connection, t: &User, subject: &str, status: &str) {
+        conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,?2,?3,0,0)", params![t.id, subject, status]).unwrap();
+    }
+
+    #[test]
+    fn a_new_enrolment_tells_the_approved_active_teachers_once_per_subject_without_naming_the_student() {
+        let conn = create_test_db();
+        let (s1, s2) = seed(&conn);
+        conn.execute("INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES ('s3','i1','شبكات',1,0)", []).unwrap();
+        let t1 = insert_test_user(&conn, "t1@x.com", "teacher", "active");
+        let t2 = insert_test_user(&conn, "t2@x.com", "teacher", "active");
+        let (pending, rejected, suspended, elsewhere) = (
+            insert_test_user(&conn, "t3@x.com", "teacher", "active"),
+            insert_test_user(&conn, "t4@x.com", "teacher", "active"),
+            insert_test_user(&conn, "t5@x.com", "teacher", "suspended"),
+            insert_test_user(&conn, "t6@x.com", "teacher", "active"),
+        );
+        approve_for(&conn, &t1, &s1, "approved");
+        approve_for(&conn, &t2, &s1, "approved");
+        approve_for(&conn, &pending, &s1, "pending");
+        approve_for(&conn, &rejected, &s1, "rejected");
+        approve_for(&conn, &suspended, &s1, "approved");
+        approve_for(&conn, &elsewhere, "s3", "approved");
+        approve_for(&conn, &t1, "s3", "approved");
+        let (a, b, c) = (insert_test_user(&conn, "sara.private@x.com", "student", "active"), insert_test_user(&conn, "b@x.com", "student", "active"), insert_test_user(&conn, "c@x.com", "student", "active"));
+        conn.execute("UPDATE users SET full_name = 'سارة الشريف' WHERE id = ?1", params![a.id]).unwrap();
+        let unread = |t: &User| notices(&conn, t, "new_enrollment");
+        // `since` is the moment the notice began (the count is derived from it); the rest of the data is the contract
+        let no_since = |v: &serde_json::Value| {
+            let mut v = v.clone();
+            assert!(v["since"].is_i64(), "{v}");
+            v.as_object_mut().unwrap().remove("since");
+            v
+        };
+
+        enroll(&conn, &a, &s1).unwrap();
+        for t in [&t1, &t2] {
+            let n = unread(t);
+            assert_eq!(n.len(), 1, "{}", t.email);
+            assert_eq!((no_since(&n[0].0), n[0].1.as_str(), n[0].2), (serde_json::json!({"subject": "برمجة", "count": 1}), "/platform/subjects/s1", false));
+        }
+        for t in [&pending, &rejected, &suspended, &elsewhere, &a] {
+            assert!(unread(t).is_empty(), "{} must not be told", t.email);
+        }
+        // the second student folds into the SAME unread notice: count 2, moved to the top
+        conn.execute("UPDATE notifications SET created_at = 5", []).unwrap();
+        enroll(&conn, &b, &s1).unwrap();
+        let n = unread(&t1);
+        assert_eq!((n.len(), n[0].0["count"].as_i64()), (1, Some(2)));
+        assert!(n[0].3 > 5, "moved to the top (created_at updated in place)");
+        // enrolling again changes nothing: no new notice, no count
+        enroll(&conn, &a, &s1).unwrap();
+        assert_eq!(unread(&t1)[0].0["count"].as_i64(), Some(2), "INSERT OR IGNORE did nothing, so nobody is told");
+        // privacy: nothing about who it was is stored anywhere in the notifications
+        let all: String = conn.query_row("SELECT group_concat(data || link, ' ') FROM notifications", [], |r| r.get(0)).unwrap();
+        for secret in ["سارة", "الشريف", "sara.private", "@x.com", a.id.as_str(), b.id.as_str()] {
+            assert!(!all.contains(secret), "{secret:?} leaked into {all}");
+        }
+        assert_eq!(unread(&t1)[0].0.as_object().unwrap().keys().collect::<Vec<_>>(), ["count", "since", "subject"]);
+        // once read, the next enrolment starts a fresh notice; the unread one of the other teacher keeps counting
+        conn.execute("UPDATE notifications SET read_at = 9 WHERE user_id = ?1", params![t1.id]).unwrap();
+        enroll(&conn, &c, &s1).unwrap();
+        let n = unread(&t1);
+        assert_eq!((n.len(), n[0].2, n[1].2, n[1].0["count"].as_i64()), (2, true, false, Some(1)), "the read one is history");
+        assert_eq!(unread(&t2).len(), 1);
+        assert_eq!(unread(&t2)[0].0["count"].as_i64(), Some(3));
+        // another subject is another notice; a closed subject is a 404 and tells nobody
+        enroll(&conn, &a, "s3").unwrap();
+        assert_eq!((unread(&t1).len(), unread(&elsewhere).len()), (3, 1));
+        assert_eq!(enroll(&conn, &a, &s2).unwrap_err().0, StatusCode::NOT_FOUND);
+        // leaving and coming back is the same student: the count follows who is enrolled, not how often they pressed the button
+        let (before, at) = (unread(&t2)[0].0.clone(), unread(&t2)[0].3);
+        conn.execute("DELETE FROM subject_enrollments WHERE student_id = ?1 AND subject_id = ?2", params![b.id, s1]).unwrap();
+        enroll(&conn, &b, &s1).unwrap();
+        let n = unread(&t2);
+        assert_eq!((n.len(), n[0].0.clone(), n[0].3), (1, before, at), "still 3, and not moved up either: nothing new happened");
+    }
+
+    #[test]
+    fn a_student_who_leaves_and_joins_again_does_not_inflate_the_count() {
+        let conn = create_test_db();
+        let (s1, _) = seed(&conn);
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        approve_for(&conn, &t, &s1, "approved");
+        let (a, b) = (insert_test_user(&conn, "a@x.com", "student", "active"), insert_test_user(&conn, "b@x.com", "student", "active"));
+        let count = |t: &User| notices(&conn, t, "new_enrollment").last().map(|n| n.0["count"].as_i64().unwrap());
+        // the same student toggling twenty times is one student
+        for _ in 0..20 {
+            enroll(&conn, &a, &s1).unwrap();
+            conn.execute("DELETE FROM subject_enrollments WHERE student_id = ?1", params![a.id]).unwrap();
+        }
+        enroll(&conn, &a, &s1).unwrap();
+        assert_eq!(count(&t), Some(1));
+        // another student joins: 2 - and then toggling again changes nothing
+        enroll(&conn, &b, &s1).unwrap();
+        assert_eq!(count(&t), Some(2));
+        for _ in 0..5 {
+            conn.execute("DELETE FROM subject_enrollments WHERE student_id = ?1", params![b.id]).unwrap();
+            enroll(&conn, &b, &s1).unwrap();
+        }
+        assert_eq!((count(&t), notices(&conn, &t, "new_enrollment").len()), (Some(2), 1));
+        // somebody who left before the next one joined is not counted any more
+        let c = insert_test_user(&conn, "c@x.com", "student", "active");
+        conn.execute("DELETE FROM subject_enrollments WHERE student_id = ?1", params![a.id]).unwrap();
+        enroll(&conn, &c, &s1).unwrap();
+        assert_eq!(count(&t), Some(2), "b and c are enrolled; a left");
+        // enrolments from before the notice began are not part of it (they are made old explicitly: a test runs inside
+        // one millisecond, and the notice's start is inclusive)
+        conn.execute("UPDATE subject_enrollments SET created_at = 1", []).unwrap();
+        conn.execute("UPDATE notifications SET read_at = 9", []).unwrap();
+        let d = insert_test_user(&conn, "d@x.com", "student", "active");
+        enroll(&conn, &d, &s1).unwrap();
+        assert_eq!((count(&t), notices(&conn, &t, "new_enrollment").len()), (Some(1), 2), "a new notice starts from this student, not from the whole class");
+        // a notice written before `since` existed keeps counting events and starts remembering from now
+        conn.execute("UPDATE notifications SET data = '{\"subject\":\"برمجة\",\"count\":4}' WHERE read_at IS NULL", []).unwrap();
+        let e = insert_test_user(&conn, "e@x.com", "student", "active");
+        enroll(&conn, &e, &s1).unwrap();
+        let last = notices(&conn, &t, "new_enrollment").pop().unwrap().0;
+        assert_eq!((last["count"].as_i64(), last["since"].is_i64()), (Some(5), true));
+    }
+
+    #[test]
+    fn a_new_follower_tells_the_teacher_once_anonymously_and_only_for_a_real_new_follow() {
+        let conn = create_test_db();
+        seed(&conn);
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        let pending_t = insert_test_user(&conn, "p@x.com", "teacher", "pending");
+        let (a, b) = (insert_test_user(&conn, "follower.a@x.com", "student", "active"), insert_test_user(&conn, "b@x.com", "student", "active"));
+        conn.execute("UPDATE users SET full_name = 'خالد المتابع' WHERE id = ?1", params![a.id]).unwrap();
+        let unread = |u: &User| notices(&conn, u, "new_follower");
+        follow(&conn, &a, &t.id).unwrap();
+        let n = unread(&t);
+        assert_eq!((n.len(), n[0].0["count"].as_i64(), n[0].0["since"].is_i64(), n[0].1.as_str(), n[0].2), (1, Some(1), true, format!("/platform/teachers/{}", t.id).as_str(), false));
+        assert_eq!(n[0].0.as_object().unwrap().keys().collect::<Vec<_>>(), ["count", "since"], "no name, no id");
+        follow(&conn, &a, &t.id).unwrap(); // again: nothing happened
+        assert_eq!(unread(&t)[0].0["count"].as_i64(), Some(1), "no notice for a follow that was already there");
+        conn.execute("UPDATE notifications SET created_at = 5", []).unwrap();
+        follow(&conn, &b, &t.id).unwrap();
+        let n = unread(&t);
+        assert_eq!((n.len(), n[0].0["count"].as_i64()), (1, Some(2)));
+        assert!(n[0].3 > 5);
+        let all: String = conn.query_row("SELECT group_concat(data || link, ' ') FROM notifications", [], |r| r.get(0)).unwrap();
+        for secret in ["خالد", "المتابع", "follower.a", "@x.com", a.id.as_str(), b.id.as_str()] {
+            assert!(!all.contains(secret), "{secret:?} leaked into {all}");
+        }
+        // read -> the next follow starts over; unfollow + follow is a new follow
+        conn.execute("UPDATE notifications SET read_at = 9", []).unwrap();
+        conn.execute("DELETE FROM teacher_follows WHERE student_id = ?1", params![a.id]).unwrap();
+        follow(&conn, &a, &t.id).unwrap();
+        let n = unread(&t);
+        assert_eq!((n.len(), n[1].0["count"].as_i64(), n[1].2), (2, Some(1), false));
+        // a teacher who cannot be followed is told nothing
+        assert_eq!(follow(&conn, &a, &pending_t.id).unwrap_err().0, StatusCode::NOT_FOUND);
+        assert!(unread(&pending_t).is_empty() && unread(&a).is_empty());
+        // following, unfollowing and following again is one follower, however often it is done (b's follow is made old
+        // explicitly: a test runs inside one millisecond, and the notice's start is inclusive)
+        conn.execute("UPDATE teacher_follows SET created_at = 1 WHERE student_id = ?1", params![b.id]).unwrap();
+        let before = unread(&t)[1].clone();
+        for _ in 0..5 {
+            conn.execute("DELETE FROM teacher_follows WHERE student_id = ?1", params![a.id]).unwrap();
+            follow(&conn, &a, &t.id).unwrap();
+        }
+        let n = unread(&t);
+        assert_eq!((n.len(), n[1].0.clone(), n[1].3), (2, before.0, before.3), "count 1 and not moved");
+        let c = insert_test_user(&conn, "c@x.com", "student", "active");
+        follow(&conn, &c, &t.id).unwrap();
+        let n = unread(&t);
+        assert_eq!(n[1].0["count"].as_i64(), Some(2), "a second person is counted");
     }
 }

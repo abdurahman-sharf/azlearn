@@ -34,6 +34,11 @@ export interface StartRes {
 export interface ItemResult {
   id: string; type: string; stem: string; options: string[]; your_answer: string | null
   correct: boolean | null; points: number; max: number; correct_answer: string | null; analysis: string | null
+  /** the grader's comment on a written answer (the attempt's own student sees it once the result is released) */
+  feedback?: string | null
+  /** graders and admins only (null for a student): who wrote the grade, and when */
+  graded_by_name?: string | null
+  graded_at?: number | null
 }
 export interface AttemptResult {
   attempt_id: string; assessment_id: string; title: string; student_name: string
@@ -61,8 +66,9 @@ export const saveAnswers = (id: string, answers: Record<string, string>) => plat
 /** Integrity event; informational only (graders see the count). */
 export const sendAttemptEvent = (id: string, type: 'tab_leave') => platformFetch<void>(`/attempts/${id}/events`, { method: 'POST', body: { type } })
 export const getAttempt = (id: string) => platformFetch<AttemptResult>(`/attempts/${id}`)
-export const gradeAttempt = (id: string, grades: Record<string, number>) =>
-  platformFetch<AttemptResult>(`/attempts/${id}/grade`, { method: 'PATCH', body: { grades } })
+/** Grades and/or comments on the written answers of one attempt, both keyed by question id. */
+export const gradeAttempt = (id: string, body: { grades?: Record<string, number>; feedback?: Record<string, string> }) =>
+  platformFetch<AttemptResult>(`/attempts/${id}/grade`, { method: 'PATCH', body })
 export const assessmentResults = (id: string) => platformFetch<ResultsSummary>(`/assessments/${id}/results`)
 export const subjectAssessments = (id: string) => platformFetch<AssessmentInfo[]>(`/subjects/${id}/assessments`)
 export const myAssessments = () => platformFetch<AssessmentInfo[]>('/assessments/mine')

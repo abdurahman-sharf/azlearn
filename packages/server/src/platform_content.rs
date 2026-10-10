@@ -77,6 +77,22 @@ CREATE TABLE IF NOT EXISTS live_sessions (
 CREATE INDEX IF NOT EXISTS idx_live_subject ON live_sessions(subject_id, starts_at);
 ";
 
+/// Columns added after the first release (phase 3-4): when a post / course was first announced. `NULL` = never announced
+/// (a draft). Idempotent; safe on every start.
+///
+/// Rows that are published already are **back-filled** with `created_at`: they were announced when they were published,
+/// and without a value here unpublishing and publishing one again would announce it a second time. Running the back-fill
+/// at every start (not only when the column is new) also covers a crash between adding the column and filling it; in
+/// steady state it matches nothing, because every path that publishes claims `published_at` (see [`first_publication`]).
+pub fn migrate(conn: &Connection) -> Result<(), String> {
+    for table in ["posts", "courses"] {
+        crate::platform::add_column_if_missing(conn, table, "published_at", "INTEGER")?;
+        conn.execute(&format!("UPDATE {table} SET published_at = created_at WHERE status = 'published' AND published_at IS NULL"), [])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BODY_CHARS: usize = 20_000;
 const MAX_URL_CHARS: usize = 500;
@@ -157,6 +173,17 @@ pub(crate) fn can_publish(conn: &Connection, teacher_id: &str, subject_id: &str)
             "SELECT EXISTS(SELECT 1 FROM teacher_subjects ts JOIN subjects s ON s.id = ts.subject_id
              WHERE ts.teacher_id = ?1 AND ts.subject_id = ?2 AND ts.status = 'approved' AND {SUBJECT_ACTIVE} AND {INSTITUTION_ACTIVE})"
         ),
+        params![teacher_id, subject_id],
+        |r| r.get(0),
+    )
+    .map_err(db_err)
+}
+
+/// The teacher holds an *approved* assignment for the subject - and nothing more (no check that the subject or its
+/// institution is active, which [`can_publish`] adds). For reading things that belong to the class as it is today.
+pub(crate) fn is_approved_for(conn: &Connection, teacher_id: &str, subject_id: &str) -> Res<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM teacher_subjects WHERE teacher_id = ?1 AND subject_id = ?2 AND status = 'approved')",
         params![teacher_id, subject_id],
         |r| r.get(0),
     )
@@ -298,7 +325,14 @@ fn scope_id<'a>(scope: Scope<'a>) -> &'a str {
     }
 }
 
-/// Tells followers/enrolled students about new content (only on first publication).
+/// Claims the ONE announcement of a post or course: `published_at` is set with a conditional update and never
+/// overwritten, so unpublishing and publishing again (or any later save) does not tell every follower a second time -
+/// the same rule as for exams (`platform_exams::announce`). `table` is always a literal of this module.
+fn first_publication(conn: &Connection, table: &str, id: &str, now: i64) -> bool {
+    conn.execute(&format!("UPDATE {table} SET published_at = ?2 WHERE id = ?1 AND published_at IS NULL"), params![id, now]).map_or(false, |n| n == 1)
+}
+
+/// Tells followers/enrolled students about new content (callers announce only on the first publication).
 fn announce(conn: &Connection, teacher: &User, subject_id: &str, kind: &str, title: &str, link: &str) {
     crate::platform_engage::notify_audience(
         conn,
@@ -308,6 +342,11 @@ fn announce(conn: &Connection, teacher: &User, subject_id: &str, kind: &str, tit
         serde_json::json!({ "title": title, "teacher": teacher.full_name }),
         link,
     );
+}
+
+/// The owner of a piece of content as the `teacher` of [`announce`], for when somebody else (an admin) is the one acting.
+fn owner_user(id: &str, full_name: &str) -> User {
+    User { id: id.to_string(), email: String::new(), full_name: full_name.to_string(), role: "teacher".into(), institution_type: None, status: "active".into(), status_reason: None }
 }
 
 /// Moderation by someone other than the owner: tell the owner.
@@ -451,7 +490,7 @@ fn create_post(conn: &Connection, user: &User, r: &PostReq) -> Res<Post> {
         params![id, user.id, subject_id, kind, title, body, status, now],
     )
     .map_err(db_err)?;
-    if status == "published" {
+    if status == "published" && first_publication(conn, "posts", &id, now) {
         announce(conn, user, subject_id, "new_post", &title, &format!("/platform/posts/{id}"));
     }
     get_post(conn, &id)
@@ -487,8 +526,11 @@ fn update_post(conn: &Connection, user: &User, id: &str, r: &PostReq) -> Res<Pos
         if status == "draft" && cur.status == "published" {
             tell_owner_moderated(conn, &owner, &title, &format!("/platform/posts/{id}"));
         }
-    } else if status == "published" && cur.status != "published" {
-        announce(conn, user, &cur.subject_id, "new_post", &title, &format!("/platform/posts/{id}"));
+    }
+    // The first publication is announced once, whoever makes it (the owner, or an admin publishing the owner's draft):
+    // every path that publishes claims `published_at`, so the announcement can neither be repeated nor skipped.
+    if status == "published" && cur.status != "published" && first_publication(conn, "posts", id, now_ms()) {
+        announce(conn, &owner_user(&owner, &cur.teacher_name), &cur.subject_id, "new_post", &title, &format!("/platform/posts/{id}"));
     }
     get_post(conn, id)
 }
@@ -902,8 +944,10 @@ fn update_course(conn: &Connection, user: &User, id: &str, r: &CourseReq) -> Res
         if status == "draft" && cur.status == "published" {
             tell_owner_moderated(conn, &owner, &title, &format!("/platform/courses/{id}"));
         }
-    } else if status == "published" && cur.status != "published" {
-        announce(conn, user, &cur.subject_id, "new_course", &title, &format!("/platform/courses/{id}"));
+    }
+    // announced once on the first publication, by whoever makes it (see `update_post`)
+    if status == "published" && cur.status != "published" && first_publication(conn, "courses", id, now_ms()) {
+        announce(conn, &owner_user(&owner, &cur.teacher_name), &cur.subject_id, "new_course", &title, &format!("/platform/courses/{id}"));
     }
     get_course(conn, id)
 }
@@ -1250,7 +1294,7 @@ fn update_live(conn: &Connection, user: &User, id: &str, r: &LiveReq) -> Res<Liv
     let owner = can_manage(conn, "live_sessions", id, user)?;
     admin_only_status(user, &owner, r.title.is_some() || r.description.is_some() || r.starts_at.is_some() || r.duration_min.is_some() || r.join_url.is_some())?;
     let cur = get_live(conn, id)?;
-    let (cur_status, cur_subject, cur_teacher) = (cur.status.clone(), cur.subject_id.clone(), cur.teacher_name.clone());
+    let (cur_status, cur_subject, cur_teacher, cur_starts_at, cur_url) = (cur.status.clone(), cur.subject_id.clone(), cur.teacher_name.clone(), cur.starts_at, cur.join_url.clone());
     let title = match &r.title {
         Some(t) => text(t, 200, "invalid_title")?,
         None => cur.title,
@@ -1285,9 +1329,31 @@ fn update_live(conn: &Connection, user: &User, id: &str, r: &LiveReq) -> Res<Liv
             tell_owner_moderated(conn, &owner, &title, &format!("/platform/subjects/{}", cur_subject));
         }
     }
-    if status == "cancelled" && cur_status == "scheduled" {
-        let teacher = User { id: owner.clone(), email: String::new(), full_name: cur_teacher, role: "teacher".into(), institution_type: None, status: "active".into(), status_reason: None };
-        announce(conn, &teacher, &cur_subject, "live_cancelled", &title, &format!("/platform/subjects/{cur_subject}"));
+    let teacher = owner_user(&owner, &cur_teacher);
+    let link = format!("/platform/subjects/{cur_subject}");
+    let over = starts_at + duration * 60_000 <= now_ms(); // nothing to tell about a session that is already over
+    // The audience is told only about a session they can see (published by a teacher in good standing, subject and
+    // institution active): the owner may still edit a hidden session after the approval went away, and that must not
+    // become a way to broadcast to its students and followers. Checked after the update, against the new state.
+    let shown = visible_to_public(conn, "live_sessions", "l", id, &status)?;
+    if !shown {
+        // nothing to announce
+    } else if status == "cancelled" && cur_status == "scheduled" {
+        announce(conn, &teacher, &cur_subject, "live_cancelled", &title, &link);
+    } else if status == "scheduled" && cur_status == "cancelled" && !over {
+        // back on: told like a new session (it is one again)
+        announce(conn, &teacher, &cur_subject, "live_scheduled", &title, &link);
+    } else if status == "scheduled" && cur_status == "scheduled" && !over && (starts_at != cur_starts_at || url != cur_url) {
+        // The time or the link of a session students may be planning to join moved: once per save, to the same audience.
+        // A new title or description alone is not worth a notice.
+        crate::platform_engage::notify_audience(
+            conn,
+            &owner,
+            &cur_subject,
+            "live_updated",
+            serde_json::json!({ "title": title, "teacher": teacher.full_name, "starts_at": starts_at }),
+            &link,
+        );
     }
     get_live(conn, id)
 }
@@ -2430,5 +2496,270 @@ mod tests {
             assert_eq!(get_my_live(&w.conn, who, "l1", now).unwrap_err().0, StatusCode::FORBIDDEN, "{}", who.role);
         }
         assert_eq!(get_my_live(&w.conn, &w.teacher, "nope", now).unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
+    // ───── phase 3-4: announce once, live changes, back-fill ─────
+
+    fn count_kind(conn: &Connection, user: &str, kind: &str) -> i64 {
+        conn.query_row("SELECT count(*) FROM notifications WHERE user_id = ?1 AND kind = ?2", params![user, kind], |r| r.get(0)).unwrap()
+    }
+
+    fn stamp(conn: &Connection, table: &str, id: &str) -> Option<i64> {
+        conn.query_row(&format!("SELECT published_at FROM {table} WHERE id = ?1"), params![id], |r| r.get(0)).unwrap()
+    }
+
+    fn status_req(status: &str) -> PostReq {
+        PostReq { subject_id: None, kind: None, title: None, body: None, status: Some(status.into()) }
+    }
+
+    #[test]
+    fn a_post_is_announced_once_however_often_it_goes_back_to_a_draft_and_out_again() {
+        let w = world();
+        let told = || count_kind(&w.conn, &w.student.id, "new_post");
+        let p = create_post(&w.conn, &w.teacher, &post_req(&w, "draft")).unwrap();
+        assert_eq!((told(), stamp(&w.conn, "posts", &p.id)), (0, None), "a draft is not announced and has no publication time");
+        update_post(&w.conn, &w.teacher, &p.id, &status_req("published")).unwrap();
+        let first = stamp(&w.conn, "posts", &p.id).expect("claimed by the first publication");
+        assert_eq!(told(), 1);
+        for round in 0..3 {
+            update_post(&w.conn, &w.teacher, &p.id, &status_req("draft")).unwrap();
+            assert_eq!(stamp(&w.conn, "posts", &p.id), Some(first), "round {round}: unpublishing keeps the time");
+            update_post(&w.conn, &w.teacher, &p.id, &status_req("published")).unwrap();
+            assert_eq!((told(), stamp(&w.conn, "posts", &p.id)), (1, Some(first)), "round {round}: publishing again announces nothing and keeps the first time");
+        }
+        // a save that leaves it published is not a publication either
+        update_post(&w.conn, &w.teacher, &p.id, &PostReq { subject_id: None, kind: None, title: Some("عنوان جديد".into()), body: None, status: None }).unwrap();
+        assert_eq!(told(), 1);
+        // created as published: announced at creation, once
+        let direct = create_post(&w.conn, &w.teacher, &post_req(&w, "published")).unwrap();
+        assert_eq!((told(), stamp(&w.conn, "posts", &direct.id).is_some()), (2, true));
+        // a copy is a new draft with no history: its own first publication announces
+        let copy = duplicate_post(&w.conn, &w.teacher, &p.id, &DuplicateReq::default()).unwrap();
+        assert_eq!((stamp(&w.conn, "posts", &copy.id), told()), (None, 2), "duplicates start without a publication time");
+        update_post(&w.conn, &w.teacher, &copy.id, &status_req("published")).unwrap();
+        assert_eq!((told(), stamp(&w.conn, "posts", &copy.id).is_some()), (3, true));
+    }
+
+    #[test]
+    fn a_course_is_announced_once_too_and_a_copy_starts_over() {
+        let w = world();
+        let told = || count_kind(&w.conn, &w.student.id, "new_course");
+        let c = create_course(&w.conn, &w.teacher, &CourseReq { subject_id: Some("s1".into()), title: Some("دورة".into()), description: None, status: Some("draft".into()) }).unwrap();
+        let id = c.course.id.clone();
+        add_lesson(&w.conn, &w.teacher, &id, &LessonReq { title: Some("درس".into()), description: None, section: None, video_url: Some("https://youtu.be/dQw4w9WgXcQ".into()) }).unwrap();
+        let set = |status: &str| update_course(&w.conn, &w.teacher, &id, &CourseReq { subject_id: None, title: None, description: None, status: Some(status.into()) }).unwrap();
+        assert_eq!((told(), stamp(&w.conn, "courses", &id)), (0, None));
+        set("published");
+        let first = stamp(&w.conn, "courses", &id).expect("claimed");
+        assert_eq!(told(), 1);
+        for _ in 0..3 {
+            set("draft");
+            set("published");
+        }
+        assert_eq!((told(), stamp(&w.conn, "courses", &id)), (1, Some(first)));
+        let copy = duplicate_course(&w.conn, &w.teacher, &id, &DuplicateReq::default()).unwrap();
+        assert_eq!(stamp(&w.conn, "courses", &copy.course.id), None, "a copy starts without a publication time");
+    }
+
+    #[test]
+    fn the_migration_back_fills_published_rows_so_old_content_is_never_announced_again() {
+        // a database written before `published_at` existed (the real v1 dump), upgraded the way the server does it
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        c.execute_batch(include_str!("../tests/fixtures/platform_v1.sql")).unwrap();
+        for t in ["posts", "courses"] {
+            assert!(!crate::platform::column_exists(&c, t, "published_at").unwrap(), "{t}: the fixture predates the column");
+        }
+        crate::platform::apply_schema(&c).unwrap();
+        let get = |sql: &str| -> (i64, Option<i64>) { c.query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap() };
+        let (created, published) = get("SELECT created_at, published_at FROM posts WHERE status = 'published' LIMIT 1");
+        assert_eq!(published, Some(created), "an already published post counts as announced when it was created");
+        let (created, published) = get("SELECT created_at, published_at FROM courses WHERE status = 'published' LIMIT 1");
+        assert_eq!(published, Some(created));
+        // a draft has not been announced; running the migration again changes nothing (idempotent)
+        c.execute("UPDATE posts SET status = 'draft', published_at = NULL", []).unwrap();
+        let before: Vec<Option<i64>> = c.prepare("SELECT published_at FROM courses ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        crate::platform::apply_schema(&c).unwrap();
+        crate::platform::apply_schema(&c).unwrap();
+        let after: Vec<Option<i64>> = c.prepare("SELECT published_at FROM courses ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(before, after);
+        assert_eq!(get("SELECT count(*), max(published_at) FROM posts WHERE status = 'draft'").1, None, "a draft is not back-filled");
+
+        // and the point of it: a legacy published post that is unpublished and published again is NOT announced again
+        let w = world();
+        raw_post(&w.conn, "legacy", &w.teacher.id, "s1", "published", "قديم", 1_000);
+        assert_eq!(stamp(&w.conn, "posts", "legacy"), None, "the legacy state: published, never stamped");
+        migrate(&w.conn).unwrap();
+        assert_eq!(stamp(&w.conn, "posts", "legacy"), Some(1_000));
+        update_post(&w.conn, &w.teacher, "legacy", &status_req("draft")).unwrap();
+        update_post(&w.conn, &w.teacher, "legacy", &status_req("published")).unwrap();
+        assert_eq!(count_kind(&w.conn, &w.student.id, "new_post"), 0, "nobody is told about old content again");
+    }
+
+    fn live_req(f: impl FnOnce(&mut LiveReq)) -> LiveReq {
+        let mut r = LiveReq { subject_id: None, title: None, description: None, starts_at: None, duration_min: None, join_url: None, status: None };
+        f(&mut r);
+        r
+    }
+
+    #[test]
+    fn live_updated_goes_out_only_when_the_time_or_the_link_of_a_scheduled_session_moves() {
+        let w = world();
+        let follower = insert_test_user(&w.conn, "f@x.com", "student", "active");
+        w.conn.execute("INSERT INTO teacher_follows VALUES (?1, ?2, 0)", params![follower.id, w.teacher.id]).unwrap();
+        let now = now_ms();
+        let l = create_live(
+            &w.conn,
+            &w.teacher,
+            &LiveReq { subject_id: Some("s1".into()), title: Some("درس".into()), description: None, starts_at: Some(now + 7_200_000), duration_min: Some(60), join_url: Some("https://meet.example.com/a".into()), status: None },
+        )
+        .unwrap();
+        let updated = |u: &User| count_kind(&w.conn, &u.id, "live_updated");
+        let all = || (updated(&w.student), updated(&follower), updated(&w.teacher));
+        assert_eq!(count_kind(&w.conn, &w.student.id, "live_scheduled"), 1);
+
+        // title, description, duration and an unchanged time/link are not worth a notice
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.title = Some("عنوان آخر".into()))).unwrap();
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.description = Some("وصف".into()))).unwrap();
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.duration_min = Some(90))).unwrap();
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| { r.starts_at = Some(now + 7_200_000); r.join_url = Some("https://meet.example.com/a".into()); })).unwrap();
+        assert_eq!(all(), (0, 0, 0));
+
+        // a new time: once per save, to everyone who would be told about a new session - never the teacher
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.starts_at = Some(now + 10_800_000))).unwrap();
+        assert_eq!(all(), (1, 1, 0));
+        let (data, link): (String, String) = w.conn.query_row("SELECT data, link FROM notifications WHERE user_id = ?1 AND kind = 'live_updated'", params![w.student.id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!((data["title"].as_str(), data["teacher"].as_str(), data["starts_at"].as_i64()), (Some("عنوان آخر"), Some("T"), Some(now + 10_800_000)));
+        assert_eq!(link, "/platform/subjects/s1");
+        // a new link; and both at once is still ONE notice for that save
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.join_url = Some("https://meet.example.com/b".into()))).unwrap();
+        assert_eq!(all(), (2, 2, 0));
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| { r.starts_at = Some(now + 14_400_000); r.join_url = Some("https://meet.example.com/c".into()); })).unwrap();
+        assert_eq!(all(), (3, 3, 0), "one notice per save, not one per field");
+        assert_eq!(count_kind(&w.conn, &w.student.id, "live_scheduled"), 1, "and none of it is announced as a new session");
+    }
+
+    #[test]
+    fn a_cancelled_session_that_comes_back_is_announced_as_scheduled_and_a_finished_one_is_never_re_announced() {
+        let w = world();
+        let now = now_ms();
+        let mk = |start: i64, dur: i64| create_live(&w.conn, &w.teacher, &LiveReq { subject_id: Some("s1".into()), title: Some("درس".into()), description: None, starts_at: Some(start), duration_min: Some(dur), join_url: Some("https://meet.example.com/a".into()), status: None }).unwrap();
+        let l = mk(now + 7_200_000, 60);
+        let n = |kind: &str| count_kind(&w.conn, &w.student.id, kind);
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.status = Some("cancelled".into()))).unwrap();
+        assert_eq!((n("live_cancelled"), n("live_scheduled")), (1, 1));
+        // a link change while it is cancelled concerns nobody
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.join_url = Some("https://meet.example.com/z".into()))).unwrap();
+        assert_eq!(n("live_updated"), 0);
+        // bringing it back is a (re)scheduling, not an update
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.status = Some("scheduled".into()))).unwrap();
+        assert_eq!((n("live_scheduled"), n("live_updated")), (2, 0));
+        // a session that is over: nothing to tell, whatever changes
+        raw_live(&w.conn, "over", &w.teacher.id, "s1", "scheduled", "انتهى", now - 3 * 3_600_000, 60);
+        update_live(&w.conn, &w.teacher, "over", &live_req(|r| r.join_url = Some("https://meet.example.com/q".into()))).unwrap();
+        assert_eq!(n("live_updated"), 0, "a finished session is not announced");
+        // an admin's hand-made cancellation is still `content_unpublished` for the owner (and `live_cancelled` for the audience)
+        update_live(&w.conn, &w.admin, &l.id, &live_req(|r| r.status = Some("cancelled".into()))).unwrap();
+        assert_eq!((count_kind(&w.conn, &w.teacher.id, "content_unpublished"), count_kind(&w.conn, &w.teacher.id, "content_auto_hidden")), (1, 0));
+        assert_eq!(n("live_cancelled"), 2);
+    }
+
+    #[test]
+    fn a_session_students_cannot_see_is_not_announced_whatever_its_owner_changes() {
+        let w = world();
+        let follower = insert_test_user(&w.conn, "f@x.com", "student", "active");
+        w.conn.execute("INSERT INTO teacher_follows VALUES (?1, ?2, 0)", params![follower.id, w.teacher.id]).unwrap();
+        let now = now_ms();
+        let l = create_live(
+            &w.conn,
+            &w.teacher,
+            &LiveReq { subject_id: Some("s1".into()), title: Some("درس".into()), description: None, starts_at: Some(now + 7_200_000), duration_min: Some(60), join_url: Some("https://meet.example.com/a".into()), status: None },
+        )
+        .unwrap();
+        let told = || {
+            ["live_updated", "live_cancelled", "live_scheduled"].map(|k| (count_kind(&w.conn, &w.student.id, k), count_kind(&w.conn, &follower.id, k)))
+        };
+        assert_eq!(told(), [(0, 0), (0, 0), (1, 1)]);
+        let mut hours = 2;
+        let mut move_it = |w: &World| {
+            hours += 1;
+            update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| { r.title = Some(format!("{}", "ع".repeat(200))); r.starts_at = Some(now + hours * 3_600_000); })).unwrap();
+        };
+        // each way the session can stop being shown to students: the owner can still save it, nobody is told
+        let hide: [(&str, &str, &str); 4] = [
+            ("the assignment was revoked", "UPDATE teacher_subjects SET status = 'rejected'", "UPDATE teacher_subjects SET status = 'approved'"),
+            ("the subject is switched off", "UPDATE subjects SET is_active = 0", "UPDATE subjects SET is_active = 1"),
+            ("the institution is switched off", "UPDATE institutions SET is_active = 0", "UPDATE institutions SET is_active = 1"),
+            ("the owner's account is suspended", "UPDATE users SET status = 'suspended' WHERE role = 'teacher'", "UPDATE users SET status = 'active' WHERE role = 'teacher'"),
+        ];
+        for (label, off, on) in hide {
+            w.conn.execute(off, []).unwrap();
+            move_it(&w);
+            assert_eq!(told(), [(0, 0), (0, 0), (1, 1)], "{label}: no 'live_updated' for a session nobody can see");
+            w.conn.execute(on, []).unwrap();
+        }
+        // back in good standing the same kind of save is announced again
+        move_it(&w);
+        assert_eq!(told()[0], (1, 1));
+        // cancelling a hidden session tells nobody either; cancelling a visible one does
+        w.conn.execute("UPDATE subjects SET is_active = 0", []).unwrap();
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.status = Some("cancelled".into()))).unwrap();
+        assert_eq!(told()[1], (0, 0), "cancelled while hidden");
+        w.conn.execute("UPDATE subjects SET is_active = 1", []).unwrap();
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.status = Some("scheduled".into()))).unwrap();
+        assert_eq!(told()[2], (2, 2), "back on in good standing: announced like a new session");
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.status = Some("cancelled".into()))).unwrap();
+        assert_eq!(told()[1], (1, 1));
+        // an admin bringing a suspended teacher's cancelled session back (the assignment is all that is asked of the owner)
+        // does not announce it either: the owner is not in good standing
+        w.conn.execute("UPDATE users SET status = 'suspended' WHERE role = 'teacher'", []).unwrap();
+        update_live(&w.conn, &w.admin, &l.id, &live_req(|r| r.status = Some("scheduled".into()))).unwrap();
+        assert_eq!(told()[2], (2, 2));
+    }
+
+    #[test]
+    fn an_admin_publishing_a_draft_claims_the_announcement_so_it_goes_out_once_and_never_again() {
+        let w = world();
+        // a post
+        let p = create_post(&w.conn, &w.teacher, &post_req(&w, "draft")).unwrap();
+        assert_eq!((stamp(&w.conn, "posts", &p.id), count_kind(&w.conn, &w.student.id, "new_post")), (None, 0));
+        update_post(&w.conn, &w.admin, &p.id, &status_req("published")).unwrap();
+        let first = stamp(&w.conn, "posts", &p.id).expect("the admin's publication claimed it - the invariant holds on this path too");
+        assert_eq!(count_kind(&w.conn, &w.student.id, "new_post"), 1, "announced, as the owner's post");
+        let data: String = w.conn.query_row("SELECT data FROM notifications WHERE kind = 'new_post'", [], |r| r.get(0)).unwrap();
+        assert!(data.contains("\"teacher\":\"T\""), "in the owner's name, not the admin's: {data}");
+        // unpublished by the admin, republished by the owner: not announced a second time
+        update_post(&w.conn, &w.admin, &p.id, &status_req("draft")).unwrap();
+        update_post(&w.conn, &w.teacher, &p.id, &status_req("published")).unwrap();
+        assert_eq!((stamp(&w.conn, "posts", &p.id), count_kind(&w.conn, &w.student.id, "new_post")), (Some(first), 1));
+        // a post the owner published first is not announced again by the admin's later republication
+        let q = create_post(&w.conn, &w.teacher, &post_req(&w, "published")).unwrap();
+        assert_eq!(count_kind(&w.conn, &w.student.id, "new_post"), 2);
+        update_post(&w.conn, &w.admin, &q.id, &status_req("draft")).unwrap();
+        update_post(&w.conn, &w.admin, &q.id, &status_req("published")).unwrap();
+        assert_eq!(count_kind(&w.conn, &w.student.id, "new_post"), 2);
+        // a course
+        let c = create_course(&w.conn, &w.teacher, &CourseReq { subject_id: Some("s1".into()), title: Some("دورة".into()), description: None, status: Some("draft".into()) }).unwrap();
+        add_lesson(&w.conn, &w.teacher, &c.course.id, &LessonReq { title: Some("درس".into()), description: None, section: None, video_url: Some("https://youtu.be/dQw4w9WgXcQ".into()) }).unwrap();
+        let set = |who: &User, status: &str| update_course(&w.conn, who, &c.course.id, &CourseReq { subject_id: None, title: None, description: None, status: Some(status.into()) }).unwrap();
+        set(&w.admin, "published");
+        assert_eq!((stamp(&w.conn, "courses", &c.course.id).is_some(), count_kind(&w.conn, &w.student.id, "new_course")), (true, 1));
+        set(&w.admin, "draft");
+        set(&w.teacher, "published");
+        assert_eq!(count_kind(&w.conn, &w.student.id, "new_course"), 1);
+        // an admin cannot publish into a subject the owner is no longer approved for (unchanged), and nothing is claimed then
+        let r = create_post(&w.conn, &w.teacher, &post_req(&w, "draft")).unwrap();
+        w.conn.execute("UPDATE teacher_subjects SET status = 'rejected'", []).unwrap();
+        assert_eq!(update_post(&w.conn, &w.admin, &r.id, &status_req("published")).unwrap_err().0, StatusCode::FORBIDDEN);
+        assert_eq!(stamp(&w.conn, "posts", &r.id), None);
+    }
+
+    #[test]
+    fn unpublishing_by_hand_keeps_saying_content_unpublished() {
+        let w = world();
+        let p = create_post(&w.conn, &w.teacher, &post_req(&w, "published")).unwrap();
+        update_post(&w.conn, &w.admin, &p.id, &status_req("draft")).unwrap();
+        assert_eq!((count_kind(&w.conn, &w.teacher.id, "content_unpublished"), count_kind(&w.conn, &w.teacher.id, "content_auto_hidden")), (1, 0));
     }
 }

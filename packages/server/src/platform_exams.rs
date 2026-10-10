@@ -238,6 +238,51 @@ pub(crate) struct Outcome {
     /// asking for the grading anew. `None` everywhere else (and absent from the stored JSON).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kept: Option<f64>,
+    /// Phase 3-4 provenance, set ONLY when a grader writes a GRADE by hand on a written short answer (never by the
+    /// automatic marking): who (user id) and when (ms) last gave the points - a first grade or a correction that moved
+    /// them. A comment alone, on a graded or a pending answer, never touches it: the points are what these two vouch for,
+    /// and the first grade has no audit row, so overwriting them would erase the only record of who gave it. Absent
+    /// from outcomes stored before this existed and from every automatically marked answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) graded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) graded_at: Option<i64>,
+    /// The grader's comment on this written answer (plain text, trimmed, at most [`MAX_FEEDBACK_CHARS`]). May exist
+    /// before the answer is graded (the answer then stays pending).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) feedback: Option<String>,
+}
+
+impl Outcome {
+    /// An outcome produced by the automatic marking: no grader, no comment.
+    pub(crate) fn auto(id: String, correct: Option<bool>, points: f64, max: f64) -> Outcome {
+        Outcome { id, correct, points, max, kept: None, graded_by: None, graded_at: None, feedback: None }
+    }
+}
+
+/// Longest comment a grader can leave on one written answer.
+pub(crate) const MAX_FEEDBACK_CHARS: usize = 500;
+
+/// Characters that never belong in a plain-text comment: control characters other than a line break or a tab (the NUL
+/// and escape family), the zero-width space and the left/right marks (U+200B, U+200E, U+200F), the bidi embedding and
+/// override controls (U+202A-U+202E, U+2066-U+2069), the word joiner and invisible operators (U+2060-U+2064) and the byte
+/// order mark (U+FEFF). They are invisible or reorder what is around them, so a comment made of them would look empty
+/// (or reversed) to the student. The zero-width joiner and non-joiner (U+200C, U+200D) stay: scripts and emoji need them.
+fn is_hidden_char(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t')
+        || matches!(c, '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// The comment as it is stored: hidden characters dropped (carriage returns too, so CR/LF reads as LF), then trimmed. `None` when nothing visible
+/// is left (only blanks and joiners) - the way a comment is cleared. **The one place this is decided**; the client
+/// mirrors it in `utils/gradeSheet.ts` (`cleanFeedback`) so that its counter and its diff see the same text.
+pub(crate) fn clean_feedback(raw: &str) -> Option<String> {
+    let kept: String = raw.chars().filter(|c| !is_hidden_char(*c)).collect();
+    let text = kept.trim();
+    if text.chars().all(|c| c.is_whitespace() || c == '\u{200C}' || c == '\u{200D}') {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 /// Grades one question from what the student wrote (`None` = nothing given): objective questions are marked right
@@ -247,7 +292,7 @@ pub(crate) struct Outcome {
 pub(crate) fn grade_one(q: &Question, user: Option<&str>) -> Outcome {
     let max = points_of(q);
     if max <= 0.0 {
-        return Outcome { id: q.id.clone(), correct: Some(true), points: 0.0, max: 0.0, kept: None };
+        return Outcome::auto(q.id.clone(), Some(true), 0.0, 0.0);
     }
     let (correct, points) = match auto_grade(q, user) {
         Some(true) => (Some(true), max),
@@ -261,7 +306,7 @@ pub(crate) fn grade_one(q: &Question, user: Option<&str>) -> Outcome {
             }
         }
     };
-    Outcome { id: q.id.clone(), correct, points, max, kept: None }
+    Outcome::auto(q.id.clone(), correct, points, max)
 }
 
 fn grade_all(questions: &[Question], answers: &HashMap<String, String>) -> (Vec<Outcome>, f64, i64) {
@@ -967,8 +1012,10 @@ fn public_questions(qs: &[Question]) -> Vec<PublicQuestion> {
 
 // ───────── finishing attempts ─────────
 
-/// Grades `shown` answers (displayed letters) and stores the attempt as submitted at `submitted_at`.
-fn finalize_attempt(conn: &Connection, attempt_id: &str, assessment_id: &str, shown: &HashMap<String, String>, order_raw: Option<String>, submitted_at: i64) -> Res<()> {
+/// Grades `shown` answers (displayed letters) and stores the attempt as submitted at `submitted_at`. `now` is the clock
+/// of the caller (a manual submit, or the settlement of an overdue attempt, whose `submitted_at` lies in the past): the
+/// exam's owner is told when written answers now wait for grading (throttled, see `tell_submission_pending`).
+fn finalize_attempt(conn: &Connection, attempt_id: &str, assessment_id: &str, shown: &HashMap<String, String>, order_raw: Option<String>, submitted_at: i64, now: i64) -> Res<()> {
     let questions = load_questions(conn, assessment_id)?;
     let order = parse_order(order_raw);
     let answers = to_original(&questions, order.as_ref(), &clean_answers(shown, &questions));
@@ -978,6 +1025,10 @@ fn finalize_attempt(conn: &Connection, attempt_id: &str, assessment_id: &str, sh
         params![submitted_at, serde_json::to_string(&answers).map_err(db_err)?, serde_json::to_string(&outcomes).map_err(db_err)?, score, pending, attempt_id],
     )
     .map_err(db_err)?;
+    if pending > 0 {
+        // a missing notice must never fail a submission that has already been stored
+        let _ = crate::platform_engage::tell_submission_pending(conn, assessment_id, now);
+    }
     Ok(())
 }
 
@@ -998,7 +1049,7 @@ fn settle_if_due(conn: &Connection, attempt_id: &str, assessment_id: &str, durat
     if saved_at.is_some() {
         // the browser went away (or lost connection) before the timer ran out: the autosaved answers count
         let shown: HashMap<String, String> = serde_json::from_str(&answers_raw).unwrap_or_default();
-        finalize_attempt(conn, attempt_id, assessment_id, &shown, order_raw, due)?;
+        finalize_attempt(conn, attempt_id, assessment_id, &shown, order_raw, due, now)?;
     } else {
         conn.execute("UPDATE attempts SET status = 'expired' WHERE id = ?1", params![attempt_id]).map_err(db_err)?;
     }
@@ -1189,6 +1240,12 @@ pub struct ItemResult {
     max: f64,
     correct_answer: Option<String>,
     analysis: Option<String>,
+    /// The grader's comment on this written answer. The attempt's own student sees it once the result is released
+    /// (items are not sent before), graders always.
+    pub(crate) feedback: Option<String>,
+    /// Who graded the answer by hand and when. **Graders and admins only** - `None` for the student, always.
+    pub(crate) graded_by_name: Option<String>,
+    pub(crate) graded_at: Option<i64>,
 }
 
 #[derive(Serialize, Debug)]
@@ -1257,7 +1314,7 @@ pub(crate) fn submit_attempt(conn: &Connection, student: &User, attempt_id: &str
         settle_if_due(conn, attempt_id, &assessment_id, info.duration_min, now)?;
         return Err(err(StatusCode::CONFLICT, "time_expired"));
     }
-    finalize_attempt(conn, attempt_id, &assessment_id, raw, order_raw, now)?;
+    finalize_attempt(conn, attempt_id, &assessment_id, raw, order_raw, now, now)?;
     attempt_result(conn, student, attempt_id)
 }
 
@@ -1297,6 +1354,17 @@ pub(crate) fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str)
         let answers: HashMap<String, String> = serde_json::from_str(&answers_raw).unwrap_or_default();
         let outcomes: Vec<Outcome> = serde_json::from_str(&results_raw).unwrap_or_default();
         let by_id: HashMap<&str, &Outcome> = outcomes.iter().map(|o| (o.id.as_str(), o)).collect();
+        // names of the graders, looked up once for the ones that appear (graders see them, students never)
+        let mut grader_names: HashMap<String, String> = HashMap::new();
+        if is_owner {
+            for id in outcomes.iter().filter_map(|o| o.graded_by.as_deref()) {
+                if !grader_names.contains_key(id) {
+                    if let Some(name) = conn.query_row("SELECT full_name FROM users WHERE id = ?1", params![id], |r| r.get::<_, String>(0)).optional().map_err(db_err)? {
+                        grader_names.insert(id.to_string(), name);
+                    }
+                }
+            }
+        }
         Some(
             questions
                 .iter()
@@ -1313,6 +1381,9 @@ pub(crate) fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str)
                         max: points_of(q),
                         correct_answer: Some(q.answer.clone()),
                         analysis: (!q.analysis.is_empty()).then(|| q.analysis.clone()),
+                        feedback: o.and_then(|o| o.feedback.clone()),
+                        graded_by_name: o.and_then(|o| o.graded_by.as_ref()).filter(|_| is_owner).and_then(|id| grader_names.get(id).cloned()),
+                        graded_at: o.and_then(|o| o.graded_at).filter(|_| is_owner),
                     }
                 })
                 .collect(),
@@ -1344,15 +1415,55 @@ pub(crate) fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str)
 
 // ───────── teacher: grading & results ─────────
 
-#[derive(Deserialize)]
+/// What a grader writes on one attempt: points per written short answer (`grades`) and/or a comment per written short
+/// answer (`feedback`). Both maps are keyed by question id; at least one must be non-empty. In `feedback` an empty text
+/// clears the comment, a question that is not mentioned keeps what it has.
+#[derive(Deserialize, Default, Debug, Clone)]
 pub struct GradeReq {
+    #[serde(default)]
     pub(crate) grades: HashMap<String, f64>,
+    #[serde(default)]
+    pub(crate) feedback: HashMap<String, String>,
 }
 
 pub(crate) fn grade_attempt(conn: &Connection, grader: &User, attempt_id: &str, g: &GradeReq) -> Res<AttemptResult> {
-    let (assessment_id, student_id, status, results_raw, answers_raw): (String, String, String, String, String) = conn
-        .query_row("SELECT assessment_id, student_id, status, results, answers FROM attempts WHERE id = ?1", params![attempt_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    grade_attempt_at(conn, grader, attempt_id, g, now_ms())
+}
+
+/// [`grade_attempt`] with the clock passed in. All or nothing: the attempt, the audit rows and the student's notices are
+/// written inside one savepoint, so it is atomic on its own and joins the surrounding transaction when `grade_batch`
+/// runs it (one `ROLLBACK` there undoes every attempt of the batch).
+///
+/// Rules (the one place they are written; the batch and the single-attempt route both come here):
+/// * only a **written** short answer can be graded or commented (`not_gradable` for objective questions and blank
+///   answers); points are `0..=max` (`invalid_points`); a comment is trimmed, at most 500 characters
+///   (`feedback_too_long`), stripped of control, zero-width and bidi-override characters ([`clean_feedback`]), and an
+///   empty (or invisible) one clears the comment;
+/// * a grade can be corrected later; every correction (the answer was graded and the points differ) writes its own
+///   `answer_regraded` audit row `{exam_id, question_id, old, new}` (the attempt is the row's target); first grades and
+///   comment-only edits do not. The provenance on the outcome (`graded_by` / `graded_at`) records who GAVE THE POINTS
+///   last (first grade or a correction) and is the only record of a first grade, so a comment edit never changes it;
+/// * writing exactly what is stored changes nothing (no provenance, no audit row, no notice);
+/// * the student is told only when the result is released at `now`, and never when they are the grader: the last pending
+///   answer graded -> `assessment_graded` (as before); a correction that moves the score -> `score_changed` with
+///   `cause: "grade"`; a new or changed comment -> `feedback_added` (only when the exam shows its student the
+///   per-question view, where the comment is - `show_answers`). The last two coalesce while unread.
+pub(crate) fn grade_attempt_at(conn: &Connection, grader: &User, attempt_id: &str, g: &GradeReq, now: i64) -> Res<AttemptResult> {
+    conn.execute_batch("SAVEPOINT grade_attempt").map_err(db_err)?;
+    match write_grades(conn, grader, attempt_id, g, now) {
+        Ok(()) => conn.execute_batch("RELEASE grade_attempt").map_err(db_err)?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO grade_attempt; RELEASE grade_attempt");
+            return Err(e);
+        }
+    }
+    attempt_result(conn, grader, attempt_id)
+}
+
+fn write_grades(conn: &Connection, grader: &User, attempt_id: &str, g: &GradeReq, now: i64) -> Res<()> {
+    let (assessment_id, student_id, status, results_raw, answers_raw, old_score): (String, String, String, String, String, f64) = conn
+        .query_row("SELECT assessment_id, student_id, status, results, answers, score FROM attempts WHERE id = ?1", params![attempt_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
         })
         .optional()
         .map_err(db_err)?
@@ -1363,11 +1474,18 @@ pub(crate) fn grade_attempt(conn: &Connection, grader: &User, attempt_id: &str, 
     if status != "submitted" {
         return Err(err(StatusCode::CONFLICT, "not_submitted"));
     }
+    if g.grades.is_empty() && g.feedback.is_empty() {
+        return Err(bad("invalid_selection")); // nothing to write
+    }
     let questions = load_questions(conn, &assessment_id)?;
     let answers: HashMap<String, String> = serde_json::from_str(&answers_raw).unwrap_or_default();
     let mut outcomes: Vec<Outcome> = serde_json::from_str(&results_raw).map_err(db_err)?;
     let pending_before = outcomes.iter().filter(|o| o.correct.is_none()).count();
-    for (qid, pts) in &g.grades {
+    // answers touched by this call, in a fixed order (the audit rows and the errors do not depend on hash order)
+    let touched_ids: std::collections::BTreeSet<&String> = g.grades.keys().chain(g.feedback.keys()).collect();
+    let mut corrections: Vec<(String, f64, f64)> = vec![];
+    let mut new_feedback = false;
+    for qid in touched_ids {
         let q = questions.iter().find(|q| &q.id == qid).ok_or_else(|| bad("invalid_question_id"))?;
         let o = outcomes.iter_mut().find(|o| &o.id == qid).ok_or_else(|| bad("invalid_question_id"))?;
         // Only written (short) answers are graded by hand; a grade can be corrected later, but a blank
@@ -1376,11 +1494,40 @@ pub(crate) fn grade_attempt(conn: &Connection, grader: &User, attempt_id: &str, 
         if q.qtype != QuestionType::ShortAnswer || !written {
             return Err(bad("not_gradable"));
         }
-        if !pts.is_finite() || *pts < 0.0 || *pts > o.max {
-            return Err(bad("invalid_points"));
+        let was_graded = o.correct.is_some();
+        // the points were given (first grade) or moved (a correction) by this call
+        let mut points_written = false;
+        if let Some(pts) = g.grades.get(qid) {
+            if !pts.is_finite() || *pts < 0.0 || *pts > o.max {
+                return Err(bad("invalid_points"));
+            }
+            let new_points = round2(*pts);
+            if !was_graded || (new_points - o.points).abs() > 1e-9 {
+                if was_graded {
+                    corrections.push((qid.clone(), o.points, new_points));
+                }
+                points_written = true;
+            }
+            o.points = new_points;
+            o.correct = Some(*pts >= o.max);
         }
-        o.points = round2(*pts);
-        o.correct = Some(*pts >= o.max);
+        if let Some(raw) = g.feedback.get(qid) {
+            let next = clean_feedback(raw);
+            if next.as_deref().map_or(0, |t| t.chars().count()) > MAX_FEEDBACK_CHARS {
+                return Err(bad("feedback_too_long"));
+            }
+            if next != o.feedback {
+                new_feedback |= next.is_some();
+                o.feedback = next;
+            }
+        }
+        // provenance: who gave the points, and when. Only a write of POINTS counts - a comment edit (also one that an
+        // admin makes on a teacher's graded answer) must not take the grade over: the first grade has no audit row, so
+        // this is the only record of who gave it.
+        if points_written {
+            o.graded_by = Some(grader.id.clone());
+            o.graded_at = Some(now);
+        }
     }
     let score = round2(outcomes.iter().map(|o| o.points).sum());
     let pending = outcomes.iter().filter(|o| o.correct.is_none()).count() as i64;
@@ -1389,19 +1536,45 @@ pub(crate) fn grade_attempt(conn: &Connection, grader: &User, attempt_id: &str, 
         params![serde_json::to_string(&outcomes).map_err(db_err)?, score, pending, attempt_id],
     )
     .map_err(db_err)?;
+    // the trail of every correction: written with `?` (the shared `audit` helper swallows errors, which would let a
+    // correction commit without its record)
+    for (qid, old, new) in &corrections {
+        let detail = json!({ "exam_id": assessment_id, "question_id": qid, "old": old, "new": new });
+        conn.execute(
+            "INSERT INTO audit_log(actor_id, target_id, action, detail, created_at) VALUES (?1, ?2, 'answer_regraded', ?3, ?4)",
+            params![grader.id, attempt_id, detail.to_string(), now],
+        )
+        .map_err(db_err)?;
+    }
+    let completed_now = pending == 0 && pending_before > 0;
+    let score_moved = !corrections.is_empty() && (score - old_score).abs() > 1e-9;
+    if !completed_now && !score_moved && !new_feedback {
+        return Ok(());
+    }
+    let (title, mode, exam_status, closes_at, total, show_answers): (String, String, String, Option<i64>, f64, bool) = conn
+        .query_row("SELECT title, release_mode, status, closes_at, total_points, show_answers FROM assessments WHERE id = ?1", params![assessment_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })
+        .map_err(db_err)?;
+    // While the result is withheld (`after_close`) the student is told when it is released instead (phase 1-8).
+    if !is_released(&mode, &exam_status, closes_at, now) {
+        return Ok(());
+    }
     // tell the student once, when the last pending answer gets its grade (not on later corrections)
-    if pending == 0 && pending_before > 0 {
-        let (title, mode, exam_status, closes_at): (String, String, String, Option<i64>) = conn
-            .query_row("SELECT title, release_mode, status, closes_at FROM assessments WHERE id = ?1", params![assessment_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
-            .map_err(db_err)?;
-        // While the result is withheld (`after_close`) the student is told when it is released instead (phase 1-8).
-        if is_released(&mode, &exam_status, closes_at, now_ms()) {
-            crate::platform_engage::notify(conn, &student_id, "assessment_graded", json!({ "title": title }), &format!("/platform/attempts/{attempt_id}"));
+    if completed_now {
+        crate::platform_engage::notify(conn, &student_id, "assessment_graded", json!({ "title": title }), &format!("/platform/attempts/{attempt_id}"));
+    }
+    if student_id != grader.id {
+        if score_moved {
+            crate::platform_exam_key::tell_score_change(conn, &student_id, attempt_id, &title, old_score, score, total, Some("grade"), now)?;
+        }
+        // The comments live in the per-question view; an exam that hides the answers shows its student no such view, so a
+        // notice would lead to a page without the comment. They are kept, and show up if the exam ever shows its answers.
+        if new_feedback && show_answers {
+            crate::platform_engage::tell_feedback_added(conn, &student_id, attempt_id, &title, now)?;
         }
     }
-    attempt_result(conn, grader, attempt_id)
+    Ok(())
 }
 
 #[derive(Serialize, Debug)]
@@ -1800,10 +1973,10 @@ mod tests {
         assert_eq!(submit_attempt(&w.conn, &w.student, &start.attempt_id, &ans(&[]), now + 6000).unwrap_err().0, StatusCode::CONFLICT, "no double submit");
         // teacher grades the short answer
         let other_teacher = crate::platform::insert_test_user(&w.conn, "t2@x.com", "teacher", "active");
-        assert_eq!(grade_attempt(&w.conn, &other_teacher, &start.attempt_id, &GradeReq { grades: ans_f(&[("q5", 3.0)]) }).unwrap_err().0, StatusCode::FORBIDDEN, "another teacher cannot grade");
-        assert_eq!(grade_attempt(&w.conn, &w.teacher, &start.attempt_id, &GradeReq { grades: ans_f(&[("q5", 9.0)]) }).unwrap_err().0, StatusCode::BAD_REQUEST, "above max");
-        assert_eq!(grade_attempt(&w.conn, &w.teacher, &start.attempt_id, &GradeReq { grades: ans_f(&[("q1", 0.0)]) }).unwrap_err().0, StatusCode::BAD_REQUEST, "auto-graded cannot be overridden");
-        let g = grade_attempt(&w.conn, &w.teacher, &start.attempt_id, &GradeReq { grades: ans_f(&[("q5", 3.0)]) }).unwrap();
+        assert_eq!(grade_attempt(&w.conn, &other_teacher, &start.attempt_id, &GradeReq { grades: ans_f(&[("q5", 3.0)]), ..Default::default() }).unwrap_err().0, StatusCode::FORBIDDEN, "another teacher cannot grade");
+        assert_eq!(grade_attempt(&w.conn, &w.teacher, &start.attempt_id, &GradeReq { grades: ans_f(&[("q5", 9.0)]), ..Default::default() }).unwrap_err().0, StatusCode::BAD_REQUEST, "above max");
+        assert_eq!(grade_attempt(&w.conn, &w.teacher, &start.attempt_id, &GradeReq { grades: ans_f(&[("q1", 0.0)]), ..Default::default() }).unwrap_err().0, StatusCode::BAD_REQUEST, "auto-graded cannot be overridden");
+        let g = grade_attempt(&w.conn, &w.teacher, &start.attempt_id, &GradeReq { grades: ans_f(&[("q5", 3.0)]), ..Default::default() }).unwrap();
         assert_eq!((g.score, g.pending), (8.0, 0));
         let n: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE kind = 'assessment_graded'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
@@ -2670,7 +2843,7 @@ mod migration_tests {
         assert_eq!(view.items.as_ref().map(|i| i.len()), Some(5));
         // the pending one is still gradable by the teacher, and a new attempt can start/resume
         let pending: String = one(&c, "SELECT id FROM attempts WHERE pending = 1");
-        let g = grade_attempt(&c, &teacher, &pending, &GradeReq { grades: [("q5".to_string(), 2.0)].into() }).unwrap();
+        let g = grade_attempt(&c, &teacher, &pending, &GradeReq { grades: [("q5".to_string(), 2.0)].into(), ..Default::default() }).unwrap();
         assert_eq!((g.score, g.pending), (2.0, 0));
         // "now" is anchored to the fixture's own clock (the dump was taken at a fixed moment), so the
         // exam's time limit does not expire the in-progress attempt as real time passes.
@@ -3059,11 +3232,11 @@ mod taking_tests {
         let s2 = enroll(&w, "s2@x.com");
         let full = attempt(ans(&[("q1", "B"), ("q2", "D"), ("q3", "A"), ("q4", "AC"), ("q5", "A"), ("q6", "كتبت إجابة")]), &s2);
         assert_eq!((full.score, full.pending, full.passed), (6.0, 1, None), "pending short answer → the outcome is not decided yet");
-        let g = grade_attempt(&w.conn, &w.admin, &full.attempt_id, &GradeReq { grades: [("q6".to_string(), 0.0)].into() }).unwrap();
+        let g = grade_attempt(&w.conn, &w.admin, &full.attempt_id, &GradeReq { grades: [("q6".to_string(), 0.0)].into(), ..Default::default() }).unwrap();
         assert_eq!((g.score, g.passed), (6.0, Some(true)), "exactly 60% passes (the mark is inclusive)");
         let s3 = enroll(&w, "s3@x.com");
         let low = attempt(ans(&[("q1", "B"), ("q2", "D"), ("q3", "A"), ("q4", "A"), ("q6", "إجابة ضعيفة")]), &s3);
-        let low = grade_attempt(&w.conn, &w.admin, &low.attempt_id, &GradeReq { grades: [("q6".to_string(), 0.0)].into() }).unwrap();
+        let low = grade_attempt(&w.conn, &w.admin, &low.attempt_id, &GradeReq { grades: [("q6".to_string(), 0.0)].into(), ..Default::default() }).unwrap();
         assert_eq!((low.score, low.passed), (3.0, Some(false)));
         let sum = results_summary(&w.conn, &w.admin, &id, now_ms()).unwrap();
         assert_eq!((sum.submitted, sum.passed), (2, 1), "the summary counts passers");
@@ -3073,5 +3246,738 @@ mod taking_tests {
         let s = start_attempt(&w.conn, &w.student, &id2, now_ms()).unwrap();
         assert_eq!(submit_attempt(&w.conn, &w.student, &s.attempt_id, &ans(&[]), now_ms()).unwrap().passed, None);
         assert_eq!(passed_flag(5.0, 0.0, 0, Some(50.0)), None, "an exam worth 0 points has no percentage");
+    }
+}
+
+/// Phase 3-4: provenance, comments, corrections, the student's notices, and the throttled "answers wait for you" notice.
+#[cfg(test)]
+mod grading_tests {
+    use super::*;
+    use crate::platform::{create_test_db, insert_test_user};
+    use serde_json::Value;
+
+    const NOW: i64 = 1_000_000_000_000;
+    const MIN: i64 = 60_000;
+    /// A closing time far in the future for the real clock and for `NOW` alike.
+    const FAR: i64 = 4_000_000_000_000;
+
+    struct W {
+        conn: Connection,
+        admin: User,
+        teacher: User,
+        colleague: User,
+        student: User,
+        other: User,
+        exam: String,
+    }
+
+    fn question(id: &str, t: QuestionType, answer: &str, opts: &[&str], score: f64) -> Question {
+        Question {
+            id: id.into(), qtype: t, stem: format!("سؤال {id}"), options: opts.iter().map(|s| s.to_string()).collect(),
+            answer: answer.into(), analysis: "شرح".into(), ai_analysis: None, score: Some(score), subject: None, chapter: None, difficulty: None,
+        }
+    }
+
+    /// q1 objective (1), q5 short answer (4), q6 short answer (2): 7 points.
+    fn questions() -> Vec<Question> {
+        vec![
+            question("q1", QuestionType::SingleChoice, "B", &["أ", "ب", "ج"], 1.0),
+            question("q5", QuestionType::ShortAnswer, "نموذج", &[], 4.0),
+            question("q6", QuestionType::ShortAnswer, "نموذج ٢", &[], 2.0),
+        ]
+    }
+
+    fn exam_req(duration: Option<i64>) -> AssessmentReq {
+        AssessmentReq {
+            subject_id: Some("s1".into()), title: Some("اختبار التصحيح".into()), description: None, questions: Some(questions()),
+            duration_min: duration, opens_at: None, closes_at: None, max_attempts: Some(9), show_answers: Some(true),
+            status: Some("published".into()), clear_duration: None, clear_window: None,
+        }
+    }
+
+    fn world() -> W {
+        let conn = create_test_db();
+        conn.execute("INSERT INTO institutions(id,type,name_ar,is_active,created_at) VALUES ('i1','university','ج',1,0)", []).unwrap();
+        conn.execute("INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES ('s1','i1','برمجة',1,0)", []).unwrap();
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        let teacher = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        let colleague = insert_test_user(&conn, "c@x.com", "teacher", "active");
+        let student = insert_test_user(&conn, "s@x.com", "student", "active");
+        let other = insert_test_user(&conn, "o@x.com", "student", "active");
+        conn.execute("UPDATE users SET full_name = 'المعلم أحمد' WHERE id = ?1", params![teacher.id]).unwrap();
+        conn.execute("UPDATE users SET full_name = 'طالب نشط' WHERE id = ?1", params![student.id]).unwrap();
+        for t in [&teacher, &colleague] {
+            conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,'s1','approved',0,0)", params![t.id]).unwrap();
+        }
+        for s in [&student, &other] {
+            conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![s.id]).unwrap();
+        }
+        let exam = create_assessment(&conn, &teacher, &exam_req(None)).unwrap().id;
+        W { conn, admin, teacher, colleague, student, other, exam }
+    }
+
+    fn ans(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// One student sits the exam and submits.
+    fn sit(w: &W, who: &User, answers: &[(&str, &str)], at: i64) -> String {
+        let st = start_attempt(&w.conn, who, &w.exam, at).unwrap();
+        submit_attempt(&w.conn, who, &st.attempt_id, &ans(answers), at + 1).unwrap();
+        st.attempt_id
+    }
+
+    /// q1 right (1 point), both short answers written.
+    fn sit_written(w: &W, at: i64) -> String {
+        sit(w, &w.student, &[("q1", "B"), ("q5", "إجابتي الأولى"), ("q6", "إجابتي الثانية")], at)
+    }
+
+    fn pts(pairs: &[(&str, f64)]) -> GradeReq {
+        GradeReq { grades: pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect(), ..Default::default() }
+    }
+
+    fn fb(pairs: &[(&str, &str)]) -> GradeReq {
+        GradeReq { feedback: pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), ..Default::default() }
+    }
+
+    fn both(points: &[(&str, f64)], feedback: &[(&str, &str)]) -> GradeReq {
+        GradeReq { grades: pts(points).grades, feedback: fb(feedback).feedback }
+    }
+
+    fn outcome(w: &W, attempt: &str, qid: &str) -> Outcome {
+        let raw: String = w.conn.query_row("SELECT results FROM attempts WHERE id = ?1", params![attempt], |r| r.get(0)).unwrap();
+        serde_json::from_str::<Vec<Outcome>>(&raw).unwrap().into_iter().find(|o| o.id == qid).unwrap()
+    }
+
+    fn row(w: &W, attempt: &str) -> (f64, i64) {
+        w.conn.query_row("SELECT score, pending FROM attempts WHERE id = ?1", params![attempt], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    /// (data, link, read, created_at) of the notices of `kind` that `user` has, oldest first.
+    fn notices(w: &W, user: &User, kind: &str) -> Vec<(Value, String, bool, i64)> {
+        w.conn
+            .prepare("SELECT data, link, read_at, created_at FROM notifications WHERE user_id = ?1 AND kind = ?2 ORDER BY rowid")
+            .unwrap()
+            .query_map(params![user.id, kind], |r| Ok((serde_json::from_str(&r.get::<_, String>(0)?).unwrap(), r.get(1)?, r.get::<_, Option<i64>>(2)?.is_some(), r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn mark_all_read(w: &W, user: &User) {
+        w.conn.execute("UPDATE notifications SET read_at = 1 WHERE user_id = ?1", params![user.id]).unwrap();
+    }
+
+    fn regrades(w: &W) -> Vec<(String, String, Value, i64)> {
+        w.conn
+            .prepare("SELECT actor_id, target_id, detail, created_at FROM audit_log WHERE action = 'answer_regraded' ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, serde_json::from_str(&r.get::<_, String>(2)?).unwrap(), r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn grade(w: &W, who: &User, attempt: &str, g: &GradeReq, at: i64) -> Res<AttemptResult> {
+        grade_attempt_at(&w.conn, who, attempt, g, at)
+    }
+
+    // ───── provenance ─────
+
+    #[test]
+    fn provenance_is_set_only_by_a_manual_grade_and_outcomes_from_before_it_existed_read_as_absent() {
+        let w = world();
+        let a = sit_written(&w, NOW);
+        // right after submission nothing is attributed to anybody (auto marking leaves no grader)
+        let raw: String = w.conn.query_row("SELECT results FROM attempts WHERE id = ?1", params![a], |r| r.get(0)).unwrap();
+        for key in ["graded_by", "graded_at", "feedback", "kept"] {
+            assert!(!raw.contains(key), "{key} must not be stored for an automatic outcome: {raw}");
+        }
+        let o = outcome(&w, &a, "q1");
+        assert_eq!((o.graded_by, o.graded_at, o.feedback), (None, None, None));
+        // a hand grade attributes exactly that answer
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 3.0)]), NOW + 5 * MIN).unwrap();
+        let q5 = outcome(&w, &a, "q5");
+        assert_eq!((q5.graded_by.as_deref(), q5.graded_at, q5.correct, q5.points), (Some(w.teacher.id.as_str()), Some(NOW + 5 * MIN), Some(false), 3.0));
+        for untouched in ["q1", "q6"] {
+            let o = outcome(&w, &a, untouched);
+            assert_eq!((o.graded_by, o.graded_at), (None, None), "{untouched}");
+        }
+        // an admin correcting it takes over the attribution
+        grade(&w, &w.admin, &a, &pts(&[("q5", 4.0)]), NOW + 9 * MIN).unwrap();
+        let q5 = outcome(&w, &a, "q5");
+        assert_eq!((q5.graded_by.as_deref(), q5.graded_at, q5.correct), (Some(w.admin.id.as_str()), Some(NOW + 9 * MIN), Some(true)));
+        // outcomes stored by the previous version (no such keys) still load, as absent
+        let old: Vec<Outcome> = serde_json::from_str(r#"[{"id":"q5","correct":true,"points":2.0,"max":4.0},{"id":"q1","correct":false,"points":0.0,"max":1.0,"kept":1.5}]"#).unwrap();
+        assert_eq!((old[0].graded_by.clone(), old[0].graded_at, old[0].feedback.clone(), old[1].kept), (None, None, None, Some(1.5)));
+        let again = serde_json::to_string(&old).unwrap();
+        assert!(!again.contains("graded_") && !again.contains("feedback"), "and they are written back without the keys: {again}");
+    }
+
+    // ───── what a request must hold ─────
+
+    #[test]
+    fn a_request_needs_points_or_a_comment_and_accepts_either_or_both() {
+        let w = world();
+        let a = sit_written(&w, NOW);
+        let e = grade(&w, &w.teacher, &a, &GradeReq::default(), NOW).unwrap_err();
+        assert_eq!((e.0, e.1.contains("invalid_selection")), (StatusCode::BAD_REQUEST, true), "neither points nor comment");
+        assert_eq!(row(&w, &a), (1.0, 2));
+        // points only
+        let r = grade(&w, &w.teacher, &a, &pts(&[("q5", 2.0)]), NOW).unwrap();
+        assert_eq!((r.score, r.pending), (3.0, 1));
+        // a comment only
+        grade(&w, &w.teacher, &a, &fb(&[("q6", "اشرح أكثر")]), NOW).unwrap();
+        assert_eq!(row(&w, &a), (3.0, 1), "a comment moves no points");
+        // both in one request, for different answers and for the same one
+        let r = grade(&w, &w.teacher, &a, &both(&[("q6", 2.0), ("q5", 4.0)], &[("q6", "ممتاز"), ("q5", "كامل")]), NOW).unwrap();
+        assert_eq!((r.score, r.pending), (7.0, 0));
+        assert_eq!((outcome(&w, &a, "q6").feedback.as_deref(), outcome(&w, &a, "q5").feedback.as_deref()), (Some("ممتاز"), Some("كامل")));
+        // the JSON the HTTP route receives: both maps optional, unknown keys ignored
+        let g: GradeReq = serde_json::from_str(r#"{"feedback":{"q5":"x"},"whatever":1}"#).unwrap();
+        assert!(g.grades.is_empty() && g.feedback.len() == 1);
+        let g: GradeReq = serde_json::from_str(r#"{"grades":{"q5":1.5}}"#).unwrap();
+        assert!(g.feedback.is_empty() && g.grades["q5"] == 1.5);
+        assert!(serde_json::from_str::<GradeReq>("{}").unwrap().grades.is_empty());
+    }
+
+    #[test]
+    fn a_comment_is_plain_trimmed_bounded_clearable_and_does_not_settle_a_pending_answer() {
+        let w = world();
+        let a = sit_written(&w, NOW);
+        grade(&w, &w.teacher, &a, &fb(&[("q5", "   تحتاج إلى مثال   ")]), NOW + MIN).unwrap();
+        let o = outcome(&w, &a, "q5");
+        assert_eq!((o.feedback.as_deref(), o.correct, o.graded_by.clone(), o.graded_at), (Some("تحتاج إلى مثال"), None, None, None), "stored trimmed; the answer is still pending and nobody has graded it");
+        assert_eq!(row(&w, &a), (1.0, 2), "pending stays 2");
+        // markup is just text (rendered as text by the client): stored as written
+        grade(&w, &w.teacher, &a, &fb(&[("q6", "<b>جيد</b> & \"ممتاز\"")]), NOW + 2 * MIN).unwrap();
+        assert_eq!(outcome(&w, &a, "q6").feedback.as_deref(), Some("<b>جيد</b> & \"ممتاز\""));
+        // 500 characters pass (counted as characters, not bytes); 501 do not, and nothing is stored
+        let max: String = "ع".repeat(MAX_FEEDBACK_CHARS);
+        assert!(max.len() > MAX_FEEDBACK_CHARS);
+        grade(&w, &w.teacher, &a, &fb(&[("q5", &max)]), NOW + 3 * MIN).unwrap();
+        assert_eq!(outcome(&w, &a, "q5").feedback.as_deref(), Some(max.as_str()));
+        let too_long: String = "ع".repeat(MAX_FEEDBACK_CHARS + 1);
+        let e = grade(&w, &w.teacher, &a, &fb(&[("q5", &too_long)]), NOW + 4 * MIN).unwrap_err();
+        assert_eq!((e.0, e.1.contains("feedback_too_long")), (StatusCode::BAD_REQUEST, true));
+        assert_eq!(outcome(&w, &a, "q5").feedback.as_deref(), Some(max.as_str()), "the refused request changed nothing");
+        // the bound is on the trimmed text: padding does not count
+        grade(&w, &w.teacher, &a, &fb(&[("q5", &format!("  {max}  "))]), NOW + 5 * MIN).unwrap();
+        // absent leaves it; an empty (or blank) text clears it
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 1.0)]), NOW + 6 * MIN).unwrap();
+        assert_eq!(outcome(&w, &a, "q5").feedback.as_deref(), Some(max.as_str()), "grading without mentioning the comment keeps it");
+        grade(&w, &w.teacher, &a, &fb(&[("q5", "  \n ")]), NOW + 7 * MIN).unwrap();
+        assert_eq!(outcome(&w, &a, "q5").feedback, None);
+        assert!(!serde_json::to_string(&outcome(&w, &a, "q5")).unwrap().contains("feedback"), "and the key is gone from the stored JSON");
+        // clearing a comment that is not there changes nothing and is not an error
+        grade(&w, &w.teacher, &a, &fb(&[("q5", "")]), NOW + 8 * MIN).unwrap();
+        assert_eq!(outcome(&w, &a, "q6").feedback.as_deref(), Some("<b>جيد</b> & \"ممتاز\""), "another answer's comment is untouched");
+    }
+
+    #[test]
+    fn only_written_short_answers_take_points_or_comments_and_a_bad_item_stores_nothing() {
+        let w = world();
+        let a = sit(&w, &w.student, &[("q1", "B"), ("q5", "كتبت")], NOW); // q6 left blank
+        for (label, req) in [
+            ("points on an objective question", pts(&[("q1", 1.0)])),
+            ("a comment on an objective question", fb(&[("q1", "جيد")])),
+            ("points on a blank answer", pts(&[("q6", 1.0)])),
+            ("a comment on a blank answer", fb(&[("q6", "لم تجب")])),
+        ] {
+            let e = grade(&w, &w.teacher, &a, &req, NOW).unwrap_err();
+            assert_eq!((e.0, e.1.contains("not_gradable")), (StatusCode::BAD_REQUEST, true), "{label}");
+        }
+        for (label, req, wanted) in [
+            ("an unknown question", pts(&[("zz", 1.0)]), "invalid_question_id"),
+            ("an unknown question's comment", fb(&[("zz", "x")]), "invalid_question_id"),
+            ("above the maximum", pts(&[("q5", 4.5)]), "invalid_points"),
+            ("negative points", pts(&[("q5", -0.5)]), "invalid_points"),
+            ("NaN", pts(&[("q5", f64::NAN)]), "invalid_points"),
+            ("infinity", pts(&[("q5", f64::INFINITY)]), "invalid_points"),
+        ] {
+            let e = grade(&w, &w.teacher, &a, &req, NOW).unwrap_err();
+            assert_eq!((e.0, e.1.contains(wanted)), (StatusCode::BAD_REQUEST, true), "{label}");
+        }
+        // one bad part sinks the whole request, including the valid grade and comment that came with it
+        let e = grade(&w, &w.teacher, &a, &both(&[("q5", 3.0), ("q6", 1.0)], &[("q5", "حسن")]), NOW).unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        let e = grade(&w, &w.teacher, &a, &both(&[("q5", 3.0)], &[("q5", &"ع".repeat(501))]), NOW).unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        assert_eq!(row(&w, &a), (1.0, 1));
+        let o = outcome(&w, &a, "q5");
+        assert_eq!((o.correct, o.feedback, o.graded_by), (None, None, None), "nothing of the refused requests was stored");
+        assert!(regrades(&w).is_empty());
+        // who may write: the owner and any admin, nobody else; and only a submitted attempt
+        for (who, label) in [(&w.colleague, "a colleague"), (&w.student, "the student"), (&w.other, "another student")] {
+            assert_eq!(grade(&w, who, &a, &pts(&[("q5", 1.0)]), NOW).unwrap_err().0, StatusCode::FORBIDDEN, "{label}");
+            assert_eq!(grade(&w, who, &a, &fb(&[("q5", "x")]), NOW).unwrap_err().0, StatusCode::FORBIDDEN, "{label}: comments too");
+        }
+        assert_eq!(grade(&w, &w.admin, &a, &fb(&[("q5", "ملاحظة المدير")]), NOW).map(|r| r.pending).unwrap(), 1);
+        assert_eq!(grade(&w, &w.teacher, "nope", &pts(&[("q5", 1.0)]), NOW).unwrap_err().0, StatusCode::NOT_FOUND);
+        let open = start_attempt(&w.conn, &w.other, &w.exam, NOW).unwrap().attempt_id;
+        assert_eq!(grade(&w, &w.teacher, &open, &pts(&[("q5", 1.0)]), NOW).unwrap_err().0, StatusCode::CONFLICT, "in progress");
+    }
+
+    #[test]
+    fn writing_exactly_what_is_stored_changes_nothing() {
+        let w = world();
+        let a = sit_written(&w, NOW);
+        grade(&w, &w.teacher, &a, &both(&[("q5", 3.0), ("q6", 2.0)], &[("q5", "حسن")]), NOW + MIN).unwrap();
+        mark_all_read(&w, &w.student);
+        let stored = outcome(&w, &a, "q5");
+        let notices_before: i64 = w.conn.query_row("SELECT count(*) FROM notifications", [], |r| r.get(0)).unwrap();
+        // the same grade and comment again, hours later, by someone else
+        grade(&w, &w.admin, &a, &both(&[("q5", 3.0), ("q6", 2.0)], &[("q5", "  حسن ")]), NOW + 600 * MIN).unwrap();
+        let again = outcome(&w, &a, "q5");
+        assert_eq!((again.graded_by, again.graded_at, again.feedback), (stored.graded_by, stored.graded_at, stored.feedback), "no new attribution for a write that wrote nothing");
+        assert!(regrades(&w).is_empty());
+        assert_eq!(w.conn.query_row::<i64, _, _>("SELECT count(*) FROM notifications", [], |r| r.get(0)).unwrap(), notices_before, "and no notice");
+    }
+
+    #[test]
+    fn a_comment_edit_never_takes_a_grade_over_but_a_correction_of_the_points_does() {
+        let w = world();
+        let a = sit_written(&w, NOW);
+        // the teacher gives q5 its first grade (no audit row exists for it: the outcome is the only record)
+        grade(&w, &w.teacher, &a, &both(&[("q5", 3.0)], &[("q5", "أول تعليق")]), NOW + 5 * MIN).unwrap();
+        let first = outcome(&w, &a, "q5");
+        assert_eq!((first.graded_by.as_deref(), first.graded_at), (Some(w.teacher.id.as_str()), Some(NOW + 5 * MIN)));
+        // days later the admin fixes a typo in the comment only, and the same grader edits it again
+        grade(&w, &w.admin, &a, &fb(&[("q5", "تعليق بلا خطأ إملائي")]), NOW + 4 * 1440 * MIN).unwrap();
+        grade(&w, &w.teacher, &a, &fb(&[("q5", "تعليق ثالث")]), NOW + 5 * 1440 * MIN).unwrap();
+        let after = outcome(&w, &a, "q5");
+        assert_eq!(after.feedback.as_deref(), Some("تعليق ثالث"), "the comment did change");
+        assert_eq!((after.graded_by.as_deref(), after.graded_at), (Some(w.teacher.id.as_str()), Some(NOW + 5 * MIN)), "but the grade is still the teacher's, from Monday");
+        // the same points sent again by somebody else are not a write of points either
+        grade(&w, &w.admin, &a, &pts(&[("q5", 3.0)]), NOW + 6 * 1440 * MIN).unwrap();
+        assert_eq!(outcome(&w, &a, "q5").graded_by.as_deref(), Some(w.teacher.id.as_str()));
+        // a comment on an answer nobody has graded yet attributes nothing; the first grade that follows does
+        grade(&w, &w.admin, &a, &fb(&[("q6", "ملاحظة المدير")]), NOW + 7 * 1440 * MIN).unwrap();
+        assert_eq!(outcome(&w, &a, "q6").graded_by, None);
+        grade(&w, &w.teacher, &a, &both(&[("q6", 1.0)], &[("q6", "ملاحظة المدير")]), NOW + 8 * 1440 * MIN).unwrap();
+        assert_eq!(outcome(&w, &a, "q6").graded_by.as_deref(), Some(w.teacher.id.as_str()));
+        // points that really change are a correction and take the attribution (and are audited)
+        grade(&w, &w.admin, &a, &both(&[("q5", 4.0)], &[("q5", "تعليق رابع")]), NOW + 9 * 1440 * MIN).unwrap();
+        let fixed = outcome(&w, &a, "q5");
+        assert_eq!((fixed.graded_by.as_deref(), fixed.graded_at), (Some(w.admin.id.as_str()), Some(NOW + 9 * 1440 * MIN)));
+        assert_eq!(regrades(&w).len(), 1);
+    }
+
+    #[test]
+    fn a_comment_loses_control_zero_width_and_bidi_characters_and_an_invisible_one_clears_it() {
+        // the function itself
+        assert_eq!(clean_feedback("  جيد  ").as_deref(), Some("جيد"));
+        assert_eq!(clean_feedback("سطر\r\nثان\tوتبويب").as_deref(), Some("سطر\nثان\tوتبويب"), "line breaks and tabs stay; CR is dropped");
+        assert_eq!(clean_feedback("a\u{0}b\u{7}c\u{1b}d\u{85}e").as_deref(), Some("abcde"), "NUL, bell, escape, C1 controls");
+        assert_eq!(clean_feedback("\u{202E}gnirts\u{202C}").as_deref(), Some("gnirts"), "a right-to-left override cannot reverse what follows");
+        assert_eq!(clean_feedback("a\u{2066}b\u{2069}c\u{200B}d\u{200E}e\u{200F}f\u{FEFF}g\u{2060}h").as_deref(), Some("abcdefgh"));
+        assert_eq!(clean_feedback("\u{202E}  \u{200B}\u{FEFF}"), None, "nothing visible is left");
+        assert_eq!(clean_feedback("\u{200C}\u{200D} \n"), None, "joiners alone are invisible too");
+        assert_eq!(clean_feedback("می\u{200C}خواهم 👨\u{200D}👩").as_deref(), Some("می\u{200C}خواهم 👨\u{200D}👩"), "joiners between visible characters are kept");
+        assert_eq!(clean_feedback(""), None);
+        // and through a request
+        let w = world();
+        let a = sit_written(&w, NOW);
+        grade(&w, &w.teacher, &a, &fb(&[("q5", "\u{202E}تعليق\u{200B}")]), NOW + MIN).unwrap();
+        assert_eq!(outcome(&w, &a, "q5").feedback.as_deref(), Some("تعليق"));
+        let notices_before = notices(&w, &w.student, "feedback_added").len();
+        assert_eq!(notices_before, 1);
+        // a comment made only of invisible characters is a clear, never a new (empty-looking) comment
+        mark_all_read(&w, &w.student);
+        grade(&w, &w.teacher, &a, &fb(&[("q5", "\u{200B}\u{202E}")]), NOW + 2 * MIN).unwrap();
+        assert_eq!(outcome(&w, &a, "q5").feedback, None);
+        assert_eq!(notices(&w, &w.student, "feedback_added").len(), notices_before, "clearing is not news");
+        grade(&w, &w.teacher, &a, &fb(&[("q6", "\u{200B}")]), NOW + 3 * MIN).unwrap();
+        assert_eq!(outcome(&w, &a, "q6").feedback, None, "invisible text on a comment-free answer stores nothing");
+        // the 500 limit counts what is kept: hidden characters do not use it up
+        let padded = format!("\u{200B}{}\u{200B}", "ع".repeat(MAX_FEEDBACK_CHARS));
+        grade(&w, &w.teacher, &a, &fb(&[("q5", &padded)]), NOW + 4 * MIN).unwrap();
+        assert_eq!(outcome(&w, &a, "q5").feedback.as_deref().map(|t| t.chars().count()), Some(MAX_FEEDBACK_CHARS));
+    }
+
+    // ───── the audit trail ─────
+
+    #[test]
+    fn a_correction_writes_its_own_audit_row_and_first_grades_and_comment_edits_do_not() {
+        let w = world();
+        let a = sit_written(&w, NOW);
+        grade(&w, &w.teacher, &a, &both(&[("q5", 3.0)], &[("q5", "أول تعليق")]), NOW + MIN).unwrap(); // first grade
+        grade(&w, &w.teacher, &a, &fb(&[("q5", "تعليق ثان")]), NOW + 2 * MIN).unwrap(); // comment only
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 3.0)]), NOW + 3 * MIN).unwrap(); // same points
+        grade(&w, &w.teacher, &a, &pts(&[("q6", 2.0)]), NOW + 4 * MIN).unwrap(); // first grade of the other answer
+        assert!(regrades(&w).is_empty(), "no row for first grades, comment edits or unchanged points: {:?}", regrades(&w));
+        // a correction: the answer was graded and the points differ
+        grade(&w, &w.admin, &a, &pts(&[("q5", 4.0)]), NOW + 5 * MIN).unwrap();
+        let rows = regrades(&w);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].0.as_str(), rows[0].1.as_str(), rows[0].3), (w.admin.id.as_str(), a.as_str(), NOW + 5 * MIN), "who, which attempt, when");
+        assert_eq!(rows[0].2, serde_json::json!({"exam_id": w.exam, "question_id": "q5", "old": 3.0, "new": 4.0}));
+        // two corrections in one request: one row each
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 1.0), ("q6", 0.5)]), NOW + 6 * MIN).unwrap();
+        let rows = regrades(&w);
+        assert_eq!(rows.len(), 3);
+        let by_q = |q: &str| rows.iter().find(|r| r.2["question_id"] == q && r.2["new"] != 4.0).unwrap().2.clone();
+        assert_eq!((by_q("q5")["old"].as_f64(), by_q("q5")["new"].as_f64(), by_q("q6")["old"].as_f64(), by_q("q6")["new"].as_f64()), (Some(4.0), Some(1.0), Some(2.0), Some(0.5)));
+        // a failed correction leaves no row behind
+        let before = regrades(&w).len();
+        assert!(grade(&w, &w.teacher, &a, &pts(&[("q5", 2.0), ("q6", 99.0)]), NOW + 7 * MIN).is_err());
+        assert_eq!(regrades(&w).len(), before);
+    }
+
+    #[test]
+    fn a_failure_after_the_attempt_was_written_leaves_nothing_behind() {
+        let w = world();
+        let a = sit_written(&w, NOW);
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 3.0), ("q6", 1.0)]), NOW + MIN).unwrap();
+        mark_all_read(&w, &w.student);
+        let snapshot = |w: &W| -> (String, i64, i64) {
+            (
+                w.conn.query_row("SELECT results || score || pending FROM attempts WHERE id = ?1", params![a], |r| r.get(0)).unwrap(),
+                w.conn.query_row("SELECT count(*) FROM audit_log", [], |r| r.get(0)).unwrap(),
+                w.conn.query_row("SELECT count(*) FROM notifications", [], |r| r.get(0)).unwrap(),
+            )
+        };
+        let before = snapshot(&w);
+        // the trail cannot be written: the correction must not be stored without it
+        w.conn.execute_batch("CREATE TRIGGER no_trail BEFORE INSERT ON audit_log WHEN new.action = 'answer_regraded' BEGIN SELECT RAISE(ABORT, 'no trail'); END;").unwrap();
+        let e = grade(&w, &w.teacher, &a, &both(&[("q5", 4.0)], &[("q5", "تعليق")]), NOW + 2 * MIN).unwrap_err();
+        assert_eq!(e.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(snapshot(&w), before, "the new points, the comment and the notices are all gone with it");
+        // the notice cannot be written: same
+        w.conn.execute_batch("DROP TRIGGER no_trail; CREATE TRIGGER no_notice BEFORE INSERT ON notifications BEGIN SELECT RAISE(ABORT, 'no notice'); END;").unwrap();
+        assert_eq!(grade(&w, &w.teacher, &a, &pts(&[("q5", 4.0)]), NOW + 3 * MIN).unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(snapshot(&w), before);
+        // and once the obstacle is gone the same request goes through, as a whole
+        w.conn.execute_batch("DROP TRIGGER no_notice").unwrap();
+        grade(&w, &w.teacher, &a, &both(&[("q5", 4.0)], &[("q5", "تعليق")]), NOW + 4 * MIN).unwrap();
+        let after = snapshot(&w);
+        assert_eq!((after.1, after.2), (before.1 + 1, before.2 + 2), "one audit row, one score notice and one comment notice");
+    }
+
+    // ───── the student hears about it ─────
+
+    #[test]
+    fn assessment_graded_still_goes_out_exactly_once_when_the_last_pending_answer_is_graded() {
+        let w = world();
+        let a = sit_written(&w, NOW);
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 3.0)]), NOW + MIN).unwrap();
+        assert!(notices(&w, &w.student, "assessment_graded").is_empty(), "one answer is still waiting");
+        grade(&w, &w.teacher, &a, &fb(&[("q6", "تعليق")]), NOW + 2 * MIN).unwrap();
+        assert!(notices(&w, &w.student, "assessment_graded").is_empty(), "a comment is not a grade");
+        grade(&w, &w.teacher, &a, &pts(&[("q6", 2.0)]), NOW + 3 * MIN).unwrap();
+        let n = notices(&w, &w.student, "assessment_graded");
+        assert_eq!((n.len(), n[0].0.clone(), n[0].1.clone()), (1, serde_json::json!({"title": "اختبار التصحيح"}), format!("/platform/attempts/{a}")));
+        grade(&w, &w.teacher, &a, &pts(&[("q6", 1.0)]), NOW + 4 * MIN).unwrap();
+        assert_eq!(notices(&w, &w.student, "assessment_graded").len(), 1, "a later correction is not 'graded' again");
+    }
+
+    #[test]
+    fn a_correction_of_a_grade_tells_the_student_once_and_the_notice_vanishes_when_the_score_is_back() {
+        let w = world();
+        let a = sit_written(&w, NOW);
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 3.0), ("q6", 1.0)]), NOW + MIN).unwrap(); // score 1 + 3 + 1 = 5
+        assert_eq!(row(&w, &a), (5.0, 0));
+        mark_all_read(&w, &w.student);
+        let scored = |w: &W| notices(w, &w.student, "score_changed").into_iter().filter(|n| !n.2).collect::<Vec<_>>();
+        assert!(scored(&w).is_empty(), "first grades are not corrections");
+        // 5 -> 6
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 4.0)]), NOW + 2 * MIN).unwrap();
+        let n = scored(&w);
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].0, serde_json::json!({"title": "اختبار التصحيح", "old": 5.0, "new": 6.0, "total": 7.0, "cause": "grade"}));
+        assert_eq!(n[0].1, format!("/platform/attempts/{a}"));
+        // 6 -> 4: the same notice, still remembering the score the student last saw
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 2.0)]), NOW + 3 * MIN).unwrap();
+        let n = scored(&w);
+        assert_eq!((n.len(), n[0].0["old"].as_f64(), n[0].0["new"].as_f64(), n[0].0["cause"].as_str(), n[0].3), (1, Some(5.0), Some(4.0), Some("grade"), NOW + 3 * MIN));
+        // back to 5: nothing changed from the student's point of view, so the notice goes away
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 3.0)]), NOW + 4 * MIN).unwrap();
+        assert!(scored(&w).is_empty());
+        // a correction that nets out to nothing in one request tells nobody
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 4.0), ("q6", 0.0)]), NOW + 5 * MIN).unwrap();
+        assert!(scored(&w).is_empty(), "+1 and -1: the score did not move");
+        // once the student has read it, the next correction is a new notice from the new score
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 3.0)]), NOW + 6 * MIN).unwrap();
+        assert_eq!(scored(&w).len(), 1);
+        mark_all_read(&w, &w.student);
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 1.0)]), NOW + 7 * MIN).unwrap();
+        let n = scored(&w);
+        assert_eq!((n.len(), n[0].0["old"].as_f64(), n[0].0["new"].as_f64()), (1, Some(4.0), Some(2.0)));
+        assert_eq!(notices(&w, &w.student, "score_changed").len(), 2, "two rows in all: the read one and the new unread one");
+    }
+
+    #[test]
+    fn comments_reach_the_student_as_one_unread_notice_per_attempt() {
+        let w = world();
+        let a = sit_written(&w, NOW);
+        let b = sit(&w, &w.student, &[("q1", "B"), ("q5", "ثانية")], NOW + 10 * MIN);
+        let n = |w: &W, who: &User| notices(w, who, "feedback_added");
+        // a comment on a still-pending answer already counts
+        grade(&w, &w.teacher, &a, &fb(&[("q5", "فكرة جيدة")]), NOW + 20 * MIN).unwrap();
+        let first = n(&w, &w.student);
+        assert_eq!((first.len(), first[0].0.clone(), first[0].1.clone(), first[0].3), (1, serde_json::json!({"title": "اختبار التصحيح"}), format!("/platform/attempts/{a}"), NOW + 20 * MIN));
+        // more comments on the same attempt only move that notice up
+        grade(&w, &w.teacher, &a, &both(&[("q5", 4.0)], &[("q6", "أحسنت")]), NOW + 30 * MIN).unwrap();
+        grade(&w, &w.admin, &a, &fb(&[("q5", "تعليق معدّل")]), NOW + 40 * MIN).unwrap();
+        let after = n(&w, &w.student);
+        assert_eq!((after.len(), after[0].3), (1, NOW + 40 * MIN), "still one, moved to the latest comment");
+        // another attempt has its own
+        grade(&w, &w.teacher, &b, &fb(&[("q5", "وجهة نظر")]), NOW + 50 * MIN).unwrap();
+        assert_eq!(n(&w, &w.student).len(), 2);
+        // taking a comment away, or writing the same one, is not news
+        let before: Vec<i64> = n(&w, &w.student).iter().map(|x| x.3).collect();
+        grade(&w, &w.teacher, &b, &fb(&[("q5", "")]), NOW + 60 * MIN).unwrap();
+        grade(&w, &w.teacher, &a, &fb(&[("q5", "تعليق معدّل")]), NOW + 61 * MIN).unwrap();
+        assert_eq!(n(&w, &w.student).iter().map(|x| x.3).collect::<Vec<_>>(), before);
+        // after reading, a new comment makes a new notice
+        mark_all_read(&w, &w.student);
+        grade(&w, &w.teacher, &a, &fb(&[("q5", "تعليق جديد بعد القراءة")]), NOW + 70 * MIN).unwrap();
+        let unread: Vec<_> = n(&w, &w.student).into_iter().filter(|x| !x.2).collect();
+        assert_eq!((unread.len(), unread[0].3), (1, NOW + 70 * MIN));
+        // nobody else is told: not the other student, not the teachers
+        for who in [&w.other, &w.teacher, &w.colleague, &w.admin] {
+            assert!(n(&w, who).is_empty() && notices(&w, who, "score_changed").is_empty(), "{}", who.role);
+        }
+    }
+
+    #[test]
+    fn nothing_is_sent_while_the_result_is_withheld_and_the_student_sees_nothing_of_it() {
+        let w = world();
+        w.conn.execute("UPDATE assessments SET release_mode = 'after_close', closes_at = ?2 WHERE id = ?1", params![w.exam, FAR]).unwrap();
+        let a = sit_written(&w, NOW);
+        grade(&w, &w.teacher, &a, &both(&[("q5", 3.0), ("q6", 1.0)], &[("q5", "ملاحظة سرية")]), NOW + MIN).unwrap();
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 4.0)]), NOW + 2 * MIN).unwrap(); // a correction
+        grade(&w, &w.teacher, &a, &fb(&[("q6", "وأخرى")]), NOW + 3 * MIN).unwrap();
+        let total: i64 = w
+            .conn
+            .query_row("SELECT count(*) FROM notifications WHERE user_id = ?1 AND kind IN ('assessment_graded','score_changed','feedback_added')", params![w.student.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 0, "the release notification covers it later");
+        // and the student's own view is empty: no score, no items, no comments
+        let v = attempt_result(&w.conn, &w.student, &a).unwrap();
+        assert!((v.released, v.score, v.pending, v.items.is_none()) == (false, 0.0, 0, true));
+        assert!(!serde_json::to_string(&v).unwrap().contains("ملاحظة"), "no comment leaks before the release");
+        // the grader sees all of it, always
+        let g = attempt_result(&w.conn, &w.teacher, &a).unwrap();
+        assert_eq!(g.items.as_ref().unwrap().iter().filter(|i| i.feedback.is_some()).count(), 2);
+        // once the exam closes the student reads their feedback; the notices that were withheld are not retro-sent by grading
+        w.conn.execute("UPDATE assessments SET status = 'closed' WHERE id = ?1", params![w.exam]).unwrap();
+        let v = attempt_result(&w.conn, &w.student, &a).unwrap();
+        assert_eq!(v.items.as_ref().unwrap().iter().find(|i| i.id == "q5").unwrap().feedback.as_deref(), Some("ملاحظة سرية"));
+        // from now on the result is out: a correction is news
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 2.0)]), NOW + 4 * MIN).unwrap();
+        assert_eq!(notices(&w, &w.student, "score_changed").len(), 1);
+    }
+
+    #[test]
+    fn a_grader_is_never_told_about_their_own_attempt() {
+        let w = world();
+        // the teacher sits the exam themself (enrolled) - and grades it
+        w.conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![w.teacher.id]).unwrap();
+        let a = sit(&w, &w.teacher, &[("q1", "B"), ("q5", "x"), ("q6", "y")], NOW);
+        grade(&w, &w.teacher, &a, &both(&[("q5", 1.0), ("q6", 1.0)], &[("q5", "ممتاز")]), NOW + MIN).unwrap();
+        grade(&w, &w.teacher, &a, &both(&[("q5", 2.0)], &[("q6", "جيد")]), NOW + 2 * MIN).unwrap();
+        for kind in ["score_changed", "feedback_added"] {
+            assert!(notices(&w, &w.teacher, kind).is_empty(), "{kind}");
+        }
+        // somebody else grading the same attempt does tell them
+        grade(&w, &w.admin, &a, &both(&[("q5", 3.0)], &[("q6", "رأي المدير")]), NOW + 3 * MIN).unwrap();
+        assert_eq!((notices(&w, &w.teacher, "score_changed").len(), notices(&w, &w.teacher, "feedback_added").len()), (1, 1));
+    }
+
+    // ───── what each viewer gets back ─────
+
+    #[test]
+    fn the_student_sees_the_comment_once_released_and_only_graders_see_who_graded() {
+        let w = world();
+        let a = sit_written(&w, NOW);
+        grade(&w, &w.teacher, &a, &both(&[("q5", 3.0), ("q6", 2.0)], &[("q5", "تحليل جيد")]), NOW + 5 * MIN).unwrap();
+        let item = |r: &AttemptResult, q: &str| -> Value { serde_json::to_value(r.items.as_ref().unwrap().iter().find(|i| i.id == q).unwrap()).unwrap() };
+        // the student: the comment, never the grader
+        let s = attempt_result(&w.conn, &w.student, &a).unwrap();
+        let (q5, q6, q1) = (item(&s, "q5"), item(&s, "q6"), item(&s, "q1"));
+        assert_eq!((q5["feedback"].as_str(), q6["feedback"].is_null(), q1["feedback"].is_null()), (Some("تحليل جيد"), true, true));
+        for i in [&q5, &q6, &q1] {
+            assert!(i["graded_by_name"].is_null() && i["graded_at"].is_null(), "students never see who graded or when: {i}");
+        }
+        let raw = serde_json::to_string(&s).unwrap();
+        assert!(!raw.contains("المعلم أحمد") && !raw.contains(&w.teacher.id) && !raw.contains("graded_by\":\""), "no trace of the grader in the student's JSON: {raw}");
+        // the keys are always present (null), so a client can rely on the shape
+        for key in ["feedback", "graded_by_name", "graded_at"] {
+            assert!(q1.get(key).is_some(), "{key}");
+        }
+        // the owner, an admin: name and time, and the comment
+        for viewer in [&w.teacher, &w.admin] {
+            let g = attempt_result(&w.conn, viewer, &a).unwrap();
+            let q5 = item(&g, "q5");
+            assert_eq!((q5["graded_by_name"].as_str(), q5["graded_at"].as_i64(), q5["feedback"].as_str()), (Some("المعلم أحمد"), Some(NOW + 5 * MIN), Some("تحليل جيد")), "{}", viewer.role);
+            assert!(item(&g, "q1")["graded_by_name"].is_null(), "an automatically marked answer has no grader");
+        }
+        // a grader who was deleted afterwards leaves the time but no name
+        w.conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        w.conn.execute("DELETE FROM users WHERE id = ?1", params![w.teacher.id]).unwrap();
+        let g = attempt_result(&w.conn, &w.admin, &a).unwrap();
+        let q5 = item(&g, "q5");
+        assert_eq!((q5["graded_by_name"].is_null(), q5["graded_at"].as_i64()), (true, Some(NOW + 5 * MIN)));
+    }
+
+    #[test]
+    fn a_student_whose_exam_hides_the_answers_has_no_items_and_so_no_comments() {
+        let w = world();
+        w.conn.execute("UPDATE assessments SET show_answers = 0 WHERE id = ?1", params![w.exam]).unwrap();
+        let a = sit_written(&w, NOW);
+        grade(&w, &w.teacher, &a, &both(&[("q5", 3.0), ("q6", 2.0)], &[("q5", "ملاحظة")]), NOW + MIN).unwrap();
+        let s = attempt_result(&w.conn, &w.student, &a).unwrap();
+        assert!(s.items.is_none() && !serde_json::to_string(&s).unwrap().contains("ملاحظة"), "the per-question view is the exam's choice, and the comment lives in it");
+        assert!(attempt_result(&w.conn, &w.teacher, &a).unwrap().items.is_some());
+        // so the student is not sent to a page without the comment: no `feedback_added`, while the notices that DO lead
+        // somewhere (graded, score) still go out
+        assert!(notices(&w, &w.student, "feedback_added").is_empty(), "a notice about a comment the student can never open");
+        assert_eq!(notices(&w, &w.student, "assessment_graded").len(), 1);
+        grade(&w, &w.teacher, &a, &pts(&[("q5", 1.0)]), NOW + 2 * MIN).unwrap();
+        assert_eq!(notices(&w, &w.student, "score_changed").len(), 1);
+        // the comment is kept, and turning the answers on later makes it visible (and new comments are announced again)
+        w.conn.execute("UPDATE assessments SET show_answers = 1 WHERE id = ?1", params![w.exam]).unwrap();
+        let s = attempt_result(&w.conn, &w.student, &a).unwrap();
+        assert_eq!(s.items.as_ref().unwrap().iter().find(|i| i.id == "q5").unwrap().feedback.as_deref(), Some("ملاحظة"));
+        grade(&w, &w.teacher, &a, &fb(&[("q6", "تعليق جديد")]), NOW + 3 * MIN).unwrap();
+        assert_eq!(notices(&w, &w.student, "feedback_added").len(), 1);
+    }
+
+    #[test]
+    fn a_key_correction_keeps_the_comment_and_the_attribution_of_a_hand_grade() {
+        let w = world();
+        let a = sit_written(&w, NOW);
+        grade(&w, &w.teacher, &a, &both(&[("q5", 3.0)], &[("q5", "تعليق باقٍ"), ("q6", "على إجابة معلّقة")]), NOW + 5 * MIN).unwrap();
+        let before = outcome(&w, &a, "q5");
+        // the owner raises q5's worth from 4 to 5; the hand grade (3) stays, with its comment and its grader
+        let r = crate::platform_exam_key::CorrectReq { mode: Some("set".into()), score: Some(5.0), ..Default::default() };
+        crate::platform_exam_key::correct_question(&w.conn, &w.teacher, &w.exam, "q5", &r, NOW + 6 * MIN).unwrap();
+        let after = outcome(&w, &a, "q5");
+        assert_eq!((after.points, after.max, after.correct), (3.0, 5.0, Some(false)));
+        assert_eq!((after.graded_by.clone(), after.graded_at, after.feedback.clone()), (before.graded_by.clone(), before.graded_at, Some("تعليق باقٍ".into())));
+        // a still-pending answer keeps its comment through a key correction as well
+        let r6 = crate::platform_exam_key::CorrectReq { mode: Some("set".into()), score: Some(3.0), ..Default::default() };
+        crate::platform_exam_key::correct_question(&w.conn, &w.teacher, &w.exam, "q6", &r6, NOW + 7 * MIN).unwrap();
+        let q6 = outcome(&w, &a, "q6");
+        assert_eq!((q6.correct, q6.feedback.as_deref(), q6.graded_by), (None, Some("على إجابة معلّقة"), None));
+        // voiding sets the grade aside; the comment and attribution come back with it
+        let void = crate::platform_exam_key::CorrectReq { mode: Some("void".into()), ..Default::default() };
+        crate::platform_exam_key::correct_question(&w.conn, &w.teacher, &w.exam, "q5", &void, NOW + 8 * MIN).unwrap();
+        let voided = outcome(&w, &a, "q5");
+        assert_eq!((voided.kept, voided.feedback.as_deref(), voided.graded_by.as_deref()), (Some(3.0), Some("تعليق باقٍ"), Some(w.teacher.id.as_str())));
+        crate::platform_exam_key::correct_question(&w.conn, &w.teacher, &w.exam, "q5", &r, NOW + 9 * MIN).unwrap();
+        let back = outcome(&w, &a, "q5");
+        assert_eq!((back.points, back.feedback.as_deref(), back.graded_by.as_deref(), back.graded_at), (3.0, Some("تعليق باقٍ"), Some(w.teacher.id.as_str()), Some(NOW + 5 * MIN)));
+        // the answer-key path keeps its notice without a cause (that field belongs to grade corrections)
+        let key_notice = notices(&w, &w.student, "score_changed");
+        assert!(key_notice.iter().all(|n| n.0.get("cause").is_none()), "{key_notice:?}");
+    }
+
+    // ───── "answers wait for you": the throttled notice to the owner ─────
+
+    fn submissions(w: &W, owner: &User) -> Vec<(Value, String, bool, i64)> {
+        notices(w, owner, "submission_pending")
+    }
+
+    #[test]
+    fn the_owner_is_told_when_written_answers_wait_but_not_for_objective_only_submissions() {
+        let w = world();
+        sit(&w, &w.student, &[("q1", "B")], NOW); // nothing written: no answer waits for a grade
+        assert!(submissions(&w, &w.teacher).is_empty(), "blank written answers are 0 on their own");
+        sit(&w, &w.student, &[("q1", "B"), ("q5", "كتبت")], NOW + MIN);
+        let n = submissions(&w, &w.teacher);
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].0, serde_json::json!({"title": "اختبار التصحيح", "count": 1}));
+        assert_eq!(n[0].1, format!("/platform/grading/{}", w.exam));
+        assert_eq!(n[0].3, NOW + MIN + 1, "stamped with the moment of the submission");
+        // nobody else: not the colleague, not an admin, not the student
+        for who in [&w.colleague, &w.admin, &w.student, &w.other] {
+            assert!(submissions(&w, who).is_empty(), "{}", who.role);
+        }
+    }
+
+    #[test]
+    fn an_unread_notice_folds_later_submissions_and_a_read_one_throttles_for_an_hour_to_the_millisecond() {
+        let w = world();
+        let t0 = NOW;
+        sit(&w, &w.student, &[("q5", "أولى")], t0); // submitted at t0 + 1
+        // while it is unread, further submissions only bump it: count, time - never a second notice
+        sit(&w, &w.other, &[("q5", "ثانية")], t0 + 10 * MIN);
+        sit(&w, &w.student, &[("q6", "ثالثة")], t0 + 20 * MIN);
+        let n = submissions(&w, &w.teacher);
+        assert_eq!((n.len(), n[0].0["count"].as_i64(), n[0].3), (1, Some(3), t0 + 20 * MIN + 1));
+        // the teacher reads it. The newest notice is from t1; submissions inside the hour send nothing.
+        mark_all_read(&w, &w.teacher);
+        let t1 = t0 + 20 * MIN + 1;
+        sit(&w, &w.other, &[("q5", "رابعة")], t1 + 5 * MIN - 1);
+        sit(&w, &w.other, &[("q5", "خامسة")], t1 + 59 * MIN - 1); // submitted at t1 + 59:00
+        assert_eq!(submissions(&w, &w.teacher).len(), 1, "read, and inside the hour: nothing new");
+        // 59:59.999 after the notice: still inside
+        sit(&w, &w.other, &[("q5", "سادسة")], t1 + 60 * MIN - 1 - 1); // submitted at t1 + 59:59.999
+        assert_eq!(submissions(&w, &w.teacher).len(), 1, "one millisecond short of the hour");
+        // exactly an hour after the notice: a new one, counting from 1
+        sit(&w, &w.other, &[("q5", "سابعة")], t1 + 60 * MIN - 1); // submitted at t1 + 60:00.000
+        let n = submissions(&w, &w.teacher);
+        assert_eq!(n.len(), 2);
+        assert_eq!((n[1].0["count"].as_i64(), n[1].2, n[1].3), (Some(1), false, t1 + 60 * MIN));
+        // and that one is unread again, so it folds: never a third while it stays unread
+        sit(&w, &w.other, &[("q5", "ثامنة")], t1 + 200 * MIN);
+        let n = submissions(&w, &w.teacher);
+        assert_eq!((n.len(), n[1].0["count"].as_i64()), (2, Some(2)));
+    }
+
+    #[test]
+    fn each_exam_has_its_own_throttle_and_an_admins_exam_has_no_recipient() {
+        let w = world();
+        let second = create_assessment(&w.conn, &w.teacher, &exam_req(None)).unwrap().id;
+        sit(&w, &w.student, &[("q5", "أ")], NOW);
+        let st = start_attempt(&w.conn, &w.student, &second, NOW + MIN).unwrap();
+        submit_attempt(&w.conn, &w.student, &st.attempt_id, &ans(&[("q5", "ب")]), NOW + 2 * MIN).unwrap();
+        let n = submissions(&w, &w.teacher);
+        assert_eq!(n.len(), 2, "one per exam");
+        assert!(n.iter().any(|x| x.1.ends_with(&w.exam)) && n.iter().any(|x| x.1.ends_with(&second)));
+        // an exam an admin built belongs to nobody who could be told
+        let admin_exam = {
+            let r: crate::platform_exam_admin::ExamReq = serde_json::from_value(serde_json::json!({
+                "subject_id": "s1", "title": "امتحان المدير", "status": "published", "max_attempts": 3,
+                "questions": [{"id": "z1", "type": "short_answer", "stem": "اشرح", "answer": "مرجع", "score": 2}]
+            })).unwrap();
+            serde_json::to_value(crate::platform_exam_admin::create_exam(&w.conn, &w.admin, &r, NOW).unwrap()).unwrap()["id"].as_str().unwrap().to_string()
+        };
+        let st = start_attempt(&w.conn, &w.student, &admin_exam, NOW + 3 * MIN).unwrap();
+        submit_attempt(&w.conn, &w.student, &st.attempt_id, &ans(&[("z1", "إجابة مكتوبة")]), NOW + 4 * MIN).unwrap();
+        assert_eq!(w.conn.query_row::<i64, _, _>("SELECT pending FROM attempts WHERE id = ?1", params![st.attempt_id], |r| r.get(0)).unwrap(), 1, "the answer does wait for grading");
+        for who in [&w.admin, &w.teacher, &w.colleague] {
+            assert!(submissions(&w, who).iter().all(|x| !x.1.ends_with(&admin_exam)), "{}", who.role);
+        }
+        assert_eq!(w.conn.query_row::<i64, _, _>("SELECT count(*) FROM notifications WHERE kind = 'submission_pending'", [], |r| r.get(0)).unwrap(), 2);
+        // an owner whose account is not active any more is not written to (the sitting began before the suspension)
+        let open = start_attempt(&w.conn, &w.other, &w.exam, NOW + 400 * MIN).unwrap().attempt_id;
+        w.conn.execute("UPDATE users SET status = 'suspended' WHERE id = ?1", params![w.teacher.id]).unwrap();
+        mark_all_read(&w, &w.teacher);
+        submit_attempt(&w.conn, &w.other, &open, &ans(&[("q5", "ج")]), NOW + 500 * MIN).unwrap();
+        assert_eq!(submissions(&w, &w.teacher).len(), 2);
+    }
+
+    #[test]
+    fn the_overdue_settlement_that_submits_autosaved_answers_tells_the_owner_too() {
+        let w = world();
+        let timed = create_assessment(&w.conn, &w.teacher, &exam_req(Some(10))).unwrap().id;
+        let st = start_attempt(&w.conn, &w.student, &timed, NOW).unwrap();
+        save_answers(&w.conn, &w.student, &st.attempt_id, &ans(&[("q1", "B"), ("q5", "كتبت قبل الوقت")]), NOW + MIN).unwrap();
+        assert!(notices(&w, &w.teacher, "submission_pending").is_empty(), "still in progress");
+        // the browser went away; an hour later the sweep settles it from what was saved
+        let settled_at = NOW + 70 * MIN;
+        assert_eq!(settle_all(&w.conn, settled_at).unwrap(), 1);
+        let n = notices(&w, &w.teacher, "submission_pending");
+        assert_eq!((n.len(), n[0].0["count"].as_i64(), n[0].3), (1, Some(1), settled_at), "the notice is dated by the sweep, not by the deadline in the past");
+        assert_eq!(n[0].1, format!("/platform/grading/{timed}"));
+        // an attempt that never saved anything expires: nothing was written, nobody waits
+        let st2 = start_attempt(&w.conn, &w.other, &timed, NOW).unwrap();
+        mark_all_read(&w, &w.teacher);
+        assert_eq!(settle_all(&w.conn, NOW + 500 * MIN).unwrap(), 1);
+        assert_eq!(notices(&w, &w.teacher, "submission_pending").len(), 1);
+        assert_eq!(w.conn.query_row::<String, _, _>("SELECT status FROM attempts WHERE id = ?1", params![st2.attempt_id], |r| r.get(0)).unwrap(), "expired");
     }
 }

@@ -508,7 +508,7 @@ mod tests {
         let open = exam(&w, serde_json::json!({ "closes_at": real + 30 * 24 * H, "title": "فوري" }), real);
         let grade = |exam: &str, who: &User| {
             let attempt = take(&w, who, exam, real + MIN, MIN);
-            let g = crate::platform_exams::GradeReq { grades: [("q2".to_string(), 3.0)].into() };
+            let g = crate::platform_exams::GradeReq { grades: [("q2".to_string(), 3.0)].into(), ..Default::default() };
             crate::platform_exams::grade_attempt(&w.conn, &w.admin, &attempt, &g).unwrap();
         };
         grade(&held, &w.students[0]);

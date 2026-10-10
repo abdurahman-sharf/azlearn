@@ -929,7 +929,7 @@ mod tests {
         let answers: HashMap<String, String> = [("e1".to_string(), "إجابتي".to_string())].into();
         crate::platform_exams::submit_attempt(&w.conn, &student, &start.attempt_id, &answers, NOW + 2).unwrap();
         let teacher = insert_test_user(&w.conn, "t@x.com", "teacher", "active");
-        let grade = |who: &User, pts: f64| crate::platform_exams::grade_attempt(&w.conn, who, &start.attempt_id, &crate::platform_exams::GradeReq { grades: [("e1".to_string(), pts)].into() });
+        let grade = |who: &User, pts: f64| crate::platform_exams::grade_attempt(&w.conn, who, &start.attempt_id, &crate::platform_exams::GradeReq { grades: [("e1".to_string(), pts)].into(), ..Default::default() });
         assert_eq!(grade(&teacher, 3.0).unwrap_err().0, StatusCode::FORBIDDEN, "an unrelated teacher cannot grade an admin exam (yet)");
         assert_eq!(grade(&w.admin, 3.0).unwrap().score, 3.0, "the admin grades it");
         // a teacher-owned exam: the admin may close/archive/delete but not rewrite

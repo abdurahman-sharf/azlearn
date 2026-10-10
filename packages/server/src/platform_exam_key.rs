@@ -20,6 +20,7 @@
 
 use crate::platform::{bad, db_err, lock, rate_limit, require_admin, require_role, Res, User};
 use crate::platform_bank::clean_exam_question;
+use crate::platform_engage::{upsert_unread, Fold};
 use crate::platform_exams::{get_info, grade_one, is_released, load_questions, points_of, round2, Outcome};
 use crate::relay::{err, now_ms};
 use crate::routes::AppState;
@@ -29,7 +30,7 @@ use axum::{
     Json,
 };
 use exameow_core::exam::{Question, QuestionType};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -134,16 +135,23 @@ fn regrade(new_q: &Question, old: Option<&Outcome>, answer: Option<&str>) -> Out
     match manual {
         Some(p) if fresh.max > 0.0 => {
             let points = round2(p.clamp(0.0, fresh.max));
-            fresh = Outcome { id: fresh.id, correct: Some(points >= fresh.max), points, max: fresh.max, kept: None };
+            fresh = Outcome::auto(fresh.id, Some(points >= fresh.max), points, fresh.max);
         }
         Some(p) => fresh.kept = Some(p), // voided: nothing counts now, but the grade is remembered
         None => {}
+    }
+    // what a grader wrote by hand travels with the grade: who graded it and when, and the comment on the answer
+    // (a comment can exist on an answer that is still pending, and survives a void like the grade does)
+    if let Some(o) = old {
+        fresh.graded_by = o.graded_by.clone();
+        fresh.graded_at = o.graded_at;
+        fresh.feedback = o.feedback.clone();
     }
     fresh
 }
 
 fn same_outcome(a: &Outcome, b: &Outcome) -> bool {
-    a.correct == b.correct && (a.points - b.points).abs() < 1e-9 && (a.max - b.max).abs() < 1e-9 && a.kept == b.kept
+    a.correct == b.correct && (a.points - b.points).abs() < 1e-9 && (a.max - b.max).abs() < 1e-9 && a.kept == b.kept && a.graded_by == b.graded_by && a.graded_at == b.graded_at && a.feedback == b.feedback
 }
 
 fn plan(conn: &Connection, exam_id: &str, new_q: &Question) -> Res<Vec<Change>> {
@@ -182,39 +190,26 @@ fn clip(s: &str) -> String {
     s.chars().take(300).collect()
 }
 
-/// Tells a student their score changed — once per attempt, however often the key is corrected. An UNREAD notice for the
-/// same attempt is updated in place and keeps the score the student last saw as its `old` value (flipping a key back and
-/// forth would otherwise bury a whole class in notices); when the score ends up where it started, the notice goes away.
-fn tell_score_change(conn: &Connection, c: &Change, title: &str, total: f64, now: i64) -> Res<()> {
-    let link = format!("/platform/attempts/{}", c.attempt_id);
-    let unread: Option<(String, String)> = conn
-        .query_row(
-            "SELECT id, data FROM notifications WHERE user_id = ?1 AND kind = 'score_changed' AND link = ?2 AND read_at IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            params![c.student_id, link],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(db_err)?;
-    let shown_before = unread.as_ref().and_then(|(_, data)| serde_json::from_str::<serde_json::Value>(data).ok()).and_then(|v| v["old"].as_f64());
-    let old = shown_before.unwrap_or(c.old_score);
-    match unread {
-        Some((id, _)) if (c.new_score - old).abs() <= 1e-9 => {
-            conn.execute("DELETE FROM notifications WHERE id = ?1", params![id]).map_err(db_err)?;
+/// Tells a student their score changed - once per attempt, however often it changes. An UNREAD notice for the same
+/// attempt is updated in place and keeps the score the student last saw as its `old` value (flipping a key back and
+/// forth, or re-grading an answer twice, would otherwise bury a whole class in notices); when the score ends up where it
+/// started, the notice goes away. `cause` is `None` for an answer-key correction (phase 3-3) and `Some("grade")` for a
+/// correction of a manual grade (phase 3-4); a notice that was updated by the other cause takes the latest one. Shared by
+/// both paths; built on the one coalescing helper of `platform_engage`.
+pub(crate) fn tell_score_change(conn: &Connection, student_id: &str, attempt_id: &str, title: &str, old_score: f64, new_score: f64, total: f64, cause: Option<&str>, now: i64) -> Res<()> {
+    let link = format!("/platform/attempts/{attempt_id}");
+    upsert_unread(conn, student_id, "score_changed", &link, now, |current| {
+        // the score the student last saw: the `old` of the unread notice, when there is one
+        let old = current.as_ref().and_then(|d| d["old"].as_f64()).unwrap_or(old_score);
+        if current.is_some() && (new_score - old).abs() <= 1e-9 {
+            return Ok(Fold::Remove);
         }
-        Some((id, _)) => {
-            let data = json!({ "title": title, "old": old, "new": c.new_score, "total": total });
-            conn.execute("UPDATE notifications SET data = ?2, created_at = ?3 WHERE id = ?1", params![id, data.to_string(), now]).map_err(db_err)?;
+        let mut data = json!({ "title": title, "old": old, "new": new_score, "total": total });
+        if let Some(c) = cause {
+            data["cause"] = json!(c);
         }
-        None => {
-            let data = json!({ "title": title, "old": c.old_score, "new": c.new_score, "total": total });
-            conn.execute(
-                "INSERT INTO notifications(id, user_id, kind, data, link, created_at) VALUES (?1, ?2, 'score_changed', ?3, ?4, ?5)",
-                params![crate::platform::new_id(), c.student_id, data.to_string(), link, now],
-            )
-            .map_err(db_err)?;
-        }
-    }
-    Ok(())
+        Ok(Fold::Write(data))
+    })
 }
 
 /// Corrects one question of an exam; see the module docs. `dry_run` writes nothing.
@@ -284,7 +279,7 @@ pub fn correct_question(conn: &Connection, user: &User, exam_id: &str, question_
             // Tell the student only when the result is out now; one whose result is withheld (`after_close`) hears
             // about it with the release notification, as before.
             if c.score_changed() && released {
-                tell_score_change(conn, c, &info.title, new_total, now)?;
+                tell_score_change(conn, &c.student_id, &c.attempt_id, &info.title, c.old_score, c.new_score, new_total, None, now)?;
             }
         }
         let detail = json!({
@@ -583,7 +578,7 @@ mod tests {
         let w = world();
         let at = class(&w);
         // s0 and s2 wrote something for q5 (4 points); the teacher grades s0 with 3 and leaves s2 for later
-        grade_attempt(&w.conn, &w.teacher, &at[0], &GradeReq { grades: [("q5".to_string(), 3.0)].into() }).unwrap();
+        grade_attempt(&w.conn, &w.teacher, &at[0], &GradeReq { grades: [("q5".to_string(), 3.0)].into(), ..Default::default() }).unwrap();
         assert_eq!((scores(&w, &at), pendings(&w, &at)), (vec![8.0, 0.0, 3.0, 0.0], vec![0, 0, 1, 0]));
         // 1. an objective correction leaves the manual grade and the pending answer exactly as they were
         fix(&w, &w.teacher, "q1", json!({"mode": "set", "answer": "C"})).unwrap();
@@ -606,16 +601,16 @@ mod tests {
         let o = outcome(&w, &at[0], "q5");
         assert_eq!((o.points, o.max, o.correct), (2.0, 6.0, Some(false)));
         // the teacher can still grade the pending answer afterwards, within the new maximum
-        let g = grade_attempt(&w.conn, &w.teacher, &at[2], &GradeReq { grades: [("q5".to_string(), 6.0)].into() }).unwrap();
+        let g = grade_attempt(&w.conn, &w.teacher, &at[2], &GradeReq { grades: [("q5".to_string(), 6.0)].into(), ..Default::default() }).unwrap();
         assert_eq!(serde_json::to_value(&g).unwrap()["pending"], json!(0));
-        assert_eq!(grade_attempt(&w.conn, &w.teacher, &at[2], &GradeReq { grades: [("q5".to_string(), 7.0)].into() }).unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(grade_attempt(&w.conn, &w.teacher, &at[2], &GradeReq { grades: [("q5".to_string(), 7.0)].into(), ..Default::default() }).unwrap_err().0, StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn voiding_a_short_answer_settles_it_and_restoring_it_hands_the_hand_given_grades_back() {
         let w = world();
         let at = class(&w);
-        grade_attempt(&w.conn, &w.teacher, &at[0], &GradeReq { grades: [("q5".to_string(), 3.0)].into() }).unwrap();
+        grade_attempt(&w.conn, &w.teacher, &at[0], &GradeReq { grades: [("q5".to_string(), 3.0)].into(), ..Default::default() }).unwrap();
         assert_eq!((scores(&w, &at), pendings(&w, &at)), (vec![8.0, 0.0, 3.0, 0.0], vec![0, 0, 1, 0]));
         let r = fix(&w, &w.teacher, "q5", json!({"mode": "void"})).unwrap();
         assert_eq!((r.old_total, r.new_total, r.question.score), (9.0, 5.0, Some(0.0)));
@@ -643,8 +638,8 @@ mod tests {
     fn a_hand_given_grade_survives_zero_points_voiding_twice_and_a_different_maximum_when_it_comes_back() {
         let w = world();
         let at = class(&w);
-        grade_attempt(&w.conn, &w.teacher, &at[0], &GradeReq { grades: [("q5".to_string(), 3.0)].into() }).unwrap();
-        grade_attempt(&w.conn, &w.teacher, &at[2], &GradeReq { grades: [("q5".to_string(), 1.0)].into() }).unwrap();
+        grade_attempt(&w.conn, &w.teacher, &at[0], &GradeReq { grades: [("q5".to_string(), 3.0)].into(), ..Default::default() }).unwrap();
+        grade_attempt(&w.conn, &w.teacher, &at[2], &GradeReq { grades: [("q5".to_string(), 1.0)].into(), ..Default::default() }).unwrap();
         assert_eq!(scores(&w, &at), vec![8.0, 0.0, 4.0, 0.0]);
         // setting the points to 0 is the same as voiding; doing it twice, or voiding afterwards, keeps what was set aside
         fix(&w, &w.teacher, "q5", json!({"mode": "set", "score": 0})).unwrap();

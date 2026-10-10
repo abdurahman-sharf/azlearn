@@ -176,11 +176,11 @@ mod tests {
     }
 
     fn post(conn: &Connection, id: &str, t: &User, status: &str) {
-        conn.execute("INSERT INTO posts VALUES (?1, ?2, 's1', 'article', 'عنوان', 'نص', ?3, NULL, 0, 0)", params![id, t.id, status]).unwrap();
+        conn.execute("INSERT INTO posts VALUES (?1, ?2, 's1', 'article', 'عنوان', 'نص', ?3, NULL, 0, 0, NULL)", params![id, t.id, status]).unwrap();
     }
 
     fn course(conn: &Connection, id: &str, t: &User, status: &str) {
-        conn.execute("INSERT INTO courses VALUES (?1, ?2, 's1', 'دورة', NULL, ?3, 0, 0)", params![id, t.id, status]).unwrap();
+        conn.execute("INSERT INTO courses VALUES (?1, ?2, 's1', 'دورة', NULL, ?3, 0, 0, NULL)", params![id, t.id, status]).unwrap();
     }
 
     fn live(conn: &Connection, id: &str, t: &User, starts: i64, minutes: i64, status: &str) {

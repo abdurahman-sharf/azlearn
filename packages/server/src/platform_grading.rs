@@ -4,8 +4,8 @@
 //! Who may use it: any admin; the owning teacher of a teacher's exam; for an admin-created exam any
 //! active teacher approved for its subject (`platform_exams::can_grade`). Students never reach any of it.
 
-use crate::platform::{audit, bad, db_err, lock, require_active, Res, User};
-use crate::platform_exams::{can_grade, get_info, load_questions, passed_flag, points_of, round2, settle_assessment, AssessmentInfo, GradeReq, Outcome};
+use crate::platform::{audit, bad, db_err, like_pattern, lock, require_active, Res, User};
+use crate::platform_exams::{can_grade, get_info, grade_attempt_at, load_questions, passed_flag, points_of, round2, settle_assessment, AssessmentInfo, GradeReq, Outcome};
 use crate::relay::{err, now_ms};
 use crate::routes::AppState;
 use axum::{
@@ -41,28 +41,58 @@ fn require_grader(conn: &Connection, user: &User, id: &str) -> Res<()> {
 pub struct PendingExam {
     assessment_id: String,
     title: String,
+    subject_id: String,
     subject_name: String,
     pending_attempts: i64,
     pending_answers: i64,
     oldest_submitted_at: Option<i64>,
+    /// Submitted attempts of the exam, graded or not (the context of "N waiting").
+    attempts_total: i64,
+    /// The caller owns the exam by the codebase's one ownership rule (`AssessmentInfo::owned_by`): a teacher owns the
+    /// exams whose `teacher_id` is theirs, an admin owns the exams created by an admin (no teacher). False for an admin's
+    /// exam a teacher grades by subject approval, and for a teacher's exam an admin looks at. The queue tags those
+    /// "not your exam" for teachers only (an admin sees teachers' exams as a matter of course).
+    owned: bool,
 }
 
 /// Exams with manual grading still to do that this user may grade, oldest waiting first.
 pub fn pending_exams(conn: &Connection, user: &User) -> Res<Vec<PendingExam>> {
+    pending_rows(conn, user, None)
+}
+
+/// [`pending_exams`] restricted to one subject. A blank id means "no filter"; an id that matches nothing gives an empty
+/// list (the id is only ever compared, never used as a pattern).
+pub fn pending_exams_for_subject(conn: &Connection, user: &User, subject_id: &str) -> Res<Vec<PendingExam>> {
+    pending_rows(conn, user, Some(subject_id).filter(|s| !s.trim().is_empty()))
+}
+
+fn pending_rows(conn: &Connection, user: &User, subject_id: Option<&str>) -> Res<Vec<PendingExam>> {
     if user.role != "admin" && user.role != "teacher" {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
     conn.prepare(
-        "SELECT a.id, a.title, s.name_ar, count(*), sum(t.pending), min(t.submitted_at)
+        "SELECT a.id, a.title, s.name_ar, count(*), sum(t.pending), min(t.submitted_at), a.subject_id,
+                (SELECT count(*) FROM attempts x WHERE x.assessment_id = a.id AND x.status = 'submitted'),
+                ((?1 = 'teacher' AND a.teacher_id IS NOT NULL AND a.teacher_id = ?2) OR (?1 = 'admin' AND a.teacher_id IS NULL))
          FROM attempts t JOIN assessments a ON a.id = t.assessment_id JOIN subjects s ON s.id = a.subject_id
-         WHERE t.status = 'submitted' AND t.pending > 0 AND (
+         WHERE t.status = 'submitted' AND t.pending > 0 AND (?3 IS NULL OR a.subject_id = ?3) AND (
                ?1 = 'admin' OR (?1 = 'teacher' AND (a.teacher_id = ?2 OR (a.teacher_id IS NULL AND EXISTS(
                  SELECT 1 FROM teacher_subjects ts WHERE ts.teacher_id = ?2 AND ts.subject_id = a.subject_id AND ts.status = 'approved')))))
          GROUP BY a.id ORDER BY min(t.submitted_at), a.id LIMIT 200",
     )
     .map_err(db_err)?
-    .query_map(params![user.role, user.id], |r| {
-        Ok(PendingExam { assessment_id: r.get(0)?, title: r.get(1)?, subject_name: r.get(2)?, pending_attempts: r.get(3)?, pending_answers: r.get(4)?, oldest_submitted_at: r.get(5)? })
+    .query_map(params![user.role, user.id, subject_id], |r| {
+        Ok(PendingExam {
+            assessment_id: r.get(0)?,
+            title: r.get(1)?,
+            subject_name: r.get(2)?,
+            pending_attempts: r.get(3)?,
+            pending_answers: r.get(4)?,
+            oldest_submitted_at: r.get(5)?,
+            subject_id: r.get(6)?,
+            attempts_total: r.get(7)?,
+            owned: r.get(8)?,
+        })
     })
     .map_err(db_err)?
     .collect::<Result<Vec<_>, _>>()
@@ -79,6 +109,10 @@ pub struct GradingAnswer {
     /// `None` while the answer waits for its first grade.
     points: Option<f64>,
     submitted_at: Option<i64>,
+    /// The comment already written on this answer, if any.
+    feedback: Option<String>,
+    /// When a grader last gave the points (first grade or a correction); `None` while ungraded.
+    graded_at: Option<i64>,
 }
 
 #[derive(Serialize, Debug)]
@@ -97,6 +131,9 @@ pub struct GradingSheet {
     assessment_id: String,
     title: String,
     subject_name: String,
+    /// The exam shows its students the per-question view. When it does not, they never see the comments written here
+    /// (and are not told about them); the sheet says so to the grader.
+    show_answers: bool,
     questions: Vec<GradingQuestion>,
 }
 
@@ -126,24 +163,38 @@ pub fn grading_sheet(conn: &Connection, user: &User, id: &str, only_pending: boo
         let outcomes: Vec<Outcome> = serde_json::from_str(&results_raw).unwrap_or_default();
         for q in out.iter_mut() {
             let Some(text) = answers.get(&q.id).filter(|a| !a.trim().is_empty()) else { continue };
-            let graded = outcomes.iter().find(|o| o.id == q.id).filter(|o| o.correct.is_some()).map(|o| o.points);
+            let outcome = outcomes.iter().find(|o| o.id == q.id);
+            let graded = outcome.filter(|o| o.correct.is_some()).map(|o| o.points);
             if graded.is_none() {
                 q.pending += 1;
             }
             if only_pending && graded.is_some() {
                 continue;
             }
-            q.answers.push(GradingAnswer { attempt_id: attempt_id.clone(), student_name: name.clone(), answer: text.clone(), points: graded, submitted_at });
+            q.answers.push(GradingAnswer {
+                attempt_id: attempt_id.clone(),
+                student_name: name.clone(),
+                answer: text.clone(),
+                points: graded,
+                submitted_at,
+                feedback: outcome.and_then(|o| o.feedback.clone()),
+                graded_at: outcome.filter(|o| o.correct.is_some()).and_then(|o| o.graded_at),
+            });
         }
     }
-    Ok(GradingSheet { assessment_id: id.to_string(), title: info.title, subject_name: info.subject_name, questions: out })
+    Ok(GradingSheet { assessment_id: id.to_string(), title: info.title, subject_name: info.subject_name, show_answers: info.show_answers, questions: out })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct BatchItem {
     attempt_id: String,
     question_id: String,
-    points: f64,
+    /// New points. Optional so that a comment can be edited alone; an item needs `points` or `feedback` (or both).
+    #[serde(default)]
+    points: Option<f64>,
+    /// New comment: absent leaves it, an empty text clears it.
+    #[serde(default)]
+    feedback: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -156,28 +207,45 @@ pub struct BatchResult {
     updated: usize,
 }
 
-/// Grades many answers in one transaction: either every grade is stored or none is.
+/// Grades many answers in one transaction: either every grade is stored or none is. Every attempt goes through
+/// `platform_exams::grade_attempt` - the rules (what can be graded, the audit rows of corrections, the notices) live
+/// there once, and its savepoint joins this transaction.
 pub fn grade_batch(conn: &Connection, user: &User, id: &str, r: &BatchReq) -> Res<BatchResult> {
+    grade_batch_at(conn, user, id, r, now_ms())
+}
+
+pub fn grade_batch_at(conn: &Connection, user: &User, id: &str, r: &BatchReq, now: i64) -> Res<BatchResult> {
     require_grader(conn, user, id)?;
     if r.grades.is_empty() || r.grades.len() > MAX_BATCH {
         return Err(bad("invalid_selection"));
     }
-    let mut by_attempt: HashMap<&str, HashMap<String, f64>> = HashMap::new();
+    // attempts are handled in id order, so which error is reported first does not depend on hashing
+    let mut by_attempt: std::collections::BTreeMap<&str, GradeReq> = std::collections::BTreeMap::new();
     for g in &r.grades {
-        if by_attempt.entry(g.attempt_id.as_str()).or_default().insert(g.question_id.clone(), g.points).is_some() {
+        if g.points.is_none() && g.feedback.is_none() {
+            return Err(bad("invalid_selection")); // an item that changes nothing
+        }
+        let req = by_attempt.entry(g.attempt_id.as_str()).or_default();
+        if req.grades.contains_key(&g.question_id) || req.feedback.contains_key(&g.question_id) {
             return Err(bad("invalid_selection")); // the same answer twice in one request
+        }
+        if let Some(p) = g.points {
+            req.grades.insert(g.question_id.clone(), p);
+        }
+        if let Some(f) = &g.feedback {
+            req.feedback.insert(g.question_id.clone(), f.clone());
         }
     }
     conn.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
     let result = (|| -> Res<()> {
-        for (attempt_id, grades) in &by_attempt {
+        for (attempt_id, req) in &by_attempt {
             let belongs: bool = conn
                 .query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE id = ?1 AND assessment_id = ?2)", params![attempt_id, id], |x| x.get(0))
                 .map_err(db_err)?;
             if !belongs {
                 return Err(err(StatusCode::NOT_FOUND, "not_found"));
             }
-            crate::platform_exams::grade_attempt(conn, user, attempt_id, &GradeReq { grades: grades.clone() })?;
+            grade_attempt_at(conn, user, attempt_id, req, now)?;
         }
         audit(conn, &user.id, id, "grades_saved", &format!("{} answer(s)", r.grades.len()));
         Ok(())
@@ -380,6 +448,8 @@ pub struct TableQuery {
     q: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
+    /// `attempts` (default: one row per attempt) | `students` (one row per student, see [`students_table`]).
+    view: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -482,6 +552,225 @@ pub fn attempts_table(conn: &Connection, user: &User, id: &str, f: &TableQuery, 
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
     Ok(TablePage { items, total })
+}
+
+// ───────── one row per student ─────────
+
+#[derive(Serialize, Debug)]
+pub struct StudentSummary {
+    student_id: String,
+    student_name: String,
+    /// Only admins see e-mail addresses.
+    email: Option<String>,
+    /// Attempts of any status.
+    attempts: i64,
+    best_score: Option<f64>,
+    best_percent: Option<f64>,
+    best_attempt_id: Option<String>,
+    last_attempt_id: String,
+    last_status: String,
+    last_submitted_at: Option<i64>,
+    /// The best attempt's pass flag; `None` without a pass mark, while that attempt waits for grading, or without one.
+    passed: Option<bool>,
+    /// Written answers waiting for a grade, over all of the student's submitted attempts.
+    pending: i64,
+    /// Tab/focus losses, summed over all of the student's attempts.
+    tab_leaves: i64,
+}
+
+#[derive(Serialize, Debug)]
+pub struct StudentsPage {
+    items: Vec<StudentSummary>,
+    total: i64,
+}
+
+struct AttemptFacts {
+    id: String,
+    status: String,
+    score: f64,
+    pending: i64,
+    started_at: i64,
+    submitted_at: Option<i64>,
+    tab_leaves: i64,
+}
+
+struct StudentAcc {
+    name: String,
+    email: String,
+    attempts: Vec<AttemptFacts>,
+}
+
+/// The student's best attempt: among SUBMITTED attempts the highest score, a fully graded attempt always ahead of one
+/// that still waits for grading (its partial score would be a guess - the same rule the analytics use); a tie goes to
+/// the later one.
+fn best_attempt(attempts: &[AttemptFacts]) -> Option<&AttemptFacts> {
+    attempts.iter().filter(|a| a.status == "submitted").max_by(|a, b| {
+        (a.pending == 0, a.score, a.submitted_at.unwrap_or(a.started_at), &a.id)
+            .partial_cmp(&(b.pending == 0, b.score, b.submitted_at.unwrap_or(b.started_at), &b.id))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+/// "Per student" view of the results table: one row per student who has an attempt of any status. Same access rule as
+/// the attempts table (`can_grade`); e-mail addresses only for admins.
+///
+/// * best attempt, `passed`: see [`best_attempt`];
+/// * filter `result`: `passed` / `failed` (the best attempt's verdict) or `pending` (at least one written answer of any
+///   submitted attempt still waits for a grade); anything else is a 400 `invalid_filter`, like an unknown `sort`
+///   (`name` | `best` | `attempts` | `last`) or `dir`;
+/// * `q` searches the name (case-insensitive; `%` and `_` are ordinary characters); `limit` 1..100 (default 25), `offset`.
+pub fn students_table(conn: &Connection, user: &User, id: &str, f: &TableQuery, now: i64) -> Res<StudentsPage> {
+    require_grader(conn, user, id)?;
+    let result = f.result.as_deref().unwrap_or("");
+    if !["", "all", "passed", "failed", "pending"].contains(&result) {
+        return Err(bad("invalid_filter"));
+    }
+    let sort = f.sort.as_deref().unwrap_or("last");
+    if !["name", "best", "attempts", "last"].contains(&sort) {
+        return Err(bad("invalid_filter"));
+    }
+    let desc = match f.dir.as_deref().unwrap_or("desc") {
+        "asc" => false,
+        "desc" => true,
+        _ => return Err(bad("invalid_filter")),
+    };
+    let info = get_info(conn, &user.id, id)?;
+    settle_assessment(conn, id, info.duration_min, now)?;
+    let rows: Vec<(String, String, String, AttemptFacts)> = conn
+        .prepare(
+            "SELECT t.student_id, u.full_name, u.email, t.id, t.status, t.score, t.pending, t.started_at, t.submitted_at, t.tab_leaves
+             FROM attempts t JOIN users u ON u.id = t.student_id WHERE t.assessment_id = ?1 ORDER BY t.started_at, t.id LIMIT ?2",
+        )
+        .map_err(db_err)?
+        .query_map(params![id, MAX_ATTEMPTS_LOADED], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                AttemptFacts { id: r.get(3)?, status: r.get(4)?, score: r.get(5)?, pending: r.get(6)?, started_at: r.get(7)?, submitted_at: r.get(8)?, tab_leaves: r.get(9)? },
+            ))
+        })
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    let mut by_student: HashMap<String, StudentAcc> = HashMap::new();
+    for (student, name, email, a) in rows {
+        by_student.entry(student).or_insert_with(|| StudentAcc { name, email, attempts: vec![] }).attempts.push(a);
+    }
+    let needle = f.q.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase);
+    let show_email = user.role == "admin";
+    let total_points = info.total_points;
+    // each row travels with the moment of its latest attempt (handed in, or started) - what `sort=last` orders by
+    let mut items: Vec<(StudentSummary, i64)> = by_student
+        .into_iter()
+        .filter(|(_, acc)| needle.as_ref().map_or(true, |n| acc.name.to_lowercase().contains(n.as_str())))
+        .map(|(student_id, acc)| {
+            let best = best_attempt(&acc.attempts);
+            // `attempts` is ordered by start time, so the last element is the latest attempt
+            let last = acc.attempts.last().expect("a student row has at least one attempt");
+            let summary = StudentSummary {
+                student_name: acc.name.clone(),
+                email: show_email.then(|| acc.email.clone()),
+                attempts: acc.attempts.len() as i64,
+                best_score: best.map(|b| b.score),
+                best_percent: best.filter(|_| total_points > 0.0).map(|b| round2(b.score / total_points * 100.0)),
+                best_attempt_id: best.map(|b| b.id.clone()),
+                last_attempt_id: last.id.clone(),
+                last_status: last.status.clone(),
+                last_submitted_at: last.submitted_at,
+                passed: best.and_then(|b| passed_flag(b.score, total_points, b.pending, info.pass_mark)),
+                pending: acc.attempts.iter().filter(|a| a.status == "submitted").map(|a| a.pending).sum(),
+                tab_leaves: acc.attempts.iter().map(|a| a.tab_leaves).sum(),
+                student_id,
+            };
+            (summary, last.submitted_at.unwrap_or(last.started_at))
+        })
+        .filter(|(s, _)| match result {
+            "passed" => s.passed == Some(true),
+            "failed" => s.passed == Some(false),
+            "pending" => s.pending > 0,
+            _ => true,
+        })
+        .collect();
+    items.sort_by(|(a, a_last), (b, b_last)| {
+        use std::cmp::Ordering::*;
+        let ord = match sort {
+            "name" => a.student_name.to_lowercase().cmp(&b.student_name.to_lowercase()),
+            "attempts" => a.attempts.cmp(&b.attempts),
+            "last" => a_last.cmp(b_last),
+            // "best": a student without a submitted attempt is always last, whichever way the list runs
+            _ => match (a.best_score, b.best_score) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Equal),
+                (Some(_), None) => return Less,
+                (None, Some(_)) => return Greater,
+                (None, None) => Equal,
+            },
+        };
+        let ord = if desc { ord.reverse() } else { ord };
+        ord.then_with(|| a.student_name.to_lowercase().cmp(&b.student_name.to_lowercase())).then_with(|| a.student_id.cmp(&b.student_id))
+    });
+    let total = items.len() as i64;
+    let limit = f.limit.unwrap_or(25).clamp(1, 100) as usize;
+    let offset = f.offset.unwrap_or(0).clamp(0, 10_000_000) as usize;
+    Ok(StudentsPage { items: items.into_iter().map(|(s, _)| s).skip(offset).take(limit).collect(), total })
+}
+
+// ───────── who has not taken it ─────────
+
+#[derive(Deserialize, Default, Debug)]
+pub struct AbsentQuery {
+    q: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct AbsentStudent {
+    student_id: String,
+    student_name: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct AbsentPage {
+    items: Vec<AbsentStudent>,
+    /// Absent students matching the search.
+    total: i64,
+    /// Active students enrolled in the exam's subject (the whole class, whatever the search).
+    enrolled: i64,
+}
+
+/// Active students enrolled in the exam's subject who have no attempt of ANY status on it (an unfinished or expired
+/// attempt counts as having come), by name. **Names only** - never an e-mail address, not even for an admin. Same access
+/// rule as the other results (`can_grade`), **plus** - for a teacher - a live approved assignment for the subject: this
+/// is the subject's class list as it is today (students who enrolled long after the results were written, and may
+/// never have sat the exam), not results the teacher already owns, so a teacher whose assignment was taken away keeps
+/// their old results but not the roster. It works for an exam whose subject or institution is switched off too (the
+/// approval is all that is asked), since the grader still owns the results.
+pub fn absent_students(conn: &Connection, user: &User, id: &str, f: &AbsentQuery) -> Res<AbsentPage> {
+    require_grader(conn, user, id)?;
+    let info = get_info(conn, &user.id, id)?;
+    if user.role != "admin" && !crate::platform_content::is_approved_for(conn, &user.id, &info.subject_id)? {
+        return Err(err(StatusCode::FORBIDDEN, "forbidden"));
+    }
+    let class = "FROM subject_enrollments e JOIN users u ON u.id = e.student_id AND u.role = 'student' AND u.status = 'active' WHERE e.subject_id = ?1";
+    let enrolled: i64 = conn.query_row(&format!("SELECT count(*) {class}"), params![info.subject_id], |r| r.get(0)).map_err(db_err)?;
+    let mut args: Vec<Value> = vec![Value::Text(info.subject_id.clone()), Value::Text(id.to_string())];
+    let mut conds = "AND NOT EXISTS(SELECT 1 FROM attempts t WHERE t.assessment_id = ?2 AND t.student_id = u.id)".to_string();
+    if let Some(q) = f.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        args.push(Value::Text(like_pattern(q)));
+        conds.push_str(&format!(" AND lower(u.full_name) LIKE ?{} ESCAPE '\\'", args.len()));
+    }
+    let total: i64 = conn.query_row(&format!("SELECT count(*) {class} {conds}"), params_from_iter(args.iter()), |r| r.get(0)).map_err(db_err)?;
+    let limit = f.limit.unwrap_or(25).clamp(1, 100);
+    let offset = f.offset.unwrap_or(0).clamp(0, 10_000_000);
+    let items = conn
+        .prepare(&format!("SELECT u.id, u.full_name {class} {conds} ORDER BY u.full_name COLLATE NOCASE, u.id LIMIT {limit} OFFSET {offset}"))
+        .map_err(db_err)?
+        .query_map(params_from_iter(args.iter()), |r| Ok(AbsentStudent { student_id: r.get(0)?, student_name: r.get(1)? }))
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(AbsentPage { items, total, enrolled })
 }
 
 // ───────── export ─────────
@@ -643,9 +932,19 @@ pub fn export(conn: &Connection, user: &User, id: &str, format: &str, part: &str
 
 // ───────── handlers ─────────
 
-pub async fn pending_handler(State(s): State<Arc<AppState>>, h: HeaderMap) -> Res<Json<Vec<PendingExam>>> {
+#[derive(Deserialize, Default)]
+pub struct PendingQuery {
+    subject_id: Option<String>,
+}
+
+pub async fn pending_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Query(q): Query<PendingQuery>) -> Res<Json<Vec<PendingExam>>> {
     let u = require_active(&s, &h)?;
-    pending_exams(&*lock(&s)?, &u).map(Json)
+    let conn = lock(&s)?;
+    match q.subject_id.as_deref() {
+        Some(subject) => pending_exams_for_subject(&conn, &u, subject),
+        None => pending_exams(&conn, &u),
+    }
+    .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -668,9 +967,26 @@ pub async fn analytics_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Pat
     analytics(&*lock(&s)?, &u, &id, now_ms()).map(Json)
 }
 
-pub async fn table_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>, Query(q): Query<TableQuery>) -> Res<Json<TablePage>> {
+/// The results table in the view the request asks for: `attempts` (default, one row per attempt) or `students` (one
+/// row per student). The access check comes first, so a non-grader learns nothing - not even which views exist.
+pub fn results_view(conn: &Connection, user: &User, id: &str, q: &TableQuery, now: i64) -> Res<serde_json::Value> {
+    require_grader(conn, user, id)?;
+    let page = match q.view.as_deref().unwrap_or("attempts") {
+        "attempts" | "" => serde_json::to_value(attempts_table(conn, user, id, q, now, false)?),
+        "students" => serde_json::to_value(students_table(conn, user, id, q, now)?),
+        _ => return Err(bad("invalid_filter")),
+    };
+    page.map_err(db_err)
+}
+
+pub async fn table_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>, Query(q): Query<TableQuery>) -> Res<Json<serde_json::Value>> {
     let u = require_active(&s, &h)?;
-    attempts_table(&*lock(&s)?, &u, &id, &q, now_ms(), false).map(Json)
+    results_view(&*lock(&s)?, &u, &id, &q, now_ms()).map(Json)
+}
+
+pub async fn absent_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>, Query(q): Query<AbsentQuery>) -> Res<Json<AbsentPage>> {
+    let u = require_active(&s, &h)?;
+    absent_students(&*lock(&s)?, &u, &id, &q).map(Json)
 }
 
 #[derive(Deserialize)]
@@ -765,7 +1081,7 @@ mod tests {
     }
 
     fn grade(w: &W, attempt: &str, pts: f64) {
-        crate::platform_exams::grade_attempt(&w.conn, &w.admin, attempt, &GradeReq { grades: [("s1".to_string(), pts)].into() }).unwrap();
+        crate::platform_exams::grade_attempt(&w.conn, &w.admin, attempt, &GradeReq { grades: [("s1".to_string(), pts)].into(), ..Default::default() }).unwrap();
     }
 
     /// The analytics scenario from the design notes: scores 10, 5, 2, 1, best-of(3, 9), plus one awaiting grading.
@@ -826,7 +1142,7 @@ mod tests {
         // grading the second student empties that student's part; grading both clears the queue
         let sheet = grading_sheet(&w.conn, &w.admin, &w.exam, true).unwrap();
         for a in &sheet.questions[0].answers {
-            grade_batch(&w.conn, &w.admin, &w.exam, &BatchReq { grades: vec![BatchItem { attempt_id: a.attempt_id.clone(), question_id: "s1".into(), points: 2.0 }] }).unwrap();
+            grade_batch(&w.conn, &w.admin, &w.exam, &BatchReq { grades: vec![BatchItem { attempt_id: a.attempt_id.clone(), question_id: "s1".into(), points: Some(2.0), feedback: None }] }).unwrap();
         }
         assert!(pending_exams(&w.conn, &w.admin).unwrap().is_empty());
     }
@@ -854,7 +1170,7 @@ mod tests {
         let w = world(2);
         let a = attempt(&w, 0, &["q1"], Some("إجابة"), 1);
         let b = attempt(&w, 1, &["q1"], Some("إجابة"), 2);
-        let item = |att: &str, q: &str, p: f64| BatchItem { attempt_id: att.into(), question_id: q.into(), points: p };
+        let item = |att: &str, q: &str, p: f64| BatchItem { attempt_id: att.into(), question_id: q.into(), points: Some(p), feedback: None };
         let run = |items: Vec<BatchItem>| grade_batch(&w.conn, &w.admin, &w.exam, &BatchReq { grades: items });
         let notified = || -> i64 { w.conn.query_row("SELECT count(*) FROM notifications WHERE kind = 'assessment_graded'", [], |r| r.get(0)).unwrap() };
         let score = |att: &str| -> (f64, i64) { w.conn.query_row("SELECT score, pending FROM attempts WHERE id = ?1", params![att], |r| Ok((r.get(0)?, r.get(1)?))).unwrap() };
@@ -894,7 +1210,7 @@ mod tests {
     fn a_blank_short_answer_cannot_be_graded_by_hand() {
         let w = world(1);
         let a = attempt(&w, 0, &["q1"], None, 1);
-        let r = grade_batch(&w.conn, &w.admin, &w.exam, &BatchReq { grades: vec![BatchItem { attempt_id: a, question_id: "s1".into(), points: 5.0 }] });
+        let r = grade_batch(&w.conn, &w.admin, &w.exam, &BatchReq { grades: vec![BatchItem { attempt_id: a, question_id: "s1".into(), points: Some(5.0), feedback: None }] });
         assert_eq!(r.unwrap_err().0, StatusCode::BAD_REQUEST, "nothing was written, so there is nothing to give points for");
     }
 
@@ -1093,5 +1409,594 @@ mod tests {
         assert_eq!(fmt_utc(951_782_399_000), "2000-02-28 23:59");
         assert_eq!(fmt_utc(4_102_444_799_000), "2099-12-31 23:59");
         let _ = new_id();
+    }
+
+    // ───── phase 3-4: queue filter, comments in the sheet and the batch, per-student view, absent students ─────
+
+    const MIN: i64 = 60_000;
+
+    fn names(w: &W) {
+        for (i, n) in ["أمل", "بسمة", "جميل", "دانة", "هدى", "وليد", "زياد", "ياسر"].iter().enumerate().take(w.students.len()) {
+            w.conn.execute("UPDATE users SET full_name = ?2 WHERE id = ?1", params![w.students[i].id, n]).unwrap();
+        }
+    }
+
+    /// A teacher's own exam in `subject` (same questions as the admin exam), published.
+    fn teacher_exam(w: &W, t: &User, subject: &str, title: &str) -> String {
+        let treq: crate::platform_exams::AssessmentReq =
+            serde_json::from_value(json!({"subject_id": subject, "title": title, "questions": exam_json(json!({}))["questions"], "status": "published", "max_attempts": 5})).unwrap();
+        crate::platform_exams::create_assessment(&w.conn, t, &treq).unwrap().id()
+    }
+
+    /// Starts and submits an attempt of `exam` (not necessarily `w.exam`): the short answer `s1` is written when given.
+    fn sit_exam(w: &W, who: usize, exam: &str, short: Option<&str>, at: i64) -> String {
+        let u = &w.students[who];
+        let s = start_attempt(&w.conn, u, exam, at).unwrap();
+        let mut a: HashMap<String, String> = (1..=5).map(|i| (format!("q{i}"), "B".to_string())).collect();
+        if let Some(t) = short {
+            a.insert("s1".into(), t.into());
+        }
+        submit_attempt(&w.conn, u, &s.attempt_id, &a, at + 1).unwrap();
+        s.attempt_id
+    }
+
+    fn json_of<T: Serialize>(v: &T) -> serde_json::Value {
+        serde_json::to_value(v).unwrap()
+    }
+
+    #[test]
+    fn the_pending_queue_filters_by_subject_counts_attempts_and_says_who_owns_the_exam() {
+        let w = world(4);
+        names(&w);
+        let owner = approve(&w, "owner@x.com", "s1");
+        let other_teacher = approve(&w, "other@x.com", "s1");
+        w.conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at) VALUES (?1,'s2','approved',0)", params![owner.id]).unwrap();
+        for s in &w.students {
+            w.conn.execute("INSERT INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1,'s2',0)", params![s.id]).unwrap();
+        }
+        let mine_s1 = teacher_exam(&w, &owner, "s1", "امتحاني في البرمجة");
+        let mine_s2 = teacher_exam(&w, &owner, "s2", "امتحاني في المادة الأخرى");
+        // the admin exam: two waiting attempts + one that nothing waits on (objective only)
+        sit_exam(&w, 0, &w.exam, Some("أ"), NOW);
+        sit_exam(&w, 1, &w.exam, Some("ب"), NOW + MIN);
+        sit_exam(&w, 2, &w.exam, None, NOW + 2 * MIN);
+        sit_exam(&w, 0, &mine_s1, Some("ج"), NOW + 3 * MIN);
+        sit_exam(&w, 3, &mine_s2, Some("د"), NOW + 4 * MIN);
+
+        let rows = |u: &User, subject: Option<&str>| -> Vec<PendingExam> {
+            match subject {
+                Some(s) => pending_exams_for_subject(&w.conn, u, s).unwrap(),
+                None => pending_exams(&w.conn, u).unwrap(),
+            }
+        };
+        let by_id = |rows: &[PendingExam], id: &str| rows.iter().position(|r| r.assessment_id == id).unwrap_or_else(|| panic!("{id} missing from the queue"));
+        // the admin sees every exam; by the one ownership rule (`AssessmentInfo::owned_by`) an admin owns the exams an admin
+        // created (no teacher) and only looks at a teacher's
+        let all = rows(&w.admin, None);
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            (all[by_id(&all, &w.exam)].owned, all[by_id(&all, &mine_s1)].owned, all[by_id(&all, &mine_s2)].owned),
+            (true, false, false),
+            "an admin owns the admin's exam, not the teachers'"
+        );
+        let admin_row = &all[by_id(&all, &w.exam)];
+        assert_eq!((admin_row.subject_id.as_str(), admin_row.pending_attempts, admin_row.pending_answers, admin_row.attempts_total), ("s1", 2, 2, 3), "3 submitted attempts, 2 of them waiting");
+        // oldest waiting first, unchanged
+        assert_eq!(all.iter().map(|r| r.assessment_id.as_str()).collect::<Vec<_>>(), [w.exam.as_str(), mine_s1.as_str(), mine_s2.as_str()]);
+        // the owner: their own exams are theirs, the admin's exam is graded by approval
+        let mine = rows(&owner, None);
+        assert_eq!(mine.len(), 3);
+        assert_eq!((mine[by_id(&mine, &mine_s1)].owned, mine[by_id(&mine, &mine_s2)].owned, mine[by_id(&mine, &w.exam)].owned), (true, true, false));
+        // and `owned` is exactly the ownership rule everything else uses (exam builder, lifecycle, answer key)
+        for who in [&w.admin, &owner, &other_teacher] {
+            for r in rows(who, None) {
+                assert_eq!(r.owned, get_info(&w.conn, &who.id, &r.assessment_id).unwrap().owned_by(who), "{} on {}", who.role, r.title);
+            }
+        }
+        // a colleague approved for s1 only: the admin exam, not the owner's exams
+        let colleague = rows(&other_teacher, None);
+        assert_eq!(colleague.iter().map(|r| r.assessment_id.as_str()).collect::<Vec<_>>(), [w.exam.as_str()]);
+        assert!(!colleague[0].owned);
+        // the subject filter
+        let s2 = rows(&owner, Some("s2"));
+        assert_eq!(s2.iter().map(|r| (r.assessment_id.as_str(), r.subject_id.as_str(), r.owned)).collect::<Vec<_>>(), [(mine_s2.as_str(), "s2", true)]);
+        assert_eq!(rows(&w.admin, Some("s1")).len(), 2);
+        assert_eq!(rows(&owner, Some("s1")).len(), 2, "the owner's s1 exam and the admin's");
+        // blank = no filter; an id that matches nothing is an empty list, whatever it contains
+        assert_eq!(rows(&w.admin, Some("")).len(), 3);
+        assert_eq!(rows(&w.admin, Some("   ")).len(), 3);
+        for odd in ["nope", "%", "s%", "_1", "s1' OR '1'='1", "S1", "s1 "] {
+            assert!(rows(&w.admin, Some(odd)).is_empty(), "{odd:?}");
+        }
+        // a filter never widens what the caller may see
+        assert!(rows(&other_teacher, Some("s2")).is_empty());
+        assert_eq!(pending_exams_for_subject(&w.conn, &w.students[0], "s1").unwrap_err().0, StatusCode::FORBIDDEN);
+        // the wire carries the new fields
+        let j = json_of(&all[by_id(&all, &mine_s2)]);
+        for key in ["assessment_id", "title", "subject_id", "subject_name", "pending_attempts", "pending_answers", "oldest_submitted_at", "attempts_total", "owned"] {
+            assert!(j.get(key).is_some(), "{key} in {j}");
+        }
+    }
+
+    #[test]
+    fn the_sheet_shows_each_comment_and_when_a_grade_was_written() {
+        let w = world(3);
+        let a = attempt(&w, 0, &[], Some("أولى"), 1);
+        let b = attempt(&w, 1, &[], Some("ثانية"), 2);
+        attempt(&w, 2, &[], Some("ثالثة"), 3);
+        grade_batch_at(&w.conn, &w.admin, &w.exam, &BatchReq { grades: vec![
+            BatchItem { attempt_id: a.clone(), question_id: "s1".into(), points: Some(4.0), feedback: Some("ممتاز".into()) },
+            BatchItem { attempt_id: b.clone(), question_id: "s1".into(), points: None, feedback: Some("تحتاج توضيحاً".into()) },
+        ] }, NOW + 77).unwrap();
+        let sheet = grading_sheet(&w.conn, &w.admin, &w.exam, false).unwrap();
+        let answers = &sheet.questions[0].answers;
+        let by = |att: &str| answers.iter().find(|x| x.attempt_id == att).unwrap();
+        assert_eq!((by(&a).points, by(&a).feedback.as_deref(), by(&a).graded_at), (Some(4.0), Some("ممتاز"), Some(NOW + 77)));
+        assert_eq!((by(&b).points, by(&b).feedback.as_deref(), by(&b).graded_at), (None, Some("تحتاج توضيحاً"), None), "a comment alone does not grade the answer");
+        let c = answers.iter().find(|x| x.answer == "ثالثة").unwrap();
+        assert_eq!((c.points, c.feedback.clone(), c.graded_at), (None, None, None));
+        assert_eq!(sheet.questions[0].pending, 2);
+        // "pending only" keeps the commented-but-ungraded answer, with its comment
+        let pending = grading_sheet(&w.conn, &w.admin, &w.exam, true).unwrap();
+        let ids: Vec<&str> = pending.questions[0].answers.iter().map(|x| x.attempt_id.as_str()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&b.as_str()) && !ids.contains(&a.as_str()));
+        let j = json_of(&sheet.questions[0].answers[0]);
+        for key in ["attempt_id", "student_name", "answer", "points", "submitted_at", "feedback", "graded_at"] {
+            assert!(j.get(key).is_some(), "{key} in {j}");
+        }
+    }
+
+    #[test]
+    fn a_batch_item_carries_points_a_comment_or_both_and_one_with_neither_is_refused() {
+        let w = world(2);
+        let a = attempt(&w, 0, &["q1"], Some("إجابة"), 1);
+        let b = attempt(&w, 1, &["q1"], Some("إجابة"), 2);
+        let item = |att: &str, p: Option<f64>, f: Option<&str>| BatchItem { attempt_id: att.into(), question_id: "s1".into(), points: p, feedback: f.map(String::from) };
+        let run = |items: Vec<BatchItem>| grade_batch_at(&w.conn, &w.admin, &w.exam, &BatchReq { grades: items }, NOW + 5);
+        let state = |att: &str| -> (f64, i64, Option<String>) {
+            let raw: String = w.conn.query_row("SELECT results FROM attempts WHERE id = ?1", params![att], |r| r.get(0)).unwrap();
+            let o = serde_json::from_str::<Vec<crate::platform_exams::Outcome>>(&raw).unwrap().into_iter().find(|o| o.id == "s1").unwrap();
+            (w.conn.query_row("SELECT score FROM attempts WHERE id = ?1", params![att], |r| r.get(0)).unwrap(), w.conn.query_row("SELECT pending FROM attempts WHERE id = ?1", params![att], |r| r.get(0)).unwrap(), o.feedback)
+        };
+        // neither points nor comment: the item changes nothing, so it is refused (and nothing else is stored)
+        let e = run(vec![item(&a, Some(3.0), None), item(&b, None, None)]).unwrap_err();
+        assert_eq!((e.0, e.1.contains("invalid_selection")), (StatusCode::BAD_REQUEST, true));
+        assert_eq!((state(&a), state(&b)), ((1.0, 1, None), (1.0, 1, None)));
+        // a comment alone: stored, the answer still waits
+        assert_eq!(run(vec![item(&a, None, Some("فكرة أولى"))]).unwrap().updated, 1);
+        assert_eq!(state(&a), (1.0, 1, Some("فكرة أولى".into())));
+        // points and comment together for one answer, points alone for the other
+        run(vec![item(&a, Some(3.0), Some("أحسنت")), item(&b, Some(5.0), None)]).unwrap();
+        assert_eq!((state(&a), state(&b)), ((4.0, 0, Some("أحسنت".into())), (6.0, 0, None)));
+        // a comment cleared through the batch
+        run(vec![item(&a, None, Some(""))]).unwrap();
+        assert_eq!(state(&a).2, None);
+        // the same answer twice is refused whichever fields the two items carry
+        for (x, y) in [(item(&a, Some(1.0), None), item(&a, Some(2.0), None)), (item(&a, Some(1.0), None), item(&a, None, Some("x"))), (item(&a, None, Some("x")), item(&a, None, Some("y")))] {
+            assert_eq!(run(vec![x, y]).unwrap_err().0, StatusCode::BAD_REQUEST);
+        }
+        // the JSON of an item: points and feedback are optional on the wire
+        let i: BatchItem = serde_json::from_str(r#"{"attempt_id":"a","question_id":"s1","feedback":"x"}"#).unwrap();
+        assert!(i.points.is_none() && i.feedback.as_deref() == Some("x"));
+        let i: BatchItem = serde_json::from_str(r#"{"attempt_id":"a","question_id":"s1","points":2,"feedback":null}"#).unwrap();
+        assert!(i.points == Some(2.0) && i.feedback.is_none());
+        // one summary row per call, whatever the items hold (the old 'grades_saved' record is kept)
+        let n: i64 = w.conn.query_row("SELECT count(*) FROM audit_log WHERE action = 'grades_saved'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 3, "the three calls that succeeded (the refused ones leave no record)");
+    }
+
+    #[test]
+    fn a_batch_is_all_or_nothing_for_comments_audit_rows_and_notices_too() {
+        let w = world(3);
+        let a = attempt(&w, 0, &["q1"], Some("إجابة"), 1);
+        let b = attempt(&w, 1, &["q1"], Some("إجابة"), 2);
+        let c = attempt(&w, 2, &["q1"], Some("إجابة"), 3);
+        let item = |att: &str, p: Option<f64>, f: Option<&str>| BatchItem { attempt_id: att.into(), question_id: "s1".into(), points: p, feedback: f.map(String::from) };
+        grade_batch_at(&w.conn, &w.admin, &w.exam, &BatchReq { grades: vec![item(&a, Some(2.0), None)] }, NOW).unwrap();
+        let snapshot = |w: &W| -> (String, i64, i64, i64) {
+            (
+                w.conn.query_row("SELECT group_concat(results || score || pending, '|') FROM (SELECT * FROM attempts ORDER BY id)", [], |r| r.get(0)).unwrap(),
+                w.conn.query_row("SELECT count(*) FROM audit_log WHERE action = 'answer_regraded'", [], |r| r.get(0)).unwrap(),
+                w.conn.query_row("SELECT count(*) FROM notifications", [], |r| r.get(0)).unwrap(),
+                w.conn.query_row("SELECT count(*) FROM audit_log", [], |r| r.get(0)).unwrap(),
+            )
+        };
+        let before = snapshot(&w);
+        // a correction + a comment + a first grade, and a last item whose comment is too long: NONE of it may stay
+        let too_long = "ع".repeat(501);
+        let r = grade_batch_at(&w.conn, &w.admin, &w.exam, &BatchReq { grades: vec![
+            item(&a, Some(4.0), Some("تعليق")),
+            item(&b, Some(5.0), Some("تعليق")),
+            item(&c, None, Some(&too_long)),
+        ] }, NOW + 10);
+        assert_eq!(r.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(snapshot(&w), before, "every attempt, audit row and notification is exactly as before");
+        // and the same batch without the bad item goes through whole
+        grade_batch_at(&w.conn, &w.admin, &w.exam, &BatchReq { grades: vec![item(&a, Some(4.0), Some("تعليق")), item(&b, Some(5.0), Some("تعليق")), item(&c, None, Some("ملاحظة"))] }, NOW + 20).unwrap();
+        let after = snapshot(&w);
+        assert_eq!(after.1, 1, "the correction of a's grade left its audit row");
+        let student_notes = |kind: &str| -> i64 { w.conn.query_row("SELECT count(*) FROM notifications WHERE kind = ?1", params![kind], |r| r.get(0)).unwrap() };
+        assert_eq!((student_notes("feedback_added"), student_notes("score_changed"), student_notes("assessment_graded")), (3, 1, 2), "a: comment + correction; b: comment + graded; c: comment");
+        // an attempt of another exam inside the batch rolls the lot back, comments included
+        let other = {
+            let req: crate::platform_exam_admin::ExamReq = serde_json::from_value(exam_json(json!({"title": "آخر"}))).unwrap();
+            serde_json::to_value(crate::platform_exam_admin::create_exam(&w.conn, &w.admin, &req, NOW).unwrap()).unwrap()["id"].as_str().unwrap().to_string()
+        };
+        let before = snapshot(&w);
+        let e = grade_batch_at(&w.conn, &w.admin, &other, &BatchReq { grades: vec![item(&a, Some(1.0), Some("لن تُحفظ"))] }, NOW + 30).unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+        assert_eq!(snapshot(&w), before);
+        // who may batch: a colleague without the exam cannot, before anything is read
+        let stranger = approve(&w, "stranger@x.com", "s2");
+        assert_eq!(grade_batch_at(&w.conn, &stranger, &w.exam, &BatchReq { grades: vec![item(&a, None, Some("x"))] }, NOW).unwrap_err().0, StatusCode::FORBIDDEN);
+        assert_eq!(snapshot(&w), before);
+    }
+
+    #[test]
+    fn a_batch_that_fails_halfway_undoes_the_attempts_it_already_stored() {
+        let w = world(2);
+        let a = attempt(&w, 0, &["q1"], Some("إجابة"), 1);
+        let b = attempt(&w, 1, &["q1"], Some("إجابة"), 2);
+        let item = |att: &str, p: Option<f64>, f: Option<&str>| BatchItem { attempt_id: att.into(), question_id: "s1".into(), points: p, feedback: f.map(String::from) };
+        grade_batch_at(&w.conn, &w.admin, &w.exam, &BatchReq { grades: vec![item(&a, Some(2.0), None), item(&b, Some(2.0), None)] }, NOW).unwrap();
+        let snapshot = || -> String {
+            w.conn.query_row("SELECT (SELECT group_concat(results || score, '|') FROM attempts) || (SELECT count(*) FROM audit_log) || (SELECT count(*) FROM notifications)", [], |r| r.get(0)).unwrap()
+        };
+        let before = snapshot();
+        // attempts are handled in id order: the student of the LAST one is the one whose notice cannot be written, so the
+        // first attempt has been stored completely by the time the batch fails
+        let last_student = if a > b { &w.students[0] } else { &w.students[1] };
+        w.conn.execute_batch(&format!("CREATE TRIGGER no_notice BEFORE INSERT ON notifications WHEN new.user_id = '{}' BEGIN SELECT RAISE(ABORT, 'no notice'); END;", last_student.id)).unwrap();
+        let e = grade_batch_at(&w.conn, &w.admin, &w.exam, &BatchReq { grades: vec![item(&a, Some(5.0), Some("أ")), item(&b, Some(5.0), Some("ب"))] }, NOW + 9).unwrap_err();
+        assert_eq!(e.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(snapshot(), before, "the first attempt's new grade, its comment, its audit row and its notices were rolled back with the second");
+        w.conn.execute_batch("DROP TRIGGER no_notice").unwrap();
+        assert_eq!(grade_batch_at(&w.conn, &w.admin, &w.exam, &BatchReq { grades: vec![item(&a, Some(5.0), Some("أ")), item(&b, Some(5.0), Some("ب"))] }, NOW + 10).unwrap().updated, 2);
+        assert_ne!(snapshot(), before);
+    }
+
+    // ----- the per-student view -----
+
+    fn q(f: impl FnOnce(&mut TableQuery)) -> TableQuery {
+        let mut t = TableQuery { view: Some("students".into()), ..Default::default() };
+        f(&mut t);
+        t
+    }
+
+    fn students(w: &W, who: &User, f: TableQuery) -> StudentsPage {
+        students_table(&w.conn, who, &w.exam, &f, NOW + 99 * MIN).unwrap()
+    }
+
+    fn name_order(p: &StudentsPage) -> Vec<&str> {
+        p.items.iter().map(|s| s.student_name.as_str()).collect()
+    }
+
+    /// `scenario()` with names: أمل 10 | بسمة 5 | جميل 2 | دانة 1 | هدى (3 then 9) | وليد 4 + one answer waiting | زياد, ياسر never came.
+    fn named_scenario() -> W {
+        let w = scenario();
+        names(&w);
+        w
+    }
+
+    #[test]
+    fn the_per_student_view_aggregates_best_last_attempts_pending_and_tab_leaves() {
+        let w = named_scenario();
+        let p = students(&w, &w.admin, q(|_| {}));
+        assert_eq!(p.total, 6, "one row per student who has an attempt; the two who never came are not here");
+        let by = |n: &str| p.items.iter().find(|s| s.student_name == n).unwrap_or_else(|| panic!("{n} missing"));
+        let top = by("أمل");
+        assert_eq!((top.attempts, top.best_score, top.best_percent, top.passed, top.pending), (1, Some(10.0), Some(100.0), Some(true), 0));
+        assert_eq!(top.best_attempt_id.as_deref(), Some(top.last_attempt_id.as_str()), "a single attempt is both the best and the last");
+        assert_eq!((top.last_status.as_str(), top.last_submitted_at.is_some()), ("submitted", true));
+        assert_eq!((by("بسمة").best_score, by("بسمة").passed), (Some(5.0), Some(true)), "exactly the pass mark passes");
+        assert_eq!((by("جميل").best_score, by("جميل").passed), (Some(2.0), Some(false)));
+        assert_eq!((by("دانة").best_percent, by("دانة").passed), (Some(10.0), Some(false)));
+        // two attempts: the best is the 9, the last is the later one, which here is the same
+        let two = by("هدى");
+        assert_eq!((two.attempts, two.best_score, two.passed), (2, Some(9.0), Some(true)));
+        let ids: Vec<(String, f64, i64)> = w.conn.prepare("SELECT id, score, started_at FROM attempts WHERE student_id = ?1 ORDER BY started_at").unwrap()
+            .query_map(params![w.students[4].id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!((ids.len(), ids[0].1, ids[1].1), (2, 3.0, 9.0));
+        assert_eq!((two.best_attempt_id.as_deref(), two.last_attempt_id.as_str()), (Some(ids[1].0.as_str()), ids[1].0.as_str()));
+        // an answer still waiting: counted, no verdict
+        let waiting = by("وليد");
+        assert_eq!((waiting.best_score, waiting.passed, waiting.pending), (Some(4.0), None, 1));
+        // tab leaves are summed over all of a student's attempts
+        w.conn.execute("UPDATE attempts SET tab_leaves = 2 WHERE id = ?1", params![ids[0].0]).unwrap();
+        w.conn.execute("UPDATE attempts SET tab_leaves = 3 WHERE id = ?1", params![ids[1].0]).unwrap();
+        assert_eq!(students(&w, &w.admin, q(|_| {})).items.iter().find(|s| s.student_name == "هدى").unwrap().tab_leaves, 5);
+        // admin: e-mail; the wire shape
+        assert!(top.email.is_some());
+        let j = json_of(top);
+        for key in ["student_id", "student_name", "email", "attempts", "best_score", "best_percent", "best_attempt_id", "last_attempt_id", "last_status", "last_submitted_at", "passed", "pending", "tab_leaves"] {
+            assert!(j.get(key).is_some(), "{key} in {j}");
+        }
+        assert_eq!(json_of(&p)["total"], 6);
+    }
+
+    #[test]
+    fn a_fully_graded_attempt_is_the_best_even_when_another_one_waiting_scores_more_on_paper() {
+        let w = named_scenario();
+        // أمل's second attempt (max 2): 5 objective points + a written answer nobody has graded = 5 on paper, 10 graded
+        let second = attempt(&w, 0, &["q1", "q2", "q3", "q4", "q5"], Some("محاولة ثانية"), 120);
+        let p = students(&w, &w.admin, q(|_| {}));
+        let s = p.items.iter().find(|s| s.student_name == "أمل").unwrap();
+        assert_eq!((s.attempts, s.best_score, s.passed, s.pending), (2, Some(10.0), Some(true), 1), "the graded 10 stays the best; the waiting answer is still counted");
+        assert_eq!(s.last_attempt_id, second, "the last attempt is the newest one");
+        assert_eq!(s.last_status, "submitted");
+        // 'pending' keeps every student with an answer waiting in ANY submitted attempt
+        let pend = students(&w, &w.admin, q(|f| f.result = Some("pending".into())));
+        let mut got = name_order(&pend);
+        got.sort();
+        assert_eq!(got, ["أمل", "وليد"]);
+        // 'passed' follows the best attempt: أمل still passes
+        assert!(name_order(&students(&w, &w.admin, q(|f| f.result = Some("passed".into())))).contains(&"أمل"));
+    }
+
+    #[test]
+    fn the_per_student_view_sorts_filters_searches_and_pages() {
+        let w = named_scenario();
+        let sorted = |sort: &str, dir: &str| -> Vec<String> {
+            students(&w, &w.admin, q(|f| { f.sort = Some(sort.into()); f.dir = Some(dir.into()); })).items.iter().map(|s| s.student_name.clone()).collect()
+        };
+        assert_eq!(sorted("best", "desc"), ["أمل", "هدى", "بسمة", "وليد", "جميل", "دانة"], "10, 9, 5, 4 (waiting), 2, 1");
+        assert_eq!(sorted("best", "asc"), ["دانة", "جميل", "وليد", "بسمة", "هدى", "أمل"]);
+        assert_eq!(sorted("attempts", "desc")[0], "هدى", "two attempts");
+        assert_eq!(sorted("last", "desc")[0], "وليد", "the newest activity first");
+        assert_eq!(sorted("last", "asc")[0], "أمل");
+        let by_name = sorted("name", "asc");
+        let mut expected = by_name.clone();
+        expected.sort_by_key(|n| n.to_lowercase());
+        assert_eq!(by_name, expected);
+        assert_eq!(sorted("name", "desc"), by_name.iter().rev().cloned().collect::<Vec<_>>());
+        assert_eq!(name_order(&students(&w, &w.admin, q(|_| {}))), sorted("last", "desc").iter().map(String::as_str).collect::<Vec<_>>(), "default: newest activity first");
+        // filters
+        let res = |r: &str| -> Vec<String> { let mut v: Vec<String> = students(&w, &w.admin, q(|f| f.result = Some(r.into()))).items.iter().map(|s| s.student_name.clone()).collect(); v.sort(); v };
+        assert_eq!(res("passed"), ["أمل", "بسمة", "هدى"]);
+        assert_eq!(res("failed"), ["جميل", "دانة"]);
+        assert_eq!(res("pending"), ["وليد"]);
+        assert_eq!(res("all").len(), 6);
+        assert_eq!(res("").len(), 6);
+        assert_eq!(students(&w, &w.admin, q(|f| f.result = Some("passed".into()))).total, 3, "the total follows the filter");
+        // search: case-insensitive, and the wildcards are plain characters
+        w.conn.execute("UPDATE users SET full_name = 'Alice Smith' WHERE id = ?1", params![w.students[0].id]).unwrap();
+        w.conn.execute("UPDATE users SET full_name = '100% عمر_ا' WHERE id = ?1", params![w.students[1].id]).unwrap();
+        let find = |s: &str| students(&w, &w.admin, q(|f| f.q = Some(s.into()))).total;
+        assert_eq!((find("ALICE"), find("alice smith"), find("  alice "), find("%"), find("_"), find("100%"), find("عمر_ا"), find("zzz")), (1, 1, 1, 1, 1, 1, 1, 0));
+        assert_eq!(find("\\"), 0, "a backslash is just a character too");
+        // paging: complete, no overlap, stable
+        let mut seen: Vec<String> = vec![];
+        for off in [0, 2, 4, 6] {
+            let p = students(&w, &w.admin, q(|f| { f.sort = Some("name".into()); f.dir = Some("asc".into()); f.limit = Some(2); f.offset = Some(off); }));
+            assert_eq!(p.total, 6);
+            seen.extend(p.items.iter().map(|s| s.student_id.clone()));
+        }
+        assert_eq!((seen.len(), seen.iter().collect::<std::collections::HashSet<_>>().len()), (6, 6));
+        assert_eq!(students(&w, &w.admin, q(|f| f.limit = Some(0))).items.len(), 1, "limit is at least 1");
+        assert_eq!(students(&w, &w.admin, q(|f| f.limit = Some(100_000))).items.len(), 6);
+        assert_eq!(students(&w, &w.admin, q(|f| f.offset = Some(-5))).items.len(), 6, "a negative offset is the start");
+        assert!(students(&w, &w.admin, q(|f| f.offset = Some(60))).items.is_empty());
+    }
+
+    #[test]
+    fn students_who_never_submitted_show_up_with_empty_results_and_always_sort_last_by_best() {
+        let w = named_scenario();
+        // زياد started and left; ياسر's time ran out with nothing saved
+        let started = start_attempt(&w.conn, &w.students[6], &w.exam, NOW + 80 * MIN).unwrap();
+        let gone = start_attempt(&w.conn, &w.students[7], &w.exam, NOW + 81 * MIN).unwrap();
+        w.conn.execute("UPDATE attempts SET status = 'expired' WHERE id = ?1", params![gone.attempt_id]).unwrap();
+        let p = students(&w, &w.admin, q(|f| { f.sort = Some("best".into()); f.dir = Some("desc".into()); }));
+        assert_eq!(p.total, 8);
+        let tail: Vec<&StudentSummary> = p.items.iter().rev().take(2).collect();
+        assert!(tail.iter().all(|s| s.best_score.is_none()), "no best attempt: last, whichever way it runs");
+        let asc = students(&w, &w.admin, q(|f| { f.sort = Some("best".into()); f.dir = Some("asc".into()); }));
+        assert!(asc.items.iter().rev().take(2).all(|s| s.best_score.is_none()));
+        let z = p.items.iter().find(|s| s.student_name == "زياد").unwrap();
+        assert_eq!((z.attempts, z.best_score, z.best_percent, z.best_attempt_id.clone(), z.passed, z.last_status.as_str(), z.last_submitted_at, z.pending), (1, None, None, None, None, "in_progress", None, 0));
+        assert_eq!(z.last_attempt_id, started.attempt_id);
+        assert_eq!(p.items.iter().find(|s| s.student_name == "ياسر").unwrap().last_status, "expired");
+        assert!(students(&w, &w.admin, q(|f| f.result = Some("passed".into()))).items.iter().all(|s| s.best_score.is_some()), "no verdict without a submitted attempt");
+    }
+
+    #[test]
+    fn only_graders_see_the_per_student_view_and_only_admins_see_e_mail_addresses() {
+        let w = named_scenario();
+        let approved = approve(&w, "approved@x.com", "s1");
+        let other_subject = approve(&w, "other@x.com", "s2");
+        let unapproved = insert_test_user(&w.conn, "un@x.com", "teacher", "active");
+        let teacher_exam_id = teacher_exam(&w, &approved, "s1", "امتحان المعلم");
+        let colleague = approve(&w, "colleague@x.com", "s1");
+        let go = |who: &User, exam: &str| results_view(&w.conn, who, exam, &q(|_| {}), NOW + 99 * MIN);
+        // an approved teacher grades an admin's exam; admins grade everything
+        assert!(go(&w.admin, &w.exam).is_ok() && go(&approved, &w.exam).is_ok() && go(&w.admin, &teacher_exam_id).is_ok());
+        // everyone else gets a 403 - and for every view/parameter alike, so nothing about the exam leaks
+        for (who, exam, label) in [
+            (&other_subject, &w.exam, "a teacher of another subject"),
+            (&unapproved, &w.exam, "a teacher with no approval"),
+            (&w.students[0], &w.exam, "a student"),
+            (&colleague, &teacher_exam_id, "a colleague on someone else's exam"),
+        ] {
+            for view in ["students", "attempts", "garbage"] {
+                let t = TableQuery { view: Some(view.into()), ..Default::default() };
+                assert_eq!(results_view(&w.conn, who, exam, &t, NOW).unwrap_err().0, StatusCode::FORBIDDEN, "{label} / {view}");
+            }
+            assert_eq!(students_table(&w.conn, who, exam, &q(|_| {}), NOW).unwrap_err().0, StatusCode::FORBIDDEN, "{label}");
+        }
+        assert_eq!(results_view(&w.conn, &w.admin, "no-such-exam", &q(|_| {}), NOW).unwrap_err().0, StatusCode::NOT_FOUND);
+        // e-mail addresses: admins only
+        let admin_json = json_of(&go(&w.admin, &w.exam).unwrap());
+        assert!(admin_json["items"].as_array().unwrap().iter().all(|s| s["email"].as_str().map_or(false, |e| e.ends_with("@x.com"))));
+        for teacher_view in [go(&approved, &w.exam).unwrap(), go(&w.admin, &teacher_exam_id).map(|_| json_of(&students(&w, &approved, q(|_| {})))).unwrap()] {
+            let text = teacher_view.to_string();
+            assert!(!text.contains("@x.com") && !text.contains("st0") && teacher_view["items"].as_array().unwrap().iter().all(|s| s["email"].is_null()), "{text}");
+        }
+        // views and sorts are whitelists
+        let bad = |t: TableQuery| results_view(&w.conn, &w.admin, &w.exam, &t, NOW).unwrap_err();
+        for t in [
+            TableQuery { view: Some("everything".into()), ..Default::default() },
+            q(|f| f.sort = Some("score".into())), // a sort of the attempts view, not of this one
+            q(|f| f.sort = Some("password".into())),
+            q(|f| f.sort = Some("name; DROP TABLE users".into())),
+            q(|f| f.dir = Some("sideways".into())),
+            q(|f| f.result = Some("expired".into())),
+            q(|f| f.result = Some("in_progress".into())),
+            q(|f| f.result = Some("nonsense".into())),
+        ] {
+            let e = bad(t);
+            assert_eq!((e.0, e.1.contains("invalid_filter")), (StatusCode::BAD_REQUEST, true));
+        }
+        // the default view is still the attempts table
+        let default = results_view(&w.conn, &w.admin, &w.exam, &TableQuery::default(), NOW + 99 * MIN).unwrap();
+        assert!(default["items"][0].get("attempt_id").is_some() && default["items"][0].get("student_id").is_none());
+    }
+
+    // ----- who has not taken it -----
+
+    fn absent(w: &W, who: &User, f: AbsentQuery) -> AbsentPage {
+        absent_students(&w.conn, who, &w.exam, &f).unwrap()
+    }
+
+    fn absent_names(p: &AbsentPage) -> Vec<&str> {
+        p.items.iter().map(|s| s.student_name.as_str()).collect()
+    }
+
+    #[test]
+    fn the_absent_list_is_the_active_class_minus_anyone_with_an_attempt_of_any_status() {
+        let w = world(5);
+        names(&w);
+        attempt(&w, 0, &["q1"], None, 1); // submitted
+        start_attempt(&w.conn, &w.students[1], &w.exam, NOW + MIN).unwrap(); // started, never finished
+        let gone = start_attempt(&w.conn, &w.students[2], &w.exam, NOW + 2 * MIN).unwrap();
+        w.conn.execute("UPDATE attempts SET status = 'expired' WHERE id = ?1", params![gone.attempt_id]).unwrap();
+        // a suspended student, and students of other classes, are not part of this class
+        let suspended = insert_test_user(&w.conn, "susp@x.com", "student", "suspended");
+        w.conn.execute("INSERT INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1,'s1',0)", params![suspended.id]).unwrap();
+        let elsewhere = insert_test_user(&w.conn, "else@x.com", "student", "active");
+        w.conn.execute("INSERT INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1,'s2',0)", params![elsewhere.id]).unwrap();
+        insert_test_user(&w.conn, "nobody@x.com", "student", "active"); // not enrolled anywhere
+        let p = absent(&w, &w.admin, AbsentQuery::default());
+        assert_eq!(absent_names(&p), ["دانة", "هدى"], "the two who never touched it, by name");
+        assert_eq!((p.total, p.enrolled), (2, 5), "the class is the 5 active enrolled students");
+        assert!(p.items.iter().all(|s| s.student_id == w.students[3].id || s.student_id == w.students[4].id));
+        // as soon as one of them starts, they are no longer absent
+        start_attempt(&w.conn, &w.students[3], &w.exam, NOW + 9 * MIN).unwrap();
+        assert_eq!(absent_names(&absent(&w, &w.admin, AbsentQuery::default())), ["هدى"]);
+        // a student who leaves the subject is not part of the class any more
+        w.conn.execute("DELETE FROM subject_enrollments WHERE student_id = ?1", params![w.students[4].id]).unwrap();
+        let p = absent(&w, &w.admin, AbsentQuery::default());
+        assert_eq!((p.items.len(), p.total, p.enrolled), (0, 0, 4));
+    }
+
+    #[test]
+    fn the_absent_list_has_names_only_never_an_e_mail_not_even_for_an_admin() {
+        let w = world(3);
+        names(&w);
+        let approved = approve(&w, "approved@x.com", "s1");
+        for who in [&w.admin, &approved] {
+            let p = absent(&w, who, AbsentQuery::default());
+            let j = json_of(&p);
+            assert_eq!(p.items.len(), 3);
+            for item in j["items"].as_array().unwrap() {
+                assert_eq!(item.as_object().unwrap().keys().collect::<Vec<_>>(), ["student_id", "student_name"], "{}", who.role);
+            }
+            assert!(!j.to_string().contains("@") && !j.to_string().contains("st0"), "{j}");
+            assert_eq!(j.as_object().unwrap().keys().collect::<Vec<_>>(), ["enrolled", "items", "total"]);
+        }
+    }
+
+    #[test]
+    fn the_absent_list_is_for_graders_only_and_survives_a_switched_off_subject() {
+        let w = world(2);
+        let approved = approve(&w, "approved@x.com", "s1");
+        let other_subject = approve(&w, "other@x.com", "s2");
+        let unapproved = insert_test_user(&w.conn, "un@x.com", "teacher", "active");
+        let colleague = approve(&w, "colleague@x.com", "s1");
+        let own = teacher_exam(&w, &approved, "s1", "امتحان المعلم");
+        for (who, label) in [(&other_subject, "teacher of another subject"), (&unapproved, "no approval"), (&w.students[0], "student")] {
+            assert_eq!(absent_students(&w.conn, who, &w.exam, &AbsentQuery::default()).unwrap_err().0, StatusCode::FORBIDDEN, "{label}");
+        }
+        assert_eq!(absent_students(&w.conn, &colleague, &own, &AbsentQuery::default()).unwrap_err().0, StatusCode::FORBIDDEN, "a colleague on a teacher's own exam");
+        assert!(absent_students(&w.conn, &approved, &own, &AbsentQuery::default()).is_ok() && absent_students(&w.conn, &approved, &w.exam, &AbsentQuery::default()).is_ok());
+        assert_eq!(absent_students(&w.conn, &w.admin, "nope", &AbsentQuery::default()).unwrap_err().0, StatusCode::NOT_FOUND);
+        // the class is still listed to the graders when the subject, or its institution, is switched off
+        w.conn.execute("UPDATE subjects SET is_active = 0", []).unwrap();
+        assert_eq!(absent(&w, &w.admin, AbsentQuery::default()).total, 2);
+        w.conn.execute("UPDATE subjects SET is_active = 1", []).unwrap();
+        w.conn.execute("UPDATE institutions SET is_active = 0", []).unwrap();
+        assert_eq!(absent(&w, &approved, AbsentQuery::default()).total, 2);
+    }
+
+    #[test]
+    fn the_sheet_tells_the_grader_whether_students_will_see_the_comments() {
+        let w = world(1);
+        let sheet = |w: &W| json_of(&grading_sheet(&w.conn, &w.admin, &w.exam, false).unwrap());
+        assert_eq!(sheet(&w)["show_answers"], json!(true), "the default: students review their answers, comments included");
+        w.conn.execute("UPDATE assessments SET show_answers = 0 WHERE id = ?1", params![w.exam]).unwrap();
+        assert_eq!(sheet(&w)["show_answers"], json!(false), "an exam that hides its answers hides the comments with them");
+    }
+
+    #[test]
+    fn a_teacher_whose_assignment_was_taken_away_keeps_the_results_but_not_the_class_list() {
+        let w = world(4);
+        names(&w);
+        let owner = approve(&w, "owner@x.com", "s1");
+        let own = teacher_exam(&w, &owner, "s1", "امتحان قديم");
+        sit_exam(&w, 0, &own, Some("كتبت"), NOW);
+        let list = |who: &User| absent_students(&w.conn, who, &own, &AbsentQuery::default());
+        assert_eq!(list(&owner).unwrap().total, 3, "approved: the three who never sat it");
+        // the admin takes the subject away (approved -> rejected; a request that is pending again is the same)
+        for status in ["rejected", "pending"] {
+            w.conn.execute("UPDATE teacher_subjects SET status = ?1 WHERE teacher_id = ?2", params![status, owner.id]).unwrap();
+            let e = list(&owner).unwrap_err();
+            assert_eq!((e.0, e.1.contains("forbidden")), (StatusCode::FORBIDDEN, true), "{status}: the roster is the class as it is today");
+            // what the teacher already owns stays readable
+            assert!(results_view(&w.conn, &owner, &own, &TableQuery::default(), NOW + 99 * MIN).is_ok(), "{status}: their results");
+            assert!(analytics(&w.conn, &owner, &own, NOW + 99 * MIN).is_ok(), "{status}: their analytics");
+            // and nobody else gains anything: the admin still sees the class
+            assert_eq!(list(&w.admin).unwrap().total, 3);
+        }
+        // approved again -> the list is back; a switched-off subject still works for an approved teacher (checked elsewhere)
+        w.conn.execute("UPDATE teacher_subjects SET status = 'approved' WHERE teacher_id = ?1", params![owner.id]).unwrap();
+        assert_eq!(list(&owner).unwrap().total, 3);
+        // the check is about the exam's subject: an approval for another subject does not open this class
+        w.conn.execute("UPDATE teacher_subjects SET status = 'rejected' WHERE teacher_id = ?1 AND subject_id = 's1'", params![owner.id]).unwrap();
+        w.conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at) VALUES (?1,'s2','approved',0)", params![owner.id]).unwrap();
+        assert_eq!(list(&owner).unwrap_err().0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn the_absent_list_pages_and_searches_without_treating_wildcards_as_patterns() {
+        let w = world(8);
+        for (i, s) in w.students.iter().enumerate() {
+            let n = match i {
+                0 => "100% صفر".to_string(),
+                1 => "عمر_ا".to_string(),
+                2 => "Alice".to_string(),
+                _ => format!("طالب {i}"),
+            };
+            w.conn.execute("UPDATE users SET full_name = ?2 WHERE id = ?1", params![s.id, n]).unwrap();
+        }
+        let f = |q: &str| absent(&w, &w.admin, AbsentQuery { q: Some(q.into()), ..Default::default() });
+        assert_eq!((f("%").total, f("_").total, f("ALICE").total, f("alice").total, f("  alice  ").total, f("طالب").total, f("zzz").total), (1, 1, 1, 1, 1, 5, 0));
+        assert_eq!(f("100%").items[0].student_name, "100% صفر");
+        assert_eq!(f("%").enrolled, 8, "the class size ignores the search");
+        assert_eq!(f("").total, 8, "a blank search is no search");
+        // paging
+        let page = |limit: i64, offset: i64| absent(&w, &w.admin, AbsentQuery { q: None, limit: Some(limit), offset: Some(offset) });
+        let mut ids: Vec<String> = vec![];
+        for off in [0, 3, 6] {
+            let p = page(3, off);
+            assert_eq!(p.total, 8);
+            ids.extend(p.items.iter().map(|s| s.student_id.clone()));
+        }
+        assert_eq!((ids.len(), ids.iter().collect::<std::collections::HashSet<_>>().len()), (8, 8));
+        assert_eq!((page(0, 0).items.len(), page(1000, 0).items.len(), page(5, -3).items.len(), page(5, 100).items.len()), (1, 8, 5, 0));
+        assert_eq!(absent(&w, &w.admin, AbsentQuery::default()).items.len(), 8, "default limit 25 holds the whole class here");
+        // more than a default page
+        let big = world(30);
+        let p = absent(&big, &big.admin, AbsentQuery::default());
+        assert_eq!((p.items.len(), p.total, p.enrolled), (25, 30, 30));
+        assert_eq!(absent(&big, &big.admin, AbsentQuery { offset: Some(25), ..Default::default() }).items.len(), 5);
     }
 }

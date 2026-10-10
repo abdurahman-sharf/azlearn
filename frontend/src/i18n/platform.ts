@@ -390,6 +390,8 @@ const ar = {
   navGrading: 'التصحيح',
   gdTeacherLink: 'بحاجة تصحيح',
   a_grades_saved: 'حفظ درجات',
+  a_answer_regraded: 'تصحيح درجة سبق إعطاؤها',
+  auditOpenAttempt: 'فتح المحاولة',
   a_results_exported: 'تصدير نتائج',
   a_exam_create: 'إنشاء امتحان',
   a_exam_update: 'تعديل امتحان',
@@ -1168,6 +1170,78 @@ const ar = {
   errExOwnerNotAssigned: 'معلم هذا الامتحان غير معتمد حالياً لتدريس هذه المادة، لذلك لا يمكن إعادة نشره.',
   practiceNoneLeft: 'كل أسئلة هذا الاختبار ملغاة، فلا توجد أسئلة للتدرّب عليها.',
   exRetryTeaching: 'إعادة تحميل موادي',
+  // --- المرحلة 3-4: التصحيح والنتائج والإشعارات ---
+  gdFeedback: 'تعليق للطالب (اختياري)',
+  gdFeedbackTooLong: 'التعليق أطول من 500 حرف.',
+  gdAllFull: 'الدرجة الكاملة للإجابات المنتظِرة التي لا درجة مكتوبة لها',
+  gdAllZero: 'صفر للإجابات المنتظِرة التي لا درجة مكتوبة لها',
+  gdCommentsHidden: 'هذا الامتحان يُخفي الإجابات عن الطلاب، فلن يروا تعليقاتك ولن يصلهم إشعار بها (تبقى محفوظة).',
+  gdSavedPartial: 'حُفظ {saved} من {total} تعديلاً قبل أن يتوقف الحفظ، وبقي الباقي دون حفظ. {reason}',
+  gdShortcut: 'اختصار: Ctrl+Enter (أو Cmd+Enter) يحفظ وينتقل إلى السؤال التالي الذي ما زالت فيه إجابات منتظِرة.',
+  gdUnsavedMark: 'تعديلات غير محفوظة',
+  gdErrNotGradable: 'لا يمكن تصحيح هذه الإجابة: هي فارغة أو ليست إجابة مقالية.',
+  gdErrFeedbackLong: 'التعليق أطول من 500 حرف.',
+  gdErrSelection: 'لا توجد تعديلات صالحة للحفظ.',
+  gdErrNotFound: 'لم تعد هذه الإجابة أو هذا الامتحان متاحاً (ربما حُذف الامتحان أو انتهى تسجيل الطالب).',
+  gdErrForbidden: 'لا تملك صلاحية تصحيح هذا الامتحان.',
+  gdCorrectionHint: 'تعديل درجة سبق إعطاؤها يُسجَّل في سجل التدقيق، ويُبلَّغ الطالب بالتغيير إن كانت نتيجته ظاهرة له.',
+  gdGradedBy: 'صحّحها {name} في {date}',
+  gdGradedAt: 'صُحّحت في {date}',
+  gdTeacherFeedback: 'تعليق المصحِّح',
+  gdSubjectFilter: 'المادة',
+  gdAllSubjects: 'كل المواد',
+  gdQueueNoMatch: 'لا شيء بانتظار التصحيح في هذه المادة.',
+  gdNotOwned: 'ليس من امتحاناتك',
+  gdSubmittedAttempts: 'محاولة مسلَّمة',
+  gdResultsLink: 'النتائج',
+  gdSaving: 'جارٍ الحفظ…',
+  rsViewLabel: 'عرض الجدول',
+  rsViewAttempts: 'كل المحاولات',
+  rsViewStudents: 'حسب الطالب',
+  rsStuBest: 'أفضل درجة',
+  rsStuAttempts: 'عدد المحاولات',
+  rsStuLast: 'آخر محاولة',
+  rsSortBest: 'أفضل درجة',
+  rsSortAttempts: 'عدد المحاولات',
+  rsSortLast: 'آخر محاولة',
+  rsNoStudents: 'لا طلاب مطابقون.',
+  rsBestAttempt: 'أفضل محاولة',
+  rsLastAttempt: 'آخر محاولة',
+  rsNoSubmitted: 'لا محاولة مسلَّمة',
+  rsAbsentTitle: 'لم يبدؤوا الاختبار',
+  rsAbsentIntro: 'طلاب مسجَّلون في المادة ولم يفتحوا هذا الاختبار بعد. تظهر الأسماء فقط.',
+  rsAbsentSearch: 'ابحث عن طالب بالاسم',
+  rsAbsentNone: 'كل الطلاب المسجَّلين بدؤوا هذا الاختبار.',
+  rsAbsentNoEnrolled: 'لا يوجد طلاب مسجَّلون في هذه المادة حالياً.',
+  rsAbsentNoMatch: 'لا اسم يطابق بحثك.',
+  rsAbsentOf: 'من أصل',
+  rsAbsentError: 'تعذّر تحميل قائمة من لم يبدؤوا.',
+  notifGroupLabel: 'تصفية الإشعارات حسب النوع',
+  notifGroupAll: 'الكل',
+  notifGroupExams: 'الاختبارات',
+  notifGroupContent: 'المحتوى',
+  notifGroupPeople: 'الأشخاص',
+  notifGroupAccount: 'الحساب',
+  notifUnreadOnly: 'غير المقروءة فقط',
+  notifRead: 'مقروء',
+  notifUnread: 'غير مقروء',
+  notifNew: 'جديد',
+  notifNoMatch: 'لا إشعارات تطابق هذا التصفية.',
+  notifShowing: 'عدد الإشعارات المعروضة: {n}',
+  errListFilter: 'طلب القائمة غير صالح. أعد تحميل الصفحة وحاول مرة أخرى.',
+  n_new_enrollment: 'انضم طالب جديد إلى مادة «{subject}».',
+  n_new_enrollment_many: 'انضم {count} طلاب جدد إلى مادة «{subject}».',
+  n_new_follower: 'بدأ طالب جديد بمتابعتك.',
+  n_new_follower_many: 'بدأ {count} طلاب جدد بمتابعتك.',
+  n_submission_pending: 'تسليم جديد في «{title}» بانتظار التصحيح.',
+  n_submission_pending_many: '{count} تسليمات جديدة في «{title}» بانتظار التصحيح.',
+  n_content_auto_hidden: 'أُوقف «{title}» تلقائياً بعد عدة بلاغات ولم يعد متاحاً للطلاب. راجعه أو تواصل مع مدير المنصة إن رأيت أن ذلك خطأ.',
+  n_live_updated: 'غيّر {teacher} موعد الدرس المباشر «{title}» أو رابطه. الموعد الآن: {starts_at}.',
+  n_feedback_added: 'أضاف المصحِّح تعليقاً على إجاباتك في «{title}».',
+  n_score_changed_grade: 'تغيّرت درجتك في «{title}» من {old} إلى {new} من {total} بعد مراجعة التصحيح.',
+  n_new_review_course: 'تقييم جديد ({rating} من 5) لدورة «{title}».',
+  n_new_review_course_comment: 'تقييم جديد ({rating} من 5) لدورة «{title}»: «{comment}»',
+  n_new_review_comment: 'تقييم جديد لك ({rating} من 5): «{comment}»',
 }
 
 const en: typeof ar = {
@@ -1558,6 +1632,8 @@ const en: typeof ar = {
   navGrading: 'Grading',
   gdTeacherLink: 'Needs grading',
   a_grades_saved: 'Grades saved',
+  a_answer_regraded: 'Grade corrected',
+  auditOpenAttempt: 'Open attempt',
   a_results_exported: 'Results exported',
   a_exam_create: 'Exam created',
   a_exam_update: 'Exam edited',
@@ -2336,6 +2412,78 @@ const en: typeof ar = {
   errExOwnerNotAssigned: 'This exam’s teacher is no longer approved for the subject, so it cannot go live again.',
   practiceNoneLeft: 'Every question of this exam was voided, so there is nothing to practise.',
   exRetryTeaching: 'Reload my subjects',
+  // --- phase 3-4: grading, results and notifications ---
+  gdFeedback: 'Feedback for the student (optional)',
+  gdFeedbackTooLong: 'The feedback is longer than 500 characters.',
+  gdAllFull: 'Full marks for the waiting answers with no grade typed',
+  gdAllZero: 'Zero for the waiting answers with no grade typed',
+  gdCommentsHidden: 'This exam hides the answers from students, so they will not see your comments and will not be notified about them (they stay saved).',
+  gdSavedPartial: 'Saved {saved} of {total} changes before saving stopped; the rest are not saved. {reason}',
+  gdShortcut: 'Shortcut: Ctrl+Enter (or Cmd+Enter) saves and moves to the next question that still has waiting answers.',
+  gdUnsavedMark: 'unsaved changes',
+  gdErrNotGradable: 'This answer cannot be graded: it is blank or not a written answer.',
+  gdErrFeedbackLong: 'The feedback is longer than 500 characters.',
+  gdErrSelection: 'There are no valid changes to save.',
+  gdErrNotFound: 'This answer or exam is no longer available (the exam may have been deleted, or the student left the subject).',
+  gdErrForbidden: 'You are not allowed to grade this exam.',
+  gdCorrectionHint: 'Changing a grade that was already given is recorded in the audit log, and the student is told about the change when their result is visible to them.',
+  gdGradedBy: 'Graded by {name} on {date}',
+  gdGradedAt: 'Graded on {date}',
+  gdTeacherFeedback: 'Grader feedback',
+  gdSubjectFilter: 'Subject',
+  gdAllSubjects: 'All subjects',
+  gdQueueNoMatch: 'Nothing is waiting for grading in this subject.',
+  gdNotOwned: 'Not your exam',
+  gdSubmittedAttempts: 'attempts submitted',
+  gdResultsLink: 'Results',
+  gdSaving: 'Saving…',
+  rsViewLabel: 'Table view',
+  rsViewAttempts: 'All attempts',
+  rsViewStudents: 'By student',
+  rsStuBest: 'Best score',
+  rsStuAttempts: 'Attempts',
+  rsStuLast: 'Last attempt',
+  rsSortBest: 'Best score',
+  rsSortAttempts: 'Number of attempts',
+  rsSortLast: 'Last attempt',
+  rsNoStudents: 'No matching students.',
+  rsBestAttempt: 'Best attempt',
+  rsLastAttempt: 'Last attempt',
+  rsNoSubmitted: 'No submitted attempt',
+  rsAbsentTitle: 'Have not started the exam',
+  rsAbsentIntro: 'Students enrolled in the subject who have not opened this exam yet. Names only.',
+  rsAbsentSearch: 'Search a student by name',
+  rsAbsentNone: 'Every enrolled student has started this exam.',
+  rsAbsentNoEnrolled: 'No students are enrolled in this subject right now.',
+  rsAbsentNoMatch: 'No name matches your search.',
+  rsAbsentOf: 'of',
+  rsAbsentError: 'The list of students who have not started could not be loaded.',
+  notifGroupLabel: 'Filter notifications by type',
+  notifGroupAll: 'All',
+  notifGroupExams: 'Exams',
+  notifGroupContent: 'Content',
+  notifGroupPeople: 'People',
+  notifGroupAccount: 'Account',
+  notifUnreadOnly: 'Unread only',
+  notifRead: 'Read',
+  notifUnread: 'Unread',
+  notifNew: 'New',
+  notifNoMatch: 'No notifications match this filter.',
+  notifShowing: 'Notifications shown: {n}',
+  errListFilter: 'The list request was not valid. Reload the page and try again.',
+  n_new_enrollment: 'A new student joined “{subject}”.',
+  n_new_enrollment_many: '{count} new students joined “{subject}”.',
+  n_new_follower: 'A new student started following you.',
+  n_new_follower_many: '{count} new students started following you.',
+  n_submission_pending: 'A new submission on “{title}” is waiting for grading.',
+  n_submission_pending_many: '{count} new submissions on “{title}” are waiting for grading.',
+  n_content_auto_hidden: '“{title}” was taken down automatically after several reports and is no longer available to students. Review it, or contact the platform admin if you think this is a mistake.',
+  n_live_updated: '{teacher} changed the time or link of the live lesson “{title}”. It now starts: {starts_at}.',
+  n_feedback_added: 'A grader left feedback on your answers in “{title}”.',
+  n_score_changed_grade: 'Your score on “{title}” changed from {old} to {new} out of {total} after a grading review.',
+  n_new_review_course: 'New review ({rating} of 5) on the course “{title}”.',
+  n_new_review_course_comment: 'New review ({rating} of 5) on the course “{title}”: “{comment}”',
+  n_new_review_comment: 'New review of you ({rating} of 5): “{comment}”',
 }
 
 export type PlatformKey = keyof typeof ar
@@ -2382,6 +2530,11 @@ export function platformErrorKey(code: string): PlatformKey {
     case 'section_too_long': return 'errSectionLong'
     case 'unauthorized': return 'unauthorized'
     case 'invalid_points': return 'invalidPoints'
+    case 'not_gradable': return 'gdErrNotGradable'
+    case 'feedback_too_long': return 'gdErrFeedbackLong'
+    case 'invalid_cursor':
+    case 'invalid_group':
+    case 'invalid_filter': return 'errListFilter'
     case 'cannot_report_own': return 'reportCannotOwn'
     case 'already_reported': return 'alreadyReported'
     case 'invalid_reason': return 'invalidReason'
@@ -2436,6 +2589,22 @@ export function platformErrorKey(code: string): PlatformKey {
 
 export function platformErrorMessage(pt: (k: PlatformKey) => string, e: unknown): string {
   return pt(platformErrorKey(e instanceof PlatformError ? e.code : ''))
+}
+
+/**
+ * Like [`platformErrorMessage`] on the grading screens, where a few codes mean something more specific than elsewhere
+ * (`invalid_selection` is the bank import's message by default; `not_found` is "the answer or exam is gone").
+ */
+export function gradingErrorMessage(pt: (k: PlatformKey) => string, e: unknown): string {
+  if (e instanceof PlatformError) {
+    switch (e.code) {
+      case 'invalid_selection': return pt('gdErrSelection')
+      case 'invalid_points': return pt('gdBadPoints')
+      case 'not_found': return pt('gdErrNotFound')
+      case 'forbidden': return pt('gdErrForbidden')
+    }
+  }
+  return platformErrorMessage(pt, e)
 }
 
 /**

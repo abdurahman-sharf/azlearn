@@ -11,6 +11,22 @@ const more = ref(false)
 const error = ref('')
 const fmt = (ms: number) => new Date(ms).toLocaleString(i18n.locale === 'ar' ? 'ar' : undefined, { dateStyle: 'medium', timeStyle: 'short' })
 
+/**
+ * A grade correction (`answer_regraded`): the detail is `{exam_id, question_id, old, new}` and the row's target is the
+ * attempt. Shown as "question q5: 3 -> 4" next to a link to that attempt instead of the raw JSON.
+ */
+interface Regrade { question: string; before: string; after: string }
+function regrade(r: AuditRow): Regrade | null {
+  if (r.action !== 'answer_regraded' || !r.target_id) return null
+  try {
+    const d = JSON.parse(r.detail ?? '') as { question_id?: unknown; old?: unknown; new?: unknown }
+    if (typeof d.old !== 'number' || typeof d.new !== 'number') return null
+    return { question: typeof d.question_id === 'string' ? d.question_id : '', before: String(d.old), after: String(d.new) }
+  } catch {
+    return null
+  }
+}
+
 async function load(before?: number) {
   try {
     const page = await adminAudit(before)
@@ -33,7 +49,11 @@ onMounted(() => load())
         <div class="font-bold">{{ auditLabel(pt, r.action) }}</div>
         <div class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">
           {{ pt('actor') }}: {{ r.actor ?? pt('system') }} · {{ fmt(r.created_at) }}
-          <template v-if="r.detail"> · <span dir="auto">{{ r.detail }}</span></template>
+          <template v-if="regrade(r)">
+            · <span dir="ltr" class="inline-block" data-testid="audit-regrade">{{ regrade(r)!.question }}: {{ regrade(r)!.before }} → {{ regrade(r)!.after }}</span>
+            · <router-link :to="`/platform/attempts/${r.target_id}`" class="underline" :aria-label="`${pt('auditOpenAttempt')} - ${fmt(r.created_at)}`" data-testid="audit-attempt-link">{{ pt('auditOpenAttempt') }}</router-link>
+          </template>
+          <template v-else-if="r.detail"> · <span dir="auto">{{ r.detail }}</span></template>
         </div>
       </li>
     </ul>
