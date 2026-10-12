@@ -7,6 +7,7 @@ import { getStructure, type Structure, type Unit, type UnitKind } from '@/api/pl
 import { getPlacement, setPlacement, myTeaching, type Placement } from '@/api/platformLearning'
 import { statusBySubject, type TeachingGroupKey } from '@/utils/teachingCards'
 import PageError from '@/components/platform/PageError.vue'
+import PageLoading from '@/components/platform/PageLoading.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -16,6 +17,8 @@ const id = route.params.id as string
 const data = ref<Structure | null>(null)
 const placement = ref<Placement | null>(null)
 const error = ref('')
+/** set when the student has just chosen a level here: the suggestions of that level wait on "My subjects" */
+const placedNow = ref(false)
 // A teacher sees which subjects of this institution they already asked for / teach (optional: the page works without it).
 const mine = ref<Record<string, TeachingGroupKey>>({})
 const MARK: Record<TeachingGroupKey, PlatformKey> = { pending: 'statusPending', approved: 'statusApproved', rejected: 'statusRejected' }
@@ -56,6 +59,7 @@ async function chooseLevel(u: Unit) {
     const p = { institution_id: id, unit_id: u.id }
     await setPlacement(p)
     placement.value = p
+    placedNow.value = true
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
   }
@@ -72,6 +76,10 @@ onMounted(load)
       {{ [data.institution.name_en, data.institution.city].filter(Boolean).join(' · ') }}
     </p>
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+    <p v-if="placedNow" class="card-filled p-3 mb-3 text-body-md" role="status" data-testid="browse-placement-saved">
+      {{ pt('browsePlacementSaved') }}
+      <router-link to="/platform/my-subjects" class="underline font-semibold ms-1" data-testid="browse-go-suggestions">{{ pt('browseGoSuggestions') }}</router-link>
+    </p>
 
     <p v-if="!rows.length && !subjectsOf(null).length" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))">{{ pt('noResults') }}</p>
 
@@ -82,7 +90,7 @@ onMounted(load)
             <span class="shrink-0 px-2 py-0.5 rounded-full text-xs font-semibold" style="background-color: rgb(var(--md-secondary-container))">{{ pt(kindKey[unit.kind]) }}</span>
             <span class="font-bold break-words min-w-0 flex-1">{{ unit.name_ar }}</span>
             <span v-if="placement?.unit_id === unit.id" class="text-xs font-semibold px-2 py-0.5 rounded-full" style="background-color: rgb(var(--md-primary-container))">{{ pt('myLevelSet') }}</span>
-            <button v-else-if="auth.role === 'student' && unit.kind !== 'department'" class="btn-text" @click="chooseLevel(unit)">{{ pt('myLevel') }}</button>
+            <button v-else-if="auth.role === 'student' && unit.kind !== 'department'" class="btn-text" :aria-label="`${pt('myLevel')}: ${unit.name_ar}`" :data-testid="`browse-level-${unit.id}`" @click="chooseLevel(unit)">{{ pt('myLevel') }}</button>
           </div>
           <div v-if="subjectsOf(unit.id).length" class="flex flex-wrap gap-2 mt-2">
             <router-link v-for="s in subjectsOf(unit.id)" :key="s.id" :to="`/platform/subjects/${s.id}`" class="px-3 py-1 rounded-full text-sm" style="background-color: rgb(var(--md-surface-container-high))" :data-testid="`browse-subject-${s.id}`">{{ s.name_ar }}<span v-if="mine[s.id]" class="ms-1 text-xs font-semibold" :data-testid="`browse-mark-${s.id}`">· {{ pt(MARK[mine[s.id]!]) }}</span></router-link>
@@ -99,4 +107,5 @@ onMounted(load)
     </div>
   </div>
   <PageError v-else-if="error" :message="error" />
+  <PageLoading v-else />
 </template>

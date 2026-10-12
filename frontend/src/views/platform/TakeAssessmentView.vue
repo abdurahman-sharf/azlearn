@@ -5,6 +5,7 @@ import { usePt, platformErrorMessage } from '@/i18n/platform'
 import { PlatformError } from '@/lib/platformApi'
 import { useDialog } from '@/composables/useDialog'
 import { startAssessment, submitAttempt, saveAnswers, sendAttemptEvent, type StartRes } from '@/api/platformExams'
+import { attemptDraftKey, autoSubmitDue, isAttemptOverCode } from '@/utils/attemptDrafts'
 
 const pt = usePt()
 const route = useRoute()
@@ -44,8 +45,10 @@ async function doSave() {
   } catch (e) {
     dirty = true
     saveState.value = 'failed'
-    if (e instanceof PlatformError && (e.code === 'time_expired' || e.code === 'already_submitted')) {
-      // the server already settled this attempt (time ran out): show what it recorded
+    if (attemptOver(e)) {
+      // the server already settled this attempt (time ran out): the local copy is of no use any more; show what it recorded
+      over = true
+      dropDraft()
       router.replace(`/platform/attempts/${session.value.attempt_id}`)
       return
     }
@@ -67,7 +70,18 @@ const back = () => { away = false }
 const onVisibility = () => (document.visibilityState === 'hidden' ? leave() : back())
 
 const LABELS = 'ABCDEFGHIJ'.split('')
-const storageKey = () => `exameow-attempt-${session.value?.attempt_id}`
+const storageKey = () => attemptDraftKey(session.value?.attempt_id ?? '')
+/** The server has already ended this attempt (submitted elsewhere, or settled when its time ran out). */
+const attemptOver = (e: unknown) => e instanceof PlatformError && isAttemptOverCode(e.code)
+/** Set once the server says the attempt is over: no local copy is written any more, and nothing is sent. */
+let over = false
+/** When the page last tried to hand the attempt in by itself (the deadline passed). */
+let lastAutoTry = 0
+/** Forgets this attempt's local copy of the answers (it is kept only while the attempt runs). */
+function dropDraft() {
+  if (!session.value) return
+  try { localStorage.removeItem(storageKey()) } catch { /* storage unavailable */ }
+}
 const q = computed(() => session.value?.questions[index.value] ?? null)
 const answered = computed(() => session.value?.questions.filter(x => (answers.value[x.id] ?? '').trim()).length ?? 0)
 const remainingSec = computed(() => (session.value ? Math.max(0, Math.floor((session.value.ends_at - now.value) / 1000)) : 0))
@@ -89,7 +103,12 @@ onMounted(async () => {
     sweep = setInterval(() => { if (dirty) void doSave() }, 30_000)
     timer = setInterval(() => {
       now.value = Date.now()
-      if (timed.value && remainingSec.value <= 0 && !submitting.value) submit()
+      // time is up: hand the attempt in; a failed try (offline, server error) waits a few seconds before the next, and
+      // once the server says the attempt is over there are no more requests
+      if (autoSubmitDue({ timed: timed.value, remainingSec: remainingSec.value, submitting: submitting.value, over, now: now.value, lastTryAt: lastAutoTry })) {
+        lastAutoTry = now.value
+        void submit()
+      }
     }, 1000)
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
@@ -106,7 +125,7 @@ onUnmounted(() => {
 
 // Keep a local draft so a refresh does not lose answers (the server only stores them on submit).
 watch(answers, (v) => {
-  if (!session.value) return
+  if (!session.value || over) return
   try { localStorage.setItem(storageKey(), JSON.stringify(v)) } catch { /* storage unavailable */ }
   dirty = true
   scheduleSave()
@@ -128,19 +147,35 @@ async function submit() {
   error.value = ''
   try {
     const r = await submitAttempt(session.value.attempt_id, answers.value)
-    try { localStorage.removeItem(storageKey()) } catch { /* ignore */ }
+    dropDraft()
     router.replace(`/platform/attempts/${r.attempt_id}`)
   } catch (e) {
+    if (attemptOver(e)) {
+      // The server already ended this attempt (the device slept through the deadline, or it was handed in from another
+      // tab or device) and settled it from the last autosave: leave for the page that shows what it recorded. Staying
+      // here would be a dead end (focus mode has no navigation) with the same request failing again every second.
+      over = true
+      dropDraft()
+      confirming.value = false
+      router.replace(`/platform/attempts/${session.value.attempt_id}`)
+      return
+    }
     error.value = platformErrorMessage(pt, e)
     submitting.value = false
     confirming.value = false
   }
+}
+function askToSubmit() {
+  error.value = ''
+  confirming.value = true
 }
 </script>
 
 <template>
   <div v-if="session && q" class="max-w-2xl mx-auto pb-8">
     <h1 class="sr-only">{{ pt('tkPageTitle') }}</h1>
+    <!-- a failed hand-in (the confirmation dialog has closed): say so here, the answers are still on screen and can be sent again -->
+    <p v-if="error && !confirming" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))" data-testid="take-error">{{ error }}</p>
     <div class="flex items-center gap-3 mb-3">
       <span class="text-body-sm flex-1">{{ pt('question') }} <span dir="ltr" class="inline-block">{{ index + 1 }} / {{ session.questions.length }}</span> · {{ pt('answered') }}: {{ answered }}</span>
       <span class="text-body-sm" data-testid="save-state" aria-live="polite">{{ saveState === 'saving' ? pt('tkSaving') : saveState === 'saved' ? pt('tkSaved') : saveState === 'failed' ? pt('tkSaveFailed') : '' }}</span>
@@ -167,7 +202,7 @@ async function submit() {
     <div class="flex items-center gap-2 mt-4">
       <button class="btn-outlined" :disabled="index === 0" @click="index--">{{ pt('previous') }}</button>
       <button class="btn-outlined" :disabled="index >= session.questions.length - 1" @click="index++">{{ pt('next') }}</button>
-      <button class="btn-filled ms-auto" @click="confirming = true">{{ pt('submitAttempt') }}</button>
+      <button class="btn-filled ms-auto" data-testid="take-submit" @click="askToSubmit">{{ pt('submitAttempt') }}</button>
     </div>
 
     <nav class="flex flex-wrap gap-1 mt-4" :aria-label="pt('tkQuestionNav')">

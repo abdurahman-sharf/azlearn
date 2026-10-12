@@ -63,6 +63,8 @@ export interface EnrolledSubject {
   subject_name: string
   institution_id: string
   institution_name: string
+  /** false while the subject or its institution is switched off: the row stays so the student can unenrol (its page is gone) */
+  active?: boolean
 }
 export interface Placement {
   institution_id: string

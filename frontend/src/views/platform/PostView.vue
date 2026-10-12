@@ -6,6 +6,7 @@ import { usePt, platformErrorMessage } from '@/i18n/platform'
 import ReportButton from '@/components/platform/ReportButton.vue'
 import { getPost, updatePost, deletePost, downloadFile, type Post } from '@/api/platformContent'
 import PageError from '@/components/platform/PageError.vue'
+import PageLoading from '@/components/platform/PageLoading.vue'
 import ConfirmDeleteDialog from '@/components/platform/ConfirmDeleteDialog.vue'
 
 const pt = usePt()
@@ -86,4 +87,5 @@ onMounted(load)
     />
   </div>
   <PageError v-else-if="error" :message="error" />
+  <PageLoading v-else />
 </template>

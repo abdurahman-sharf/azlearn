@@ -18,25 +18,35 @@ const error = ref('')
 const delPassword = ref('')
 const delError = ref('')
 
-// What deleting the account takes with it (the caller's own exams, student attempts on them, courses, posts, live
-// sessions). Read when the page opens and again right before the confirmation, so the dialog never shows old numbers.
+// What deleting the account takes with it (a teacher's own exams, student attempts on them, courses, posts, live
+// sessions; a student's exam attempts and results, completed lessons, enrolments and reviews). Read when the page opens
+// and again right before the confirmation, so the dialog never shows old numbers.
 const impact = ref<DeletionImpact | null>(null)
 const impactKnown = ref(false)
 const confirming = ref(false)
 const busy = ref(false)
 const dialogError = ref('')
 
-const total = (i: DeletionImpact | null) => (i ? i.exams + i.attempts + i.courses + i.posts + i.live : 0)
+const total = (i: DeletionImpact | null) =>
+  i ? i.exams + i.attempts + i.courses + i.posts + i.live + (i.attempts_taken ?? 0) + (i.lessons_completed ?? 0) + (i.enrollments ?? 0) + (i.reviews ?? 0) : 0
+// the dialog lists only the non-zero ones (a student's teacher figures are always 0, and the other way round)
 const counts = computed(() => [
   { label: pt('delCntExams'), value: impact.value?.exams ?? 0 },
   { label: pt('delCntAttempts'), value: impact.value?.attempts ?? 0 },
   { label: pt('delCntCourses'), value: impact.value?.courses ?? 0 },
   { label: pt('delCntPosts'), value: impact.value?.posts ?? 0 },
   { label: pt('delCntLive'), value: impact.value?.live ?? 0 },
+  { label: pt('delCntAttemptsTaken'), value: impact.value?.attempts_taken ?? 0 },
+  { label: pt('delCntLessons'), value: impact.value?.lessons_completed ?? 0 },
+  { label: pt('delCntEnrollments'), value: impact.value?.enrollments ?? 0 },
+  { label: pt('delCntReviews'), value: impact.value?.reviews ?? 0 },
 ])
-// Typing the e-mail is required whenever something of value goes with the account, and also when the numbers could
-// not be read (then nothing is known to be safe to lose).
-const needsEmail = computed(() => !impactKnown.value || total(impact.value) > 0)
+// Typing the e-mail is required whenever something of value goes with the account - a teacher's content, a student's
+// exam results (the server insists on it then: 409 confirm_required) - and also when the numbers could not be read
+// (then nothing is known to be safe to lose). Enrolments, completed lessons and reviews alone are listed but need only
+// the password.
+const teacherTotal = (i: DeletionImpact | null) => (i ? i.exams + i.attempts + i.courses + i.posts + i.live : 0)
+const needsEmail = computed(() => !impactKnown.value || teacherTotal(impact.value) > 0 || (impact.value?.attempts_taken ?? 0) > 0)
 // Students' attempts on this teacher's exams: the server refuses the deletion (409 has_attempts) and says so up front.
 const blocked = computed(() => (impact.value?.attempts ?? 0) > 0)
 
@@ -72,11 +82,19 @@ async function remove() {
   busy.value = true
   dialogError.value = ''
   try {
-    await deleteAccount(delPassword.value)
+    // the dialog only lets this through once the typed address matches the account's (the server checks it again for a
+    // student who has taken exams: 409 confirm_required)
+    await deleteAccount(delPassword.value, needsEmail.value ? auth.profile?.email : undefined)
     confirming.value = false
     await signOut()
   } catch (e) {
-    dialogError.value = e instanceof PlatformError && e.code === 'has_attempts' ? pt('delHasAttempts') : platformErrorMessage(pt, e)
+    if (e instanceof PlatformError && e.code === 'confirm_required') {
+      // exams were taken since the numbers were read: show them, and the dialog now asks for the e-mail
+      dialogError.value = pt('delErrConfirmEmail')
+      await loadImpact()
+    } else {
+      dialogError.value = e instanceof PlatformError && e.code === 'has_attempts' ? pt('delHasAttempts') : platformErrorMessage(pt, e)
+    }
   } finally {
     busy.value = false
   }
@@ -104,6 +122,7 @@ async function remove() {
       <h2 class="font-bold" style="color: rgb(var(--md-error))">{{ pt('deleteAccount') }}</h2>
       <p class="text-body-sm">{{ pt('deleteAccountHint') }}</p>
       <p v-if="auth.role === 'teacher'" class="text-body-sm" data-testid="del-teacher-hint">{{ pt('deleteAccountTeacherHint') }}</p>
+      <p v-if="auth.role === 'student'" class="text-body-sm" data-testid="del-student-hint">{{ pt('deleteAccountStudentHint') }}</p>
       <p v-if="blocked" class="text-body-sm font-semibold" role="note" data-testid="del-blocked">{{ pt('delBlockedNotice') }}</p>
       <input v-model="delPassword" type="password" required autocomplete="current-password" dir="ltr" :placeholder="pt('deleteAccountConfirm')" :aria-label="pt('deleteAccountConfirm')" class="input-outlined w-full" data-testid="del-password" />
       <p v-if="delError" class="text-body-sm" role="alert" style="color: rgb(var(--md-error))">{{ delError }}</p>

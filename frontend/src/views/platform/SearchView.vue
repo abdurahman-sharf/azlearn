@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { usePt, platformErrorMessage, type PlatformKey } from '@/i18n/platform'
 import { search, type SearchResults, type Hit } from '@/api/platformOps'
+import PageLoading from '@/components/platform/PageLoading.vue'
 
 const pt = usePt()
 const route = useRoute()
@@ -10,6 +11,8 @@ const router = useRouter()
 const q = ref((route.query.q as string) ?? '')
 const results = ref<SearchResults | null>(null)
 const error = ref('')
+const loading = ref(false)
+let seq = 0
 
 const groups: { key: keyof SearchResults; label: PlatformKey }[] = [
   { key: 'subjects', label: 'subjectsLabel' }, { key: 'teachers', label: 'teachersLabel' },
@@ -17,14 +20,19 @@ const groups: { key: keyof SearchResults; label: PlatformKey }[] = [
 ]
 
 async function run() {
+  const mine = ++seq
   error.value = ''
   results.value = null
-  if (!q.value.trim()) return
+  if (!q.value.trim()) { loading.value = false; return }
   router.replace({ query: { q: q.value.trim() } })
+  loading.value = true
   try {
-    results.value = await search(q.value.trim())
+    const r = await search(q.value.trim())
+    if (mine === seq) results.value = r
   } catch (e) {
-    error.value = platformErrorMessage(pt, e)
+    if (mine === seq) error.value = platformErrorMessage(pt, e)
+  } finally {
+    if (mine === seq) loading.value = false
   }
 }
 const empty = () => results.value && groups.every(g => !results.value![g.key].length)
@@ -36,9 +44,10 @@ onMounted(run)
     <router-link to="/platform" class="text-body-sm underline">{{ pt('back') }}</router-link>
     <h1 class="text-display-sm font-bold tracking-tight my-3">{{ pt('searchTitle') }}</h1>
     <form class="mb-4" @submit.prevent="run">
-      <input v-model="q" type="search" maxlength="60" :placeholder="pt('searchPlaceholder')" class="input-outlined w-full" data-testid="search-input" />
+      <input v-model="q" type="search" maxlength="60" :placeholder="pt('searchPlaceholder')" :aria-label="pt('searchPlaceholder')" class="input-outlined w-full" data-testid="search-input" />
     </form>
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+    <PageLoading v-if="loading" :rows="2" />
     <p v-if="empty()" class="text-body-lg" style="color: rgb(var(--md-on-surface-variant))">{{ pt('noResults') }}</p>
     <template v-if="results">
       <section v-for="g in groups" :key="g.key" v-show="results[g.key].length" class="mb-5">

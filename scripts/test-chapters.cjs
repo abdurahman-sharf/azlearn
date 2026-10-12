@@ -16,7 +16,7 @@ require.extensions['.ts'] = (module, filename) => {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText, filename)
 }
-for (const name of ['chapters', 'practiceFilter', 'questionMetadata', 'importParser', 'arabicImport', 'structureTree', 'examBuilder', 'teacherOnboarding', 'platformGuard', 'videoKind', 'subjectPicker', 'localBanks', 'teachingCards', 'contentHub', 'notificationText', 'localBankPicker', 'examEditorState', 'myExams', 'answerKey', 'gradeSheet']) {
+for (const name of ['chapters', 'practiceFilter', 'questionMetadata', 'importParser', 'arabicImport', 'structureTree', 'examBuilder', 'teacherOnboarding', 'platformGuard', 'videoKind', 'subjectPicker', 'localBanks', 'teachingCards', 'contentHub', 'notificationText', 'localBankPicker', 'examEditorState', 'myExams', 'answerKey', 'gradeSheet', 'studentExams', 'routeTitle', 'attemptDrafts']) {
   require(path.join(root, `frontend/src/utils/${name}.test.ts`))
 }
 const direct = require(path.join(root, 'frontend/src/utils/aiClient.ts'))
@@ -64,4 +64,5 @@ async function testTransport() {
   assert.equal(generated[0].chapter, 'Chapter 1')
   console.log('Chapter grouping, filters, imports, metadata, prompt parity and AI transport tests passed')
 }
-testTransport().catch(error => { console.error(error); process.exitCode = 1 })
+// last: the auth-store test replaces `@/lib/platformApi` (it reads import.meta.env) with a scripted stub in the require cache
+testTransport().then(() => require(path.join(root, 'scripts/test-auth-store.cjs')).done).catch(error => { console.error(error); process.exitCode = 1 })

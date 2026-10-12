@@ -9,6 +9,7 @@ import { getSubject } from '@/api/platformLearning'
 import ReportButton from '@/components/platform/ReportButton.vue'
 import { getCourse, updateCourse, deleteCourse, type CourseDetail, type Lesson } from '@/api/platformContent'
 import PageError from '@/components/platform/PageError.vue'
+import PageLoading from '@/components/platform/PageLoading.vue'
 import ConfirmDeleteDialog from '@/components/platform/ConfirmDeleteDialog.vue'
 
 const pt = usePt()
@@ -163,4 +164,5 @@ onMounted(load)
     />
   </div>
   <PageError v-else-if="error" :message="error" />
+  <PageLoading v-else />
 </template>

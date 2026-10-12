@@ -19,9 +19,63 @@ use std::sync::{Arc, Mutex, OnceLock};
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const MIN_PASSWORD: usize = 8;
 const MAX_PASSWORD: usize = 128;
-const REGISTER_PER_HOUR_PER_IP: i64 = 10;
-const LOGIN_PER_10MIN_PER_IP: i64 = 30;
-const LOGIN_PER_10MIN_PER_EMAIL: i64 = 10;
+/// The window of the sign-in failure counters ([`AuthLimits`]).
+const LOGIN_WINDOW_MS: i64 = 600_000;
+const REGISTER_WINDOW_MS: i64 = 3_600_000;
+
+/// Sign-in and registration limits (phase 4-1), read once at start ([`AuthLimits::from_env`]); `0` switches one off.
+///
+/// Only **failed** sign-ins count (a wrong password or an unknown e-mail): a whole class signing in from one school
+/// address never runs into a limit, and a correct password is never refused because of somebody else's mistakes unless
+/// a counter is already full. The per-e-mail counter is kept per e-mail **and client address**, so a stranger on another
+/// network cannot lock a student out; a looser per-e-mail counter across all addresses stays as abuse protection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthLimits {
+    /// `PLATFORM_LOGIN_FAILS_PER_10MIN_PER_IP` (default 30): failed sign-ins per client address.
+    pub login_fails_per_ip: i64,
+    /// `PLATFORM_LOGIN_FAILS_PER_10MIN_PER_EMAIL_IP` (default 10): failed sign-ins per e-mail from one address.
+    pub login_fails_per_email_ip: i64,
+    /// `PLATFORM_LOGIN_FAILS_PER_10MIN_PER_EMAIL` (default 50): failed sign-ins per e-mail from all addresses.
+    pub login_fails_per_email: i64,
+    /// `PLATFORM_REGISTER_PER_HOUR_PER_IP` (default 60): registration requests per client address and hour.
+    pub register_per_ip: i64,
+}
+
+impl Default for AuthLimits {
+    fn default() -> Self {
+        AuthLimits { login_fails_per_ip: 30, login_fails_per_email_ip: 10, login_fails_per_email: 50, register_per_ip: 60 }
+    }
+}
+
+impl AuthLimits {
+    pub fn from_env() -> Self {
+        Self::parse(|k| std::env::var(k).ok())
+    }
+
+    /// Each value: a whole number `>= 0` (`0` = off); anything else keeps the default rather than switching a
+    /// protection off by accident.
+    pub fn parse(get: impl Fn(&str) -> Option<String>) -> Self {
+        let d = AuthLimits::default();
+        let n = |k: &str, default: i64| get(k).and_then(|v| v.trim().parse::<u32>().ok()).map_or(default, i64::from);
+        AuthLimits {
+            login_fails_per_ip: n("PLATFORM_LOGIN_FAILS_PER_10MIN_PER_IP", d.login_fails_per_ip),
+            login_fails_per_email_ip: n("PLATFORM_LOGIN_FAILS_PER_10MIN_PER_EMAIL_IP", d.login_fails_per_email_ip),
+            login_fails_per_email: n("PLATFORM_LOGIN_FAILS_PER_10MIN_PER_EMAIL", d.login_fails_per_email),
+            register_per_ip: n("PLATFORM_REGISTER_PER_HOUR_PER_IP", d.register_per_ip),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        let v = |n: i64| if n == 0 { "off".to_string() } else { n.to_string() };
+        format!(
+            "failed sign-ins per 10 min: {} per address, {} per e-mail+address, {} per e-mail; registrations per hour per address: {}",
+            v(self.login_fails_per_ip),
+            v(self.login_fails_per_email_ip),
+            v(self.login_fails_per_email),
+            v(self.register_per_ip)
+        )
+    }
+}
 
 pub struct PlatformState {
     pub conn: Mutex<Connection>,
@@ -38,6 +92,8 @@ pub struct PlatformState {
     pub started_at: i64,
     /// Short-lived memo of the public landing-page counters (phase 2-1).
     pub public_stats: crate::platform_stats::StatsCache,
+    /// Sign-in / registration limits (phase 4-1).
+    pub limits: AuthLimits,
 }
 
 impl PlatformState {
@@ -55,6 +111,7 @@ impl PlatformState {
             backup_busy: std::sync::atomic::AtomicBool::new(false),
             started_at: 0,
             public_stats: Default::default(),
+            limits: AuthLimits::default(),
         }
     }
 }
@@ -177,6 +234,7 @@ pub fn init_db(layout: &crate::platform_backup::Layout) -> Result<PlatformState,
         backup_busy: std::sync::atomic::AtomicBool::new(false),
         started_at: now_ms(),
         public_stats: Default::default(),
+        limits: AuthLimits::from_env(),
     })
 }
 
@@ -245,20 +303,77 @@ fn normalize_email(raw: &str) -> Option<String> {
 
 /// Fixed-window counter. Returns 429 once `max` hits are exceeded in the window.
 pub fn rate_limit(conn: &Connection, key: &str, window_ms: i64, max: i64) -> Result<(), Err> {
-    let bucket = now_ms() / window_ms;
-    let expires = (bucket + 1) * window_ms + window_ms;
-    let count: i64 = conn
-        .query_row(
-            "INSERT INTO rate_limits(key, bucket, count, expires_at) VALUES (?1, ?2, 1, ?3)
-             ON CONFLICT(key, bucket) DO UPDATE SET count = count + 1 RETURNING count",
-            params![key, bucket, expires],
-            |r| r.get(0),
-        )
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"))?;
+    let count = bump(conn, key, now_ms() / window_ms, window_ms)?;
     if count > max {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
     }
     Ok(())
+}
+
+/// One more hit on `key` in window `bucket`; returns the new count.
+fn bump(conn: &Connection, key: &str, bucket: i64, window_ms: i64) -> Result<i64, Err> {
+    let expires = (bucket + 1) * window_ms + window_ms;
+    conn.query_row(
+        "INSERT INTO rate_limits(key, bucket, count, expires_at) VALUES (?1, ?2, 1, ?3)
+         ON CONFLICT(key, bucket) DO UPDATE SET count = count + 1 RETURNING count",
+        params![key, bucket, expires],
+        |r| r.get(0),
+    )
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"))
+}
+
+/// The failure counters one sign-in attempt holds while its password is checked (see [`hold_login_attempt`]).
+#[derive(Debug, Default)]
+pub(crate) struct LoginHold {
+    /// `(key, bucket)` of each counter that was bumped.
+    held: Vec<(String, i64)>,
+}
+
+impl LoginHold {
+    /// The sign-in succeeded: it gives its place back, so a correct password never uses up a counter.
+    pub(crate) fn release(self, conn: &Connection) {
+        for (key, bucket) in self.held {
+            let _ = conn.execute("UPDATE rate_limits SET count = count - 1 WHERE key = ?1 AND bucket = ?2 AND count > 0", params![key, bucket]);
+        }
+    }
+}
+
+/// The three sign-in failure counters of a request: per client address, per e-mail from that address, per e-mail from
+/// anywhere. The e-mail is hashed: whatever was typed into the field (sometimes a password) is never stored.
+fn login_keys(limits: &AuthLimits, ip: &str, email: &str) -> [(String, i64); 3] {
+    let e = sha256_hex(email);
+    [
+        (format!("login-fail-ip:{ip}"), limits.login_fails_per_ip),
+        (format!("login-fail-email-ip:{e}:{ip}"), limits.login_fails_per_email_ip),
+        (format!("login-fail-email:{e}"), limits.login_fails_per_email),
+    ]
+}
+
+/// Takes a place on every sign-in failure counter BEFORE the password is checked (all under the database lock, so a
+/// burst of parallel guesses cannot all slip past a full counter), or answers 429 `rate_limited` when one is full (that
+/// request takes nothing). A failed attempt keeps its places; a successful one hands them back ([`LoginHold::release`]),
+/// so only failures are ever counted. A counter whose limit is 0 is off.
+pub(crate) fn hold_login_attempt(conn: &Connection, limits: &AuthLimits, ip: &str, email: &str, now: i64) -> Result<LoginHold, Err> {
+    let bucket = now / LOGIN_WINDOW_MS;
+    let mut hold = LoginHold::default();
+    for (key, max) in login_keys(limits, ip, email) {
+        if max <= 0 {
+            continue;
+        }
+        let count = match bump(conn, &key, bucket, LOGIN_WINDOW_MS) {
+            Ok(c) => c,
+            Err(e) => {
+                hold.release(conn);
+                return Err(e);
+            }
+        };
+        hold.held.push((key, bucket));
+        if count > max {
+            hold.release(conn);
+            return Err(err(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+        }
+    }
+    Ok(hold)
 }
 
 pub const USER_COLS: &str = "id, email, full_name, role, institution_type, status, status_reason";
@@ -487,9 +602,10 @@ pub async fn register_handler(
     if req.password.chars().count() < MIN_PASSWORD || req.password.chars().count() > MAX_PASSWORD {
         return Err(err(StatusCode::BAD_REQUEST, "invalid_password"));
     }
-    {
+    let per_ip = state.platform.limits.register_per_ip;
+    if per_ip > 0 {
         let conn = state.platform.conn.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"))?;
-        rate_limit(&conn, &format!("reg:{}", client_ip(&headers)), 3_600_000, REGISTER_PER_HOUR_PER_IP)?;
+        rate_limit(&conn, &format!("reg:{}", client_ip(&headers)), REGISTER_WINDOW_MS, per_ip)?;
     }
     let pw = req.password.clone();
     let hash = tokio::task::spawn_blocking(move || hash_password(&pw))
@@ -512,17 +628,25 @@ pub async fn login_handler(
     Json(req): Json<LoginReq>,
 ) -> Result<Json<serde_json::Value>, Err> {
     let email = normalize_email(&req.email).unwrap_or_default();
-    let found: Option<(User, String)> = {
+    let ip = client_ip(&headers);
+    let (hold, found): (LoginHold, Option<(User, String)>) = {
         let conn = state.platform.conn.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"))?;
-        rate_limit(&conn, &format!("login-ip:{}", client_ip(&headers)), 600_000, LOGIN_PER_10MIN_PER_IP)?;
-        rate_limit(&conn, &format!("login-email:{email}"), 600_000, LOGIN_PER_10MIN_PER_EMAIL)?;
-        conn.query_row(
+        // only failures count: the attempt takes a place now and gives it back below if the password is right
+        let hold = hold_login_attempt(&conn, &state.platform.limits, &ip, &email, now_ms())?;
+        let found = conn.query_row(
             &format!("SELECT {USER_COLS}, password_hash FROM users WHERE email = ?1"),
             params![email],
             |r| Ok((row_to_user(r)?, r.get::<_, String>(7)?)),
         )
-        .optional()
-        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"))?
+        .optional();
+        match found {
+            Ok(f) => (hold, f),
+            Err(_) => {
+                // our failure, not the caller's: nothing is counted
+                hold.release(&conn);
+                return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"));
+            }
+        }
     };
 
     let (user, phc) = match found {
@@ -535,10 +659,12 @@ pub async fn login_handler(
         .unwrap_or(false);
     let user = match (ok, user) {
         (true, Some(u)) => u,
+        // a wrong password or an unknown e-mail: the places taken above stay counted
         _ => return Err(err(StatusCode::UNAUTHORIZED, "invalid_credentials")),
     };
 
     let conn = state.platform.conn.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "db_error"))?;
+    hold.release(&conn);
     let token = create_session(&conn, &user.id)?;
     Ok(Json(serde_json::json!({ "token": token, "user": user })))
 }
@@ -661,5 +787,209 @@ mod tests {
         assert!(bootstrap_admin(&state, "Root@x.com", "password123").unwrap());
         assert!(!bootstrap_admin(&state, "other@x.com", "password123").unwrap());
         assert!(bootstrap_admin(&PlatformState::for_tests(db()), "r@x.com", "short").is_err());
+    }
+
+    // ───────── phase 4-1: sign-in / registration limits ─────────
+
+    /// The start of a 10-minute window, so a test never straddles two.
+    const T0: i64 = 1_800_000_000_000;
+
+    fn hold(conn: &Connection, l: &AuthLimits, ip: &str, email: &str) -> Result<LoginHold, Err> {
+        hold_login_attempt(conn, l, ip, email, T0)
+    }
+
+    fn fail(conn: &Connection, l: &AuthLimits, ip: &str, email: &str) {
+        hold(conn, l, ip, email).expect("a failure below the limit is let through"); // kept: it failed
+    }
+
+    fn limited(r: Result<LoginHold, Err>) -> bool {
+        matches!(r, Err((StatusCode::TOO_MANY_REQUESTS, ref m)) if m.contains("rate_limited"))
+    }
+
+    #[test]
+    fn limits_come_from_the_environment_with_safe_defaults_and_zero_means_off() {
+        assert_eq!(AuthLimits::parse(|_| None), AuthLimits { login_fails_per_ip: 30, login_fails_per_email_ip: 10, login_fails_per_email: 50, register_per_ip: 60 });
+        assert_eq!(AuthLimits::default(), AuthLimits::parse(|_| None));
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "PLATFORM_LOGIN_FAILS_PER_10MIN_PER_IP" => Some(" 5 ".into()),
+                "PLATFORM_LOGIN_FAILS_PER_10MIN_PER_EMAIL_IP" => Some("0".into()),
+                "PLATFORM_LOGIN_FAILS_PER_10MIN_PER_EMAIL" => Some("-3".into()),
+                "PLATFORM_REGISTER_PER_HOUR_PER_IP" => Some("lots".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            AuthLimits::parse(env),
+            AuthLimits { login_fails_per_ip: 5, login_fails_per_email_ip: 0, login_fails_per_email: 50, register_per_ip: 60 },
+            "unparseable or negative keeps the default"
+        );
+        assert!(AuthLimits::parse(env).describe().contains("off"));
+    }
+
+    #[test]
+    fn a_successful_sign_in_never_uses_up_a_counter_and_a_failure_does() {
+        let conn = db();
+        let l = AuthLimits { login_fails_per_ip: 2, login_fails_per_email_ip: 2, login_fails_per_email: 2, register_per_ip: 1 };
+        for _ in 0..25 {
+            hold(&conn, &l, "1.1.1.1", "a@x.com").unwrap().release(&conn);
+        }
+        fail(&conn, &l, "1.1.1.1", "a@x.com");
+        fail(&conn, &l, "1.1.1.1", "a@x.com");
+        assert!(limited(hold(&conn, &l, "1.1.1.1", "a@x.com")), "the third failure in the window is refused");
+        // a refused request takes nothing: the counters stay exactly full
+        let counts: Vec<i64> = conn.prepare("SELECT count FROM rate_limits ORDER BY key").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(counts, vec![2, 2, 2]);
+        // the next window starts afresh
+        assert!(hold_login_attempt(&conn, &l, "1.1.1.1", "a@x.com", T0 + LOGIN_WINDOW_MS).is_ok());
+    }
+
+    #[test]
+    fn the_email_counter_is_kept_per_address_so_a_stranger_cannot_lock_a_student_out() {
+        let conn = db();
+        let l = AuthLimits::default();
+        for _ in 0..10 {
+            fail(&conn, &l, "203.0.113.9", "student@x.com");
+        }
+        assert!(limited(hold(&conn, &l, "203.0.113.9", "student@x.com")), "the stranger is stopped for that e-mail");
+        let at_school = hold(&conn, &l, "198.51.100.7", "student@x.com").expect("the student, from the school's address, still gets in");
+        at_school.release(&conn);
+        // the stranger's address is not blocked for other e-mails until its own (looser) counter is full
+        hold(&conn, &l, "203.0.113.9", "someone@x.com").unwrap().release(&conn);
+    }
+
+    #[test]
+    fn the_per_address_and_the_cross_address_caps_still_hold() {
+        let conn = db();
+        let l = AuthLimits::default();
+        // one address guessing many e-mails: 30 failures
+        for i in 0..30 {
+            fail(&conn, &l, "192.0.2.1", &format!("u{i}@x.com"));
+        }
+        assert!(limited(hold(&conn, &l, "192.0.2.1", "fresh@x.com")));
+        // one e-mail guessed from many addresses: 50 failures, then even a new address is refused
+        for i in 0..50 {
+            fail(&conn, &l, &format!("10.0.{}.{}", i / 200, i % 200), "victim@x.com");
+        }
+        assert!(limited(hold(&conn, &l, "10.9.9.9", "victim@x.com")));
+        assert!(hold(&conn, &l, "10.9.9.9", "else@x.com").is_ok());
+    }
+
+    #[test]
+    fn a_zero_limit_switches_that_counter_off() {
+        let conn = db();
+        let off = AuthLimits { login_fails_per_ip: 0, login_fails_per_email_ip: 0, login_fails_per_email: 0, register_per_ip: 0 };
+        for _ in 0..200 {
+            fail(&conn, &off, "1.1.1.1", "a@x.com");
+        }
+        let rows: i64 = conn.query_row("SELECT count(*) FROM rate_limits", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0, "nothing is even counted");
+        let only_email_ip = AuthLimits { login_fails_per_email_ip: 3, ..off };
+        for _ in 0..3 {
+            fail(&conn, &only_email_ip, "1.1.1.1", "a@x.com");
+        }
+        assert!(limited(hold(&conn, &only_email_ip, "1.1.1.1", "a@x.com")));
+        assert!(hold(&conn, &only_email_ip, "1.1.1.2", "a@x.com").is_ok());
+    }
+
+    #[test]
+    fn the_typed_email_is_never_stored_in_the_counters() {
+        let conn = db();
+        fail(&conn, &AuthLimits::default(), "1.1.1.1", "my-secret-password");
+        let keys: Vec<String> = conn.prepare("SELECT key FROM rate_limits").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.iter().all(|k| !k.contains("my-secret-password")), "{keys:?}");
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request};
+    use axum::routing::post;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    fn make_app(limits: AuthLimits) -> (Router, Arc<AppState>) {
+        static CFG: std::sync::Once = std::sync::Once::new();
+        CFG.call_once(|| std::env::set_var("XDG_CONFIG_HOME", std::env::temp_dir().join(format!("exameow-http-test-{}", new_id()))));
+        let mut platform = PlatformState::for_tests(create_test_db());
+        platform.limits = limits;
+        let state = Arc::new(AppState {
+            config_store: exameow_core::config::ConfigStore::new("ExameowServerHttpTest").expect("a scratch config dir"),
+            relay: crate::relay::init_db(":memory:").unwrap(),
+            platform,
+            admin_token: std::sync::Mutex::new("pass".into()),
+            legacy: crate::legacy_guard::LegacyGuard::new(60, 2000),
+            auth_failures: crate::token_limit::TokenLimiter::new(600),
+        });
+        let router = Router::new()
+            .route("/api/platform/login", post(login_handler))
+            .route("/api/platform/register", post(register_handler))
+            .with_state(state.clone());
+        (router, state)
+    }
+
+    async fn send(app: &Router, uri: &str, ip: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(crate::client_ip::HEADER, ip)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn only_failed_sign_ins_count_and_another_address_is_not_locked_out() {
+        let (app, state) = make_app(AuthLimits { login_fails_per_ip: 0, login_fails_per_email_ip: 2, login_fails_per_email: 0, register_per_ip: 0 });
+        {
+            let conn = state.platform.conn.lock().unwrap();
+            let hash = hash_password("password123").unwrap();
+            conn.execute(
+                "INSERT INTO users(id,email,password_hash,full_name,role,status,created_at) VALUES ('u1','s@x.com',?1,'S','student','active',0)",
+                params![hash],
+            )
+            .unwrap();
+        }
+        let good = serde_json::json!({"email": "S@x.com", "password": "password123"});
+        let wrong = serde_json::json!({"email": "s@x.com", "password": "wrong-password"});
+        for _ in 0..3 {
+            let (st, v) = send(&app, "/api/platform/login", "1.1.1.1", good.clone()).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert!(v["token"].is_string());
+        }
+        for _ in 0..2 {
+            assert_eq!(send(&app, "/api/platform/login", "1.1.1.1", wrong.clone()).await.0, StatusCode::UNAUTHORIZED);
+        }
+        let (st, v) = send(&app, "/api/platform/login", "1.1.1.1", good.clone()).await;
+        assert_eq!((st, v["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")), "that address used up its failures for this e-mail");
+        let (st, _) = send(&app, "/api/platform/login", "2.2.2.2", good.clone()).await;
+        assert_eq!(st, StatusCode::OK, "the student from another address is not locked out");
+        // an unknown e-mail is a failure too
+        let ghost = serde_json::json!({"email": "ghost@x.com", "password": "whatever-123"});
+        for _ in 0..2 {
+            assert_eq!(send(&app, "/api/platform/login", "3.3.3.3", ghost.clone()).await.0, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(send(&app, "/api/platform/login", "3.3.3.3", ghost).await.0, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn registrations_per_address_follow_the_configured_limit() {
+        let reg = |email: &str| serde_json::json!({"email": email, "password": "password123", "full_name": "طالب", "role": "student", "consent": true});
+        let (app, _) = make_app(AuthLimits { register_per_ip: 1, ..AuthLimits::default() });
+        assert_eq!(send(&app, "/api/platform/register", "1.1.1.1", reg("a@x.com")).await.0, StatusCode::CREATED);
+        let (st, v) = send(&app, "/api/platform/register", "1.1.1.1", reg("b@x.com")).await;
+        assert_eq!((st, v["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")));
+        assert_eq!(send(&app, "/api/platform/register", "1.1.1.2", reg("b@x.com")).await.0, StatusCode::CREATED, "per address");
+        let (app, _) = make_app(AuthLimits { register_per_ip: 0, ..AuthLimits::default() });
+        for email in ["c@x.com", "d@x.com"] {
+            assert_eq!(send(&app, "/api/platform/register", "1.1.1.1", reg(email)).await.0, StatusCode::CREATED, "0 = off");
+        }
     }
 }

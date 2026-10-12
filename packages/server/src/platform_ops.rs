@@ -488,11 +488,19 @@ pub async fn change_password_handler(State(s): State<Arc<AppState>>, h: HeaderMa
 #[derive(Deserialize)]
 pub struct DeleteReq {
     password: String,
+    /// The account's e-mail, typed again: required when the account has taken exams (`attempts_taken > 0`), whose
+    /// results would be deleted with it (409 `confirm_required` otherwise). Compared trimmed and case-insensitively.
+    #[serde(default)]
+    confirm_email: Option<String>,
 }
 
 /// What deleting the caller's account would take with it — their own rows only (phase 3-1). For a teacher
 /// `attempts` is the number of student attempts (any status) on their exams; while it is above zero the account
 /// cannot be deleted (`delete_account` answers 409 `has_attempts`).
+///
+/// The student's side (phase 4-1; naturally zero for an account that never studied): `attempts_taken` = the caller's
+/// own exam attempts (any status: results and attempts in progress alike), `lessons_completed`, `enrollments` and the
+/// `reviews` they wrote. All of it goes with the account.
 #[derive(Serialize, Debug, PartialEq)]
 pub struct DeletionImpact {
     exams: i64,
@@ -500,6 +508,10 @@ pub struct DeletionImpact {
     courses: i64,
     posts: i64,
     live: i64,
+    attempts_taken: i64,
+    lessons_completed: i64,
+    enrollments: i64,
+    reviews: i64,
 }
 
 pub fn deletion_impact(conn: &Connection, user_id: &str) -> Res<DeletionImpact> {
@@ -510,7 +522,24 @@ pub fn deletion_impact(conn: &Connection, user_id: &str) -> Res<DeletionImpact> 
         courses: n("SELECT count(*) FROM courses WHERE teacher_id = ?1")?,
         posts: n("SELECT count(*) FROM posts WHERE teacher_id = ?1")?,
         live: n("SELECT count(*) FROM live_sessions WHERE teacher_id = ?1")?,
+        attempts_taken: n("SELECT count(*) FROM attempts WHERE student_id = ?1")?,
+        lessons_completed: n("SELECT count(*) FROM lesson_progress WHERE student_id = ?1")?,
+        enrollments: n("SELECT count(*) FROM subject_enrollments WHERE student_id = ?1")?,
+        reviews: n("SELECT count(*) FROM reviews WHERE student_id = ?1")?,
     })
+}
+
+/// An account that has taken exams loses every result with it, so a password alone is not enough: the e-mail must be
+/// typed again (trimmed, any case). 409 `confirm_required` otherwise. Accounts without attempts need nothing more.
+fn check_deletion_confirmed(conn: &Connection, user: &User, confirm_email: Option<&str>) -> Res<()> {
+    if deletion_impact(conn, &user.id)?.attempts_taken == 0 {
+        return Ok(());
+    }
+    let typed = confirm_email.map(|e| e.trim().to_lowercase()).unwrap_or_default();
+    if typed.is_empty() || typed != user.email.trim().to_lowercase() {
+        return Err(err(StatusCode::CONFLICT, "confirm_required"));
+    }
+    Ok(())
 }
 
 pub async fn deletion_impact_handler(State(s): State<Arc<AppState>>, h: HeaderMap) -> Res<Json<DeletionImpact>> {
@@ -634,6 +663,13 @@ pub fn delete_account_and_files(conn: &Connection, files_dir: &std::path::Path, 
     Ok(())
 }
 
+/// What `DELETE /me` does once the password is verified: the typed e-mail when the account has taken exams
+/// ([`check_deletion_confirmed`]), then [`delete_account_and_files`].
+pub fn delete_account_confirmed(conn: &Connection, files_dir: &std::path::Path, user: &User, confirm_email: Option<&str>) -> Res<()> {
+    check_deletion_confirmed(conn, user, confirm_email)?;
+    delete_account_and_files(conn, files_dir, user)
+}
+
 pub async fn delete_account_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Json(r): Json<DeleteReq>) -> Res<StatusCode> {
     let user = require_active(&s, &h)?;
     let phc = {
@@ -642,11 +678,13 @@ pub async fn delete_account_handler(State(s): State<Arc<AppState>>, h: HeaderMap
         can_delete_account(&conn, &user)?;
         stored_hash(&conn, &user.id)?
     };
-    let ok = tokio::task::spawn_blocking(move || verify_password(&r.password, &phc)).await.map_err(db_err)?;
+    let password = r.password;
+    let ok = tokio::task::spawn_blocking(move || verify_password(&password, &phc)).await.map_err(db_err)?;
     if !ok {
         return Err(err(StatusCode::FORBIDDEN, "wrong_password"));
     }
-    delete_account_and_files(&*lock(&s)?, &s.platform.files_dir, &user)?;
+    // the password comes first (a wrong one never learns whether the e-mail would also be asked for)
+    delete_account_confirmed(&*lock(&s)?, &s.platform.files_dir, &user, r.confirm_email.as_deref())?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -919,18 +957,21 @@ mod tests {
         attempt_on(&w.conn, "a3", "e2", &w.students[0], "expired");
         attempt_on(&w.conn, "a4", "e-other", &w.students[0], "submitted");
         attempt_on(&w.conn, "a5", "e-admin", &w.students[0], "submitted");
-        assert_eq!(
-            deletion_impact(&w.conn, &w.teacher.id).unwrap(),
-            DeletionImpact { exams: 2, attempts: 3, courses: 1, posts: 1, live: 1 }
-        );
+        // (phase 4-1 added the student's side: attempts_taken / lessons_completed / enrollments / reviews, zero here)
+        let teacher_only = |exams, attempts, courses, posts, live| DeletionImpact { exams, attempts, courses, posts, live, attempts_taken: 0, lessons_completed: 0, enrollments: 0, reviews: 0 };
+        assert_eq!(deletion_impact(&w.conn, &w.teacher.id).unwrap(), teacher_only(2, 3, 1, 1, 1));
         let other_impact = deletion_impact(&w.conn, &other.id).unwrap();
         assert_eq!((other_impact.exams, other_impact.attempts, other_impact.courses, other_impact.posts, other_impact.live), (1, 1, 1, 1, 0));
-        // students and admins own none of it
-        assert_eq!(deletion_impact(&w.conn, &w.students[0].id).unwrap(), DeletionImpact { exams: 0, attempts: 0, courses: 0, posts: 0, live: 0 });
-        assert_eq!(deletion_impact(&w.conn, &w.admin.id).unwrap(), DeletionImpact { exams: 0, attempts: 0, courses: 0, posts: 0, live: 0 });
+        // students and admins own none of the teacher's data (a student's own attempts are their side, phase 4-1)
+        assert_eq!(
+            deletion_impact(&w.conn, &w.students[0].id).unwrap(),
+            DeletionImpact { exams: 0, attempts: 0, courses: 0, posts: 0, live: 0, attempts_taken: 4, lessons_completed: 0, enrollments: 0, reviews: 0 }
+        );
+        assert_eq!(deletion_impact(&w.conn, &w.admin.id).unwrap(), teacher_only(0, 0, 0, 0, 0));
         assert_eq!(
             serde_json::to_value(deletion_impact(&w.conn, &w.teacher.id).unwrap()).unwrap(),
-            serde_json::json!({"exams": 2, "attempts": 3, "courses": 1, "posts": 1, "live": 1}),
+            serde_json::json!({"exams": 2, "attempts": 3, "courses": 1, "posts": 1, "live": 1,
+                               "attempts_taken": 0, "lessons_completed": 0, "enrollments": 0, "reviews": 0}),
             "the agreed JSON shape"
         );
     }
@@ -1230,5 +1271,119 @@ mod tests {
         let d: serde_json::Value = serde_json::from_str(&title).unwrap();
         assert_eq!((d["title"].as_str(), d["teacher"].as_str()), (Some("بث مباشر"), Some("د. خالد البرمجي")));
         assert_eq!(n(&w.conn, &format!("SELECT count(*) FROM notifications WHERE user_id = '{}' AND kind = 'live_cancelled'", w.teacher.id)), 0);
+    }
+
+    // ───────── phase 4-1: the student's side of an account deletion ─────────
+
+    #[test]
+    fn deletion_impact_counts_the_students_own_attempts_lessons_enrolments_and_reviews() {
+        let w = world();
+        let (me, other) = (&w.students[0], &w.students[1]);
+        exam_of(&w.conn, "e1", Some(&w.teacher));
+        exam_of(&w.conn, "e2", None);
+        for (i, status) in ["submitted", "expired", "in_progress"].iter().enumerate() {
+            attempt_on(&w.conn, &format!("m{i}"), if i == 0 { "e1" } else { "e2" }, me, status);
+        }
+        attempt_on(&w.conn, "o1", "e1", other, "submitted");
+        w.conn.execute("INSERT INTO lessons(id,course_id,position,title,video_url,video_kind,created_at) VALUES ('l1','c1',1,'د','https://x.example/v','link',0), ('l2','c1',2,'د','https://x.example/v','link',0)", []).unwrap();
+        for (who, lesson) in [(me, "l1"), (me, "l2"), (other, "l1")] {
+            w.conn.execute("INSERT INTO lesson_progress(student_id,lesson_id,completed_at) VALUES (?1,?2,0)", params![who.id, lesson]).unwrap();
+        }
+        for who in [me, other] {
+            w.conn.execute("INSERT INTO subject_enrollments(student_id,subject_id,created_at) VALUES (?1,'s1',0)", params![who.id]).unwrap();
+        }
+        review(&w.conn, "r1", me, "course", "c1");
+        review(&w.conn, "r2", me, "teacher", &w.teacher.id);
+        review(&w.conn, "r3", other, "course", "c1");
+        let mine = deletion_impact(&w.conn, &me.id).unwrap();
+        assert_eq!(
+            mine,
+            DeletionImpact { exams: 0, attempts: 0, courses: 0, posts: 0, live: 0, attempts_taken: 3, lessons_completed: 2, enrollments: 1, reviews: 2 },
+            "any status counts: every one of them goes with the account"
+        );
+        let t = deletion_impact(&w.conn, &w.teacher.id).unwrap();
+        assert_eq!((t.attempts_taken, t.lessons_completed, t.enrollments, t.reviews), (0, 0, 0, 0), "a teacher's student side is zero");
+        assert_eq!((t.exams, t.attempts), (1, 2), "and the teacher's side is unchanged");
+    }
+
+    #[test]
+    fn a_student_with_attempts_must_type_the_email_to_delete_the_account() {
+        let w = world();
+        let me = w.students[0].clone();
+        exam_of(&w.conn, "e1", Some(&w.teacher));
+        attempt_on(&w.conn, "a1", "e1", &me, "expired"); // even an expired attempt is a record that would go
+        let dir = scratch_dir();
+        for typed in [None, Some(""), Some("   "), Some("s1@x.com"), Some("s0@x.co"), Some("other@x.com")] {
+            let e = delete_account_confirmed(&w.conn, &dir, &me, typed).unwrap_err();
+            assert_eq!((e.0, e.1.contains("confirm_required")), (StatusCode::CONFLICT, true), "{typed:?}");
+        }
+        assert_eq!(n(&w.conn, &format!("SELECT count(*) FROM users WHERE id = '{}'", me.id)), 1, "nothing was deleted");
+        assert_eq!(n(&w.conn, "SELECT count(*) FROM attempts WHERE id = 'a1'"), 1);
+        // trimmed and in any case
+        delete_account_confirmed(&w.conn, &dir, &me, Some("  S0@X.Com \n")).unwrap();
+        assert_eq!(n(&w.conn, &format!("SELECT count(*) FROM users WHERE id = '{}'", me.id)), 0);
+        assert_eq!(n(&w.conn, "SELECT count(*) FROM attempts WHERE id = 'a1'"), 0);
+        // without attempts nothing more is asked (a student who only enrolled, a teacher, an admin with a colleague)
+        let quiet = &w.students[1];
+        w.conn.execute("INSERT INTO subject_enrollments(student_id,subject_id,created_at) VALUES (?1,'s1',0)", params![quiet.id]).unwrap();
+        delete_account_confirmed(&w.conn, &dir, quiet, None).unwrap();
+        let t2 = insert_test_user(&w.conn, "t2@x.com", "teacher", "active");
+        delete_account_confirmed(&w.conn, &dir, &t2, None).unwrap();
+        // the older refusals still come first in their own right
+        insert_test_user(&w.conn, "a2@x.com", "admin", "active");
+        delete_account_confirmed(&w.conn, &dir, &w.admin, None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The order of the checks of `DELETE /me` through the real handler: the password first (a stolen session token must
+    /// not learn from `confirm_required` that the account has taken exams), then the typed e-mail.
+    #[tokio::test]
+    async fn the_handler_checks_the_password_before_it_asks_for_the_email() {
+        use crate::platform::{hash_password, PlatformState};
+        use axum::http::header;
+        static CFG: std::sync::Once = std::sync::Once::new();
+        CFG.call_once(|| std::env::set_var("XDG_CONFIG_HOME", std::env::temp_dir().join(format!("exameow-http-test-{}", new_id()))));
+        let w = world();
+        let me = w.students[0].clone();
+        w.conn.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![hash_password("correct-horse-1").unwrap(), me.id]).unwrap();
+        exam_of(&w.conn, "e1", Some(&w.teacher));
+        attempt_on(&w.conn, "a1", "e1", &me, "submitted"); // the account has taken an exam: the e-mail is asked for
+        let token = format!("tok-{}", new_id());
+        w.conn
+            .execute("INSERT INTO sessions(token_hash, user_id, created_at, expires_at) VALUES (?1, ?2, 0, ?3)", params![sha256_hex(&token), me.id, now_ms() + 3_600_000])
+            .unwrap();
+        let state = Arc::new(AppState {
+            config_store: exameow_core::config::ConfigStore::new("ExameowServerHttpTest").expect("a scratch config dir"),
+            relay: crate::relay::init_db(":memory:").unwrap(),
+            platform: PlatformState::for_tests(w.conn),
+            admin_token: std::sync::Mutex::new("pass".into()),
+            legacy: crate::legacy_guard::LegacyGuard::new(60, 2000),
+            auth_failures: crate::token_limit::TokenLimiter::new(600),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        let call = |password: &str, email: Option<&str>| {
+            let (state, headers) = (state.clone(), headers.clone());
+            let r = DeleteReq { password: password.into(), confirm_email: email.map(str::to_string) };
+            async move { delete_account_handler(State(state), headers, Json(r)).await }
+        };
+        let code = |e: (StatusCode, String)| (e.0, e.1.contains("wrong_password"), e.1.contains("confirm_required"));
+        // wrong password: always 403 wrong_password, whether the e-mail is missing, wrong or right
+        for email in [None, Some("nobody@x.com"), Some("s0@x.com")] {
+            assert_eq!(code(call("not-the-password", email).await.unwrap_err()), (StatusCode::FORBIDDEN, true, false), "wrong password, e-mail {email:?}");
+        }
+        // right password, e-mail missing or wrong: 409 confirm_required - and nothing was deleted
+        for email in [None, Some(""), Some("nobody@x.com")] {
+            assert_eq!(code(call("correct-horse-1", email).await.unwrap_err()), (StatusCode::CONFLICT, false, true), "right password, e-mail {email:?}");
+        }
+        let conn = state.platform.conn.lock().unwrap();
+        assert_eq!(n(&conn, "SELECT count(*) FROM users WHERE email = 's0@x.com'"), 1);
+        assert_eq!(n(&conn, "SELECT count(*) FROM attempts WHERE id = 'a1'"), 1);
+        drop(conn);
+        // right password and the e-mail typed again (any case): 204, and the account and its results are gone
+        assert_eq!(call("correct-horse-1", Some(" S0@X.com ")).await.unwrap(), StatusCode::NO_CONTENT);
+        let conn = state.platform.conn.lock().unwrap();
+        assert_eq!(n(&conn, "SELECT count(*) FROM users WHERE email = 's0@x.com'"), 0);
+        assert_eq!(n(&conn, "SELECT count(*) FROM attempts WHERE id = 'a1'"), 0);
     }
 }

@@ -701,17 +701,20 @@ pub struct EnrolledSubject {
     subject_name: String,
     institution_id: String,
     institution_name: String,
+    /// The subject AND its institution are switched on. A switched-off one keeps its row, so the student can still
+    /// unenrol, but its page and content are gone for now.
+    active: bool,
 }
 
 fn my_enrollments(conn: &Connection, student_id: &str) -> Res<Vec<EnrolledSubject>> {
     conn.prepare(
-        "SELECT s.id, s.name_ar, i.id, i.name_ar FROM subject_enrollments e
+        "SELECT s.id, s.name_ar, i.id, i.name_ar, (s.is_active = 1 AND i.is_active = 1) FROM subject_enrollments e
          JOIN subjects s ON s.id = e.subject_id JOIN institutions i ON i.id = s.institution_id
          WHERE e.student_id = ?1 ORDER BY e.created_at DESC",
     )
     .map_err(db_err)?
     .query_map(params![student_id], |r| {
-        Ok(EnrolledSubject { subject_id: r.get(0)?, subject_name: r.get(1)?, institution_id: r.get(2)?, institution_name: r.get(3)? })
+        Ok(EnrolledSubject { subject_id: r.get(0)?, subject_name: r.get(1)?, institution_id: r.get(2)?, institution_name: r.get(3)?, active: r.get(4)? })
     })
     .map_err(db_err)?
     .collect::<Result<Vec<_>, _>>()
@@ -724,6 +727,12 @@ pub async fn my_enrollments_handler(State(state): State<Arc<AppState>>, headers:
 }
 
 fn enroll(conn: &Connection, student: &User, subject_id: &str) -> Res<()> {
+    enroll_one(conn, student, subject_id, now_ms()).map(|_| ())
+}
+
+/// **The single-enrolment rules**, shared by `POST /enrollments` and the bulk enrolment: the subject and its institution
+/// must be active (404 otherwise). Returns whether the enrolment is NEW (`false`: it already existed, nothing changed).
+fn enroll_one(conn: &Connection, student: &User, subject_id: &str, now: i64) -> Res<bool> {
     let active: Option<bool> = conn
         .query_row(
             "SELECT s.is_active AND i.is_active FROM subjects s JOIN institutions i ON i.id = s.institution_id WHERE s.id = ?1",
@@ -735,7 +744,6 @@ fn enroll(conn: &Connection, student: &User, subject_id: &str) -> Res<()> {
     if active != Some(true) {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
-    let now = now_ms();
     let added = conn
         .execute(
             "INSERT OR IGNORE INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1, ?2, ?3)",
@@ -747,7 +755,163 @@ fn enroll(conn: &Connection, student: &User, subject_id: &str) -> Res<()> {
     if added == 1 {
         let _ = crate::platform_engage::tell_new_enrollment(conn, subject_id, now);
     }
-    Ok(())
+    Ok(added == 1)
+}
+
+/// At most this many subjects in one bulk enrolment (`POST /enrollments/bulk`).
+pub(crate) const MAX_BULK_ENROLL: usize = 30;
+
+#[derive(Deserialize, Debug)]
+pub struct BulkEnrollReq {
+    subject_ids: Vec<String>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct BulkEnrollRes {
+    /// New enrolments.
+    enrolled: i64,
+    /// Ids that failed a rule of the single enrolment (unknown, switched-off subject or institution) or were already
+    /// enrolled. Never an error for the batch.
+    skipped: i64,
+}
+
+/// Enrols the student in several subjects at once ("enrol me in my level's subjects"): every id goes through exactly
+/// [`enroll_one`]; one that fails a rule or is already enrolled is counted as skipped. One transaction: a database
+/// failure leaves no half-done batch. The teachers' `new_enrollment` notice is the usual coalesced one, per subject.
+fn bulk_enroll(conn: &Connection, student: &User, ids: &[String], now: i64) -> Res<BulkEnrollRes> {
+    if ids.is_empty() || ids.len() > MAX_BULK_ENROLL {
+        return Err(bad("invalid_selection"));
+    }
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    let (mut enrolled, mut skipped) = (0, 0);
+    for id in ids {
+        match enroll_one(&tx, student, id, now) {
+            Ok(true) => enrolled += 1,
+            Ok(false) => skipped += 1,
+            Err(e) if e.0 == StatusCode::NOT_FOUND => skipped += 1,
+            Err(e) => return Err(e),
+        }
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(BulkEnrollRes { enrolled, skipped })
+}
+
+pub async fn bulk_enroll_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<BulkEnrollReq>) -> Res<Json<BulkEnrollRes>> {
+    let user = require_role(&state, &headers, "student")?;
+    bulk_enroll(&*lock(&state)?, &user, &req.subject_ids, now_ms()).map(Json)
+}
+
+// ───────── suggested subjects from the placement ─────────
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct SuggestedPlacement {
+    institution_id: String,
+    institution_name: String,
+    unit_id: Option<String>,
+    /// Unit names from the institution's root down to the placement unit (empty without a unit).
+    unit_path: Vec<String>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct SuggestedSubject {
+    id: String,
+    name_ar: String,
+    name_en: Option<String>,
+    /// Unit names from the institution's root down to the subject's unit.
+    unit_path: Vec<String>,
+    enrolled: bool,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct Suggestions {
+    placement: Option<SuggestedPlacement>,
+    subjects: Vec<SuggestedSubject>,
+}
+
+/// At most this many suggestions (an institution's level rarely has more than a few dozen subjects).
+const MAX_SUGGESTIONS: usize = 200;
+
+/// The unit and every unit above it are switched on (and it belongs to the institution).
+fn unit_chain_active(conn: &Connection, institution_id: &str, unit_id: &str) -> Res<bool> {
+    let mut cur = Some(unit_id.to_string());
+    let mut hops = 0;
+    while let Some(uid) = cur {
+        let row: Option<(bool, Option<String>)> = conn
+            .query_row("SELECT is_active = 1, parent_id FROM org_units WHERE id = ?1 AND institution_id = ?2", params![uid, institution_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(db_err)?;
+        let Some((active, parent)) = row else { return Ok(false) };
+        if !active {
+            return Ok(false);
+        }
+        cur = parent;
+        hops += 1;
+        if hops > 16 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// What the student's placement suggests: the ACTIVE subjects of the placement institution that hang on the placement
+/// unit or below it (that unit and its descendants, through active units only), sorted by unit path, then name. Nothing
+/// without a placement, when the institution or a unit on the way is switched off, and **nothing when the placement names
+/// no unit**: the level the student chose was deleted (`student_placement.unit_id` is `ON DELETE SET NULL`) or never
+/// chosen, and guessing "every level of the institution" would let one click enrol them in unrelated levels. The
+/// placement is still reported (with `unit_id: null`) so the screen can ask them to choose a level again.
+fn suggested_subjects(conn: &Connection, student_id: &str) -> Res<Suggestions> {
+    let placement: Option<(String, String, bool, Option<String>)> = conn
+        .query_row(
+            "SELECT p.institution_id, i.name_ar, i.is_active = 1, p.unit_id FROM student_placement p JOIN institutions i ON i.id = p.institution_id
+             WHERE p.student_id = ?1",
+            params![student_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let Some((institution_id, institution_name, institution_on, unit_id)) = placement else {
+        return Ok(Suggestions { placement: None, subjects: vec![] });
+    };
+    let head = SuggestedPlacement { unit_path: unit_path(conn, unit_id.clone())?, institution_id: institution_id.clone(), institution_name, unit_id: unit_id.clone() };
+    let Some(unit_id) = unit_id else {
+        return Ok(Suggestions { placement: Some(head), subjects: vec![] });
+    };
+    if !institution_on || !unit_chain_active(conn, &institution_id, &unit_id)? {
+        return Ok(Suggestions { placement: Some(head), subjects: vec![] });
+    }
+    // the placement unit and the units below it, active ones only: an inactive unit cuts its subtree
+    let sql = "WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM org_units WHERE institution_id = ?1 AND is_active = 1 AND id = ?2
+                 UNION SELECT o.id FROM org_units o JOIN tree t ON o.parent_id = t.id WHERE o.is_active = 1
+               )
+               SELECT s.id, s.name_ar, s.name_en, s.unit_id,
+                      EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?3 AND e.subject_id = s.id)
+               FROM subjects s
+               WHERE s.institution_id = ?1 AND s.is_active = 1 AND s.unit_id IN (SELECT id FROM tree)";
+    let rows: Vec<(String, String, Option<String>, Option<String>, bool)> = conn
+        .prepare(sql)
+        .map_err(db_err)?
+        .query_map(params![institution_id, unit_id, student_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    let mut paths: std::collections::HashMap<Option<String>, Vec<String>> = std::collections::HashMap::new();
+    let mut subjects = Vec::with_capacity(rows.len());
+    for (id, name_ar, name_en, unit, enrolled) in rows {
+        if !paths.contains_key(&unit) {
+            let p = unit_path(conn, unit.clone())?;
+            paths.insert(unit.clone(), p);
+        }
+        subjects.push(SuggestedSubject { id, name_ar, name_en, unit_path: paths[&unit].clone(), enrolled });
+    }
+    subjects.sort_by(|a, b| a.unit_path.cmp(&b.unit_path).then_with(|| a.name_ar.cmp(&b.name_ar)).then_with(|| a.id.cmp(&b.id)));
+    subjects.truncate(MAX_SUGGESTIONS);
+    Ok(Suggestions { placement: Some(head), subjects })
+}
+
+pub async fn suggested_subjects_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res<Json<Suggestions>> {
+    let user = require_role(&state, &headers, "student")?;
+    suggested_subjects(&*lock(&state)?, &user.id).map(Json)
 }
 
 pub async fn enroll_handler(
@@ -1987,5 +2151,201 @@ mod tests {
         follow(&conn, &c, &t.id).unwrap();
         let n = unread(&t);
         assert_eq!(n[1].0["count"].as_i64(), Some(2), "a second person is counted");
+    }
+
+    // ───────── phase 4-1: enrolment flags, suggestions from the placement, bulk enrolment ─────────
+
+    /// i1 (school-like tree): dept D > levels L1 (active) / L2 (switched off) > terms; plus a second institution.
+    ///   D ─ L1 ─ T1          subjects: sD (on D), sL1 (on L1), sT1 (on T1), sT1off (on T1, switched off)
+    ///     │    └ T2(off)     sT2 (on T2, below a switched-off unit)
+    ///     └ L2(off) ─ T3     sT3 (below L2)
+    ///   (no unit)            sRoot (directly on the institution)
+    ///   i2                   sOther
+    fn tree(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO institutions(id,type,name_ar,is_active,created_at) VALUES ('i1','university','جامعة',1,0), ('i2','university','أخرى',1,0);
+             INSERT INTO org_units(id,institution_id,parent_id,kind,name_ar,is_active,created_at) VALUES
+               ('D','i1',NULL,'department','قسم',1,0),
+               ('L1','i1','D','level','المستوى الأول',1,0),
+               ('L2','i1','D','level','المستوى الثاني',0,0),
+               ('T1','i1','L1','term','الفصل الأول',1,0),
+               ('T2','i1','L1','term','الفصل الثاني',0,0),
+               ('T3','i1','L2','term','فصل',1,0);
+             INSERT INTO subjects(id,institution_id,unit_id,name_ar,name_en,is_active,created_at) VALUES
+               ('sD','i1','D','عامة','General',1,0),
+               ('sL1','i1','L1','برمجة','Programming',1,0),
+               ('sL1b','i1','L1','أ-رياضيات',NULL,1,0),
+               ('sT1','i1','T1','شبكات',NULL,1,0),
+               ('sT1off','i1','T1','مطفأة',NULL,0,0),
+               ('sT2','i1','T2','تحت مطفأ',NULL,1,0),
+               ('sT3','i1','T3','تحت مستوى مطفأ',NULL,1,0),
+               ('sRoot','i1',NULL,'جذر',NULL,1,0),
+               ('sOther','i2',NULL,'غيرها',NULL,1,0);",
+        )
+        .unwrap();
+    }
+
+    fn place(conn: &Connection, s: &User, inst: &str, unit: Option<&str>) {
+        conn.execute(
+            "INSERT INTO student_placement(student_id,institution_id,unit_id) VALUES (?1,?2,?3)
+             ON CONFLICT(student_id) DO UPDATE SET institution_id = excluded.institution_id, unit_id = excluded.unit_id",
+            params![s.id, inst, unit],
+        )
+        .unwrap();
+    }
+
+    fn suggested_ids(conn: &Connection, s: &User) -> Vec<String> {
+        suggested_subjects(conn, &s.id).unwrap().subjects.into_iter().map(|x| x.id).collect()
+    }
+
+    #[test]
+    fn enrolments_flag_switched_off_subjects_and_institutions_and_keep_them_listed() {
+        let conn = create_test_db();
+        tree(&conn);
+        let s = insert_test_user(&conn, "s@x.com", "student", "active");
+        for id in ["sL1", "sT1", "sOther"] {
+            enroll(&conn, &s, id).unwrap();
+        }
+        let flags = |conn: &Connection| -> Vec<(String, bool)> {
+            let mut v: Vec<(String, bool)> = my_enrollments(conn, &s.id).unwrap().into_iter().map(|e| (e.subject_id, e.active)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(flags(&conn), vec![("sL1".into(), true), ("sOther".into(), true), ("sT1".into(), true)]);
+        conn.execute("UPDATE subjects SET is_active = 0 WHERE id = 'sT1'", []).unwrap();
+        conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i2'", []).unwrap();
+        assert_eq!(flags(&conn), vec![("sL1".into(), true), ("sOther".into(), false), ("sT1".into(), false)], "still listed, so the student can unenrol");
+        let v = serde_json::to_value(&my_enrollments(&conn, &s.id).unwrap()[0]).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["active", "institution_id", "institution_name", "subject_id", "subject_name"]);
+    }
+
+    #[test]
+    fn suggestions_are_the_active_subjects_on_the_placement_unit_and_below_it() {
+        let conn = create_test_db();
+        tree(&conn);
+        let s = insert_test_user(&conn, "s@x.com", "student", "active");
+        let other = insert_test_user(&conn, "o@x.com", "student", "active");
+        assert_eq!(suggested_subjects(&conn, &s.id).unwrap(), Suggestions { placement: None, subjects: vec![] }, "no placement: nothing");
+        // on L1: L1 and T1 (T2 is switched off and cuts its subtree); nothing above L1, nothing of the other institution
+        place(&conn, &s, "i1", Some("L1"));
+        let r = suggested_subjects(&conn, &s.id).unwrap();
+        assert_eq!(
+            r.placement,
+            Some(SuggestedPlacement { institution_id: "i1".into(), institution_name: "جامعة".into(), unit_id: Some("L1".into()), unit_path: vec!["قسم".into(), "المستوى الأول".into()] })
+        );
+        let got: Vec<(&str, Vec<String>)> = r.subjects.iter().map(|x| (x.id.as_str(), x.unit_path.clone())).collect();
+        let l1 = vec!["قسم".to_string(), "المستوى الأول".to_string()];
+        let t1 = vec!["قسم".to_string(), "المستوى الأول".to_string(), "الفصل الأول".to_string()];
+        assert_eq!(got, vec![("sL1b", l1.clone()), ("sL1", l1), ("sT1", t1)], "sorted by unit path, then name");
+        assert_eq!(r.subjects[1].name_en.as_deref(), Some("Programming"));
+        // the enrolled flag is mine
+        enroll(&conn, &s, "sT1").unwrap();
+        enroll(&conn, &other, "sL1").unwrap();
+        let flags: Vec<(String, bool)> = suggested_subjects(&conn, &s.id).unwrap().subjects.into_iter().map(|x| (x.id, x.enrolled)).collect();
+        assert_eq!(flags, vec![("sL1b".into(), false), ("sL1".into(), false), ("sT1".into(), true)]);
+        // on the department: everything below it through active units (not L2's subtree, not T2's)
+        place(&conn, &s, "i1", Some("D"));
+        let mut ids = suggested_ids(&conn, &s);
+        ids.sort();
+        assert_eq!(ids, vec!["sD", "sL1", "sL1b", "sT1"]);
+        // on a switched-off unit, or below one: nothing (the placement is still reported)
+        place(&conn, &s, "i1", Some("T3"));
+        let r = suggested_subjects(&conn, &s.id).unwrap();
+        assert!(r.subjects.is_empty() && r.placement.is_some(), "T3 hangs below the switched-off L2");
+        place(&conn, &s, "i1", Some("T2"));
+        assert!(suggested_ids(&conn, &s).is_empty());
+        // no unit (never chosen, or the admin deleted the level: the column is SET NULL): NOTHING is suggested - not "the
+        // whole institution", whose bulk enrolment would reach unrelated levels - but the placement is still reported so the
+        // screen can ask for a level again
+        place(&conn, &s, "i1", None);
+        let r = suggested_subjects(&conn, &s.id).unwrap();
+        assert!(r.subjects.is_empty(), "no unit: no suggestions");
+        let head = r.placement.expect("the placement is still reported");
+        assert_eq!((head.institution_id.as_str(), head.unit_id, head.unit_path), ("i1", None, Vec::<String>::new()));
+        // the same through a real deletion of the placement unit
+        place(&conn, &s, "i1", Some("L1"));
+        assert!(!suggested_ids(&conn, &s).is_empty());
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        conn.execute("DELETE FROM org_units WHERE id IN ('T1','L1')", []).unwrap();
+        let r = suggested_subjects(&conn, &s.id).unwrap();
+        assert_eq!((r.placement.map(|p| p.unit_id), r.subjects.len()), (Some(None), 0), "the deleted level leaves no suggestions behind");
+        // the institution switched off: nothing
+        conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        assert!(suggested_ids(&conn, &s).is_empty());
+        // and the other student's placement is theirs
+        assert_eq!(suggested_subjects(&conn, &other.id).unwrap().placement, None);
+    }
+
+    fn enrolments(conn: &Connection, s: &User) -> Vec<String> {
+        let mut v: Vec<String> = my_enrollments(conn, &s.id).unwrap().into_iter().map(|e| e.subject_id).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn bulk_enrolment_follows_the_single_rules_and_counts_skips() {
+        let conn = create_test_db();
+        tree(&conn);
+        let s = insert_test_user(&conn, "s@x.com", "student", "active");
+        enroll(&conn, &s, "sD").unwrap();
+        let ids = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let r = bulk_enroll(&conn, &s, &ids(&["sL1", "sD", "sT1off", "nope", "sT1", "sL1"]), 5).unwrap();
+        assert_eq!(r, BulkEnrollRes { enrolled: 2, skipped: 4 }, "already enrolled, switched off, unknown and a repeat are skipped");
+        assert_eq!(enrolments(&conn, &s), vec!["sD", "sL1", "sT1"]);
+        // a switched-off institution: the same rule as one enrolment
+        conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i2'", []).unwrap();
+        assert_eq!(bulk_enroll(&conn, &s, &ids(&["sOther"]), 6).unwrap(), BulkEnrollRes { enrolled: 0, skipped: 1 });
+        assert_eq!(enroll(&conn, &s, "sOther").unwrap_err().0, StatusCode::NOT_FOUND, "and the single enrolment agrees");
+        // 1..=30 ids
+        for n in [0usize, 31] {
+            let many: Vec<String> = (0..n).map(|i| format!("x{i}")).collect();
+            let e = bulk_enroll(&conn, &s, &many, 7).unwrap_err();
+            assert_eq!((e.0, e.1.contains("invalid_selection")), (StatusCode::BAD_REQUEST, true), "{n} ids");
+        }
+        let thirty: Vec<String> = (0..30).map(|i| format!("x{i}")).collect();
+        assert_eq!(bulk_enroll(&conn, &s, &thirty, 8).unwrap(), BulkEnrollRes { enrolled: 0, skipped: 30 });
+    }
+
+    #[test]
+    fn bulk_enrolment_tells_each_subjects_teachers_once_coalesced() {
+        let conn = create_test_db();
+        tree(&conn);
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        for subject in ["sL1", "sT1"] {
+            conn.execute("INSERT INTO teacher_subjects(teacher_id,subject_id,status,created_at) VALUES (?1,?2,'approved',0)", params![t.id, subject]).unwrap();
+        }
+        let a = insert_test_user(&conn, "a@x.com", "student", "active");
+        let b = insert_test_user(&conn, "b@x.com", "student", "active");
+        bulk_enroll(&conn, &a, &["sL1".into(), "sT1".into(), "sD".into()], 100).unwrap();
+        bulk_enroll(&conn, &b, &["sL1".into()], 200).unwrap();
+        let notices: Vec<(String, String)> = conn
+            .prepare("SELECT link, data FROM notifications WHERE user_id = ?1 AND kind = 'new_enrollment' ORDER BY link")
+            .unwrap()
+            .query_map(params![t.id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(notices.len(), 2, "one notice per subject the teacher is approved for (none for sD)");
+        let l1: serde_json::Value = serde_json::from_str(&notices.iter().find(|(l, _)| l.ends_with("/sL1")).unwrap().1).unwrap();
+        assert_eq!((l1["count"].as_i64(), l1["subject"].as_str()), (Some(2), Some("برمجة")), "coalesced: two students");
+    }
+
+    #[test]
+    fn bulk_enrolment_is_one_transaction() {
+        let conn = create_test_db();
+        tree(&conn);
+        let s = insert_test_user(&conn, "s@x.com", "student", "active");
+        // the database fails on the third subject: nothing of the batch may stay
+        conn.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON subject_enrollments WHEN NEW.subject_id = 'sT1' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        )
+        .unwrap();
+        let e = bulk_enroll(&conn, &s, &["sL1".into(), "sD".into(), "sT1".into()], 5).unwrap_err();
+        assert_eq!(e.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(enrolments(&conn, &s).is_empty(), "rolled back");
+        conn.execute_batch("DROP TRIGGER boom;").unwrap();
+        assert_eq!(bulk_enroll(&conn, &s, &["sL1".into(), "sD".into(), "sT1".into()], 6).unwrap(), BulkEnrollRes { enrolled: 3, skipped: 0 });
     }
 }

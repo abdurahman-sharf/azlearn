@@ -1,9 +1,12 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
-import { useAuthStore } from '@/stores/auth'
+import { setRecoveredHandler, useAuthStore } from '@/stores/auth'
 import { platformEnabled, setUnauthorizedHandler } from '@/lib/platformApi'
 import { pendingTeacherMayEnter } from '@/utils/platformGuard'
 import { resetAdminStats } from '@/lib/adminStats'
 import { resetTeacherStats } from '@/lib/teacherStats'
+import { resetStudentStats } from '@/lib/studentStats'
+import { setTitleKey } from '@/lib/docTitle'
+import { focusStillOurs, shouldMoveFocus, titleKeyOf } from '@/utils/routeTitle'
 
 /** Empty page for the old exam-editor addresses: the guard below always redirects away from them. */
 const LEGACY_EDITOR = { render: () => null }
@@ -149,19 +152,19 @@ const router = createRouter({
       path: '/auth/login',
       name: 'auth-login',
       component: () => import('@/views/platform/LoginView.vue'),
-      meta: { title: 'Sign in', guestOnly: true },
+      meta: { titleKey: 'login', title: 'Sign in', guestOnly: true },
     },
     {
       path: '/auth/register',
       name: 'auth-register',
       component: () => import('@/views/platform/RegisterView.vue'),
-      meta: { title: 'Register', guestOnly: true },
+      meta: { titleKey: 'register', title: 'Register', guestOnly: true },
     },
     {
       path: '/auth/pending',
       name: 'auth-pending',
       component: () => import('@/views/platform/PendingView.vue'),
-      meta: { title: 'Account status', requiresAuth: true },
+      meta: { titleKey: 'ttlAccountStatus', title: 'Account status', requiresAuth: true },
     },
     {
       // Admin area (URLs unchanged). The sidebar is not part of this route: the app shell (AppShell) shows it on every
@@ -173,79 +176,79 @@ const router = createRouter({
           path: '',
           name: 'platform-admin',
           component: () => import('@/views/platform/AdminOverviewView.vue'),
-          meta: { title: 'Overview', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'adminOverview', title: 'Overview', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
           path: 'users',
           name: 'platform-admin-users',
           component: () => import('@/views/platform/AdminUsersView.vue'),
-          meta: { title: 'Accounts', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'adminUsers', title: 'Accounts', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
           path: 'institutions',
           name: 'platform-admin-institutions',
           component: () => import('@/views/platform/AdminInstitutionsView.vue'),
-          meta: { title: 'Institutions', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'adminInstitutions', title: 'Institutions', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
           path: 'institutions/:id',
           name: 'platform-admin-institution',
           component: () => import('@/views/platform/AdminInstitutionView.vue'),
-          meta: { title: 'Institution', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'ttlInstitution', title: 'Institution', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
           path: 'teaching',
           name: 'platform-admin-teaching',
           component: () => import('@/views/platform/AdminTeachingView.vue'),
-          meta: { title: 'platform-admin-teaching', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'adminTeaching', title: 'platform-admin-teaching', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
           path: 'reports',
           name: 'platform-admin-reports',
           component: () => import('@/views/platform/AdminReportsView.vue'),
-          meta: { title: 'platform-admin-reports', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'adminReports', title: 'platform-admin-reports', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
           path: 'exams',
           name: 'platform-admin-exams',
           component: () => import('@/views/platform/AdminExamsView.vue'),
-          meta: { title: 'Exams', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'exTitle', title: 'Exams', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
           path: 'exams/new',
           name: 'platform-admin-exam-new',
           component: () => import('@/views/platform/AdminExamEditorView.vue'),
-          meta: { title: 'New exam', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'exNew', title: 'New exam', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
           path: 'exams/:id/edit',
           name: 'platform-admin-exam-edit',
           component: () => import('@/views/platform/AdminExamEditorView.vue'),
-          meta: { title: 'Edit exam', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'ttlExamEdit', title: 'Edit exam', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
           path: 'bank',
           name: 'platform-admin-bank',
           component: () => import('@/views/platform/AdminBankView.vue'),
-          meta: { title: 'Question bank', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'bankTitle', title: 'Question bank', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
           path: 'settings',
           name: 'platform-admin-settings',
           component: () => import('@/views/platform/AdminSettingsView.vue'),
-          meta: { title: 'Settings', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'settingsTitle', title: 'Settings', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
           path: 'audit',
           name: 'platform-admin-audit',
           component: () => import('@/views/platform/AdminAuditView.vue'),
-          meta: { title: 'platform-admin-audit', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'adminAudit', title: 'platform-admin-audit', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
         {
           path: 'system',
           name: 'platform-admin-system',
           component: () => import('@/views/platform/AdminSystemView.vue'),
-          meta: { title: 'System status', requiresAuth: true, requiresActive: true, roles: ['admin'] },
+          meta: { titleKey: 'sysTitle', title: 'System status', requiresAuth: true, requiresActive: true, roles: ['admin'] },
         },
       ],
     },
@@ -253,56 +256,76 @@ const router = createRouter({
       path: '/platform/grading',
       name: 'platform-grading',
       component: () => import('@/views/platform/GradingQueueView.vue'),
-      meta: { title: 'Grading', requiresAuth: true, requiresActive: true, roles: ['teacher', 'admin'] },
+      meta: { titleKey: 'navGrading', title: 'Grading', requiresAuth: true, requiresActive: true, roles: ['teacher', 'admin'] },
     },
     {
       path: '/platform/grading/:id',
       name: 'platform-grade-exam',
       component: () => import('@/views/platform/GradeExamView.vue'),
-      meta: { title: 'Grading', requiresAuth: true, requiresActive: true, roles: ['teacher', 'admin'] },
+      meta: { titleKey: 'navGrading', title: 'Grading', requiresAuth: true, requiresActive: true, roles: ['teacher', 'admin'] },
     },
     {
       // Teacher area home. Like the admin area, its sidebar is rendered by the app shell on every /platform page a teacher opens.
       path: '/platform/teacher',
       name: 'platform-teacher-home',
       component: () => import('@/views/platform/TeacherOverviewView.vue'),
-      meta: { title: 'Overview', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      meta: { titleKey: 'tchOverview', title: 'Overview', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+    },
+    {
+      // Student area home. Like the admin and teacher areas, its sidebar is rendered by the app shell on every /platform page a student opens.
+      path: '/platform/student',
+      name: 'platform-student-home',
+      component: () => import('@/views/platform/StudentOverviewView.vue'),
+      meta: { titleKey: 'stuOverview', title: 'Overview', requiresAuth: true, requiresActive: true, roles: ['student'] },
+    },
+    {
+      // The student's exams (not /platform/exams: that is the teacher's list).
+      path: '/platform/my-exams',
+      name: 'platform-student-exams',
+      component: () => import('@/views/platform/StudentExamsView.vue'),
+      meta: { titleKey: 'stexTitle', title: 'My exams', requiresAuth: true, requiresActive: true, roles: ['student'] },
+    },
+    {
+      path: '/platform/my-subjects',
+      name: 'platform-student-subjects',
+      component: () => import('@/views/platform/StudentSubjectsView.vue'),
+      meta: { titleKey: 'mysubjTitle', title: 'My subjects', requiresAuth: true, requiresActive: true, roles: ['student'] },
     },
     {
       path: '/platform',
       name: 'platform-home',
       component: () => import('@/views/platform/PlatformHomeView.vue'),
-      meta: { title: 'Platform', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'platformHome', title: 'Platform', requiresAuth: true, requiresActive: true },
     },
     {
       path: '/platform/institutions/:id',
       name: 'platform-institution',
       component: () => import('@/views/platform/InstitutionBrowseView.vue'),
-      meta: { title: 'platform-institution', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'ttlInstitution', title: 'platform-institution', requiresAuth: true, requiresActive: true },
     },
     {
       path: '/platform/subjects/:id',
       name: 'platform-subject',
       component: () => import('@/views/platform/SubjectView.vue'),
-      meta: { title: 'platform-subject', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'ttlSubject', title: 'platform-subject', requiresAuth: true, requiresActive: true },
     },
     {
       path: '/platform/teachers',
       name: 'platform-teachers',
       component: () => import('@/views/platform/TeachersView.vue'),
-      meta: { title: 'platform-teachers', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'browseTeachers', title: 'platform-teachers', requiresAuth: true, requiresActive: true },
     },
     {
       path: '/platform/teachers/:id',
       name: 'platform-teacher',
       component: () => import('@/views/platform/TeacherView.vue'),
-      meta: { title: 'platform-teacher', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'ttlTeacher', title: 'platform-teacher', requiresAuth: true, requiresActive: true },
     },
     {
       path: '/platform/profile',
       name: 'platform-profile',
       component: () => import('@/views/platform/ProfileView.vue'),
-      meta: { title: 'platform-profile', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'myProfile', title: 'platform-profile', requiresAuth: true, requiresActive: true },
     },
     {
       path: '/platform/teaching',
@@ -310,86 +333,86 @@ const router = createRouter({
       component: () => import('@/views/platform/TeachingView.vue'),
       // pendingTeacherOk: a teacher whose account still awaits approval may already request subjects here
       // (the server allows exactly this page's four calls for such an account, see `may_request_teaching`).
-      meta: { title: 'platform-teaching', requiresAuth: true, requiresActive: true, pendingTeacherOk: true, roles: ['teacher'] },
+      meta: { titleKey: 'tchNavSubjects', title: 'platform-teaching', requiresAuth: true, requiresActive: true, pendingTeacherOk: true, roles: ['teacher'] },
     },
     {
       path: '/platform/my-content',
       name: 'platform-my-content',
       component: () => import('@/views/platform/MyContentView.vue'),
-      meta: { title: 'platform-my-content', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      meta: { titleKey: 'myContent', title: 'platform-my-content', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
     },
     {
       path: '/platform/posts/new',
       name: 'platform-post-new',
       component: () => import('@/views/platform/PostEditorView.vue'),
-      meta: { title: 'platform-post-new', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      meta: { titleKey: 'newPost', title: 'platform-post-new', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
     },
     {
       path: '/platform/posts/:id/edit',
       name: 'platform-post-edit',
       component: () => import('@/views/platform/PostEditorView.vue'),
-      meta: { title: 'platform-post-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      meta: { titleKey: 'ttlPostEdit', title: 'platform-post-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
     },
     {
       path: '/platform/posts/:id',
       name: 'platform-post',
       component: () => import('@/views/platform/PostView.vue'),
-      meta: { title: 'platform-post', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'ttlPost', title: 'platform-post', requiresAuth: true, requiresActive: true },
     },
     {
       path: '/platform/courses/new',
       name: 'platform-course-new',
       component: () => import('@/views/platform/CourseEditorView.vue'),
-      meta: { title: 'platform-course-new', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      meta: { titleKey: 'newCourse', title: 'platform-course-new', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
     },
     {
       path: '/platform/courses/:id/edit',
       name: 'platform-course-edit',
       component: () => import('@/views/platform/CourseEditorView.vue'),
-      meta: { title: 'platform-course-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      meta: { titleKey: 'ttlCourseEdit', title: 'platform-course-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
     },
     {
       path: '/platform/courses/:id',
       name: 'platform-course',
       component: () => import('@/views/platform/CourseView.vue'),
-      meta: { title: 'platform-course', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'ttlCourse', title: 'platform-course', requiresAuth: true, requiresActive: true },
     },
     {
       path: '/platform/live/new',
       name: 'platform-live-new',
       component: () => import('@/views/platform/LiveEditorView.vue'),
-      meta: { title: 'platform-live-new', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      meta: { titleKey: 'newLive', title: 'platform-live-new', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
     },
     {
       path: '/platform/live/:id/edit',
       name: 'platform-live-edit',
       component: () => import('@/views/platform/LiveEditorView.vue'),
-      meta: { title: 'platform-live-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      meta: { titleKey: 'ttlLiveEdit', title: 'platform-live-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
     },
     {
       path: '/platform/notifications',
       name: 'platform-notifications',
       component: () => import('@/views/platform/NotificationsView.vue'),
-      meta: { title: 'Notifications', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'notifications', title: 'Notifications', requiresAuth: true, requiresActive: true },
     },
     {
       // My exams (the teacher's list) and the shared exam builder in teacher mode.
       path: '/platform/exams',
       name: 'platform-my-exams',
       component: () => import('@/views/platform/MyExamsView.vue'),
-      meta: { title: 'platform-my-exams', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      meta: { titleKey: 'mexTitle', title: 'platform-my-exams', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
     },
     {
       path: '/platform/exams/new',
       name: 'platform-exam-new',
       component: () => import('@/views/platform/TeacherExamEditorView.vue'),
-      meta: { title: 'platform-exam-new', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      meta: { titleKey: 'exNew', title: 'platform-exam-new', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
     },
     {
       path: '/platform/exams/:id/edit',
       name: 'platform-exam-edit',
       component: () => import('@/views/platform/TeacherExamEditorView.vue'),
-      meta: { title: 'platform-exam-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+      meta: { titleKey: 'ttlExamEdit', title: 'platform-exam-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
     },
     {
       // The old exam editor is gone: its addresses lead to the new builder (an admin to the admin builder), keeping ?subject=.
@@ -408,43 +431,50 @@ const router = createRouter({
       path: '/platform/assessments/:id/take',
       name: 'platform-assessment-take',
       component: () => import('@/views/platform/TakeAssessmentView.vue'),
-      meta: { title: 'platform-assessment-take', requiresAuth: true, requiresActive: true, roles: ['student'] },
+      meta: { titleKey: 'tkPageTitle', title: 'platform-assessment-take', requiresAuth: true, requiresActive: true, roles: ['student'] },
     },
     {
       path: '/platform/assessments/:id/results',
       name: 'platform-assessment-results',
       component: () => import('@/views/platform/AssessmentResultsView.vue'),
-      meta: { title: 'platform-assessment-results', requiresAuth: true, requiresActive: true, roles: ['teacher', 'admin'] },
+      meta: { titleKey: 'ttlExamResults', title: 'platform-assessment-results', requiresAuth: true, requiresActive: true, roles: ['teacher', 'admin'] },
     },
     {
       path: '/platform/assessments/:id',
       name: 'platform-assessment',
       component: () => import('@/views/platform/AssessmentView.vue'),
-      meta: { title: 'platform-assessment', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'ttlExam', title: 'platform-assessment', requiresAuth: true, requiresActive: true },
     },
     {
       path: '/platform/attempts/:id',
       name: 'platform-attempt',
       component: () => import('@/views/platform/AttemptView.vue'),
-      meta: { title: 'platform-attempt', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'attemptPageTitle', title: 'platform-attempt', requiresAuth: true, requiresActive: true },
     },
     {
       path: '/platform/search',
       name: 'platform-search',
       component: () => import('@/views/platform/SearchView.vue'),
-      meta: { title: 'platform-search', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'tchNavSearch', title: 'platform-search', requiresAuth: true, requiresActive: true },
     },
     {
       path: '/platform/account',
       name: 'platform-account',
       component: () => import('@/views/platform/AccountView.vue'),
-      meta: { title: 'platform-account', requiresAuth: true, requiresActive: true },
+      meta: { titleKey: 'accountSettings', title: 'platform-account', requiresAuth: true, requiresActive: true },
     },
     {
       path: '/admin',
       name: 'admin',
       component: () => import('@/views/AdminView.vue'),
       meta: { title: 'Admin' },
+    },
+    {
+      // Anything else: a page that says so (with a way home) instead of an empty screen.
+      path: '/:pathMatch(.*)*',
+      name: 'not-found',
+      component: () => import('@/views/NotFoundView.vue'),
+      meta: { titleKey: 'nfTitle', title: 'Not found' },
     },
   ],
 })
@@ -467,6 +497,10 @@ router.beforeEach(async (to) => {
   await auth.init()
 
   if (to.meta.guestOnly) return auth.isLoggedIn ? '/platform' : true
+  // A session is stored but the profile could not be read (no network, server down): stay on the page instead of
+  // sending the person to sign in. The shell shows an offline banner; once the profile arrives the guards run again
+  // (see setRecoveredHandler below) and every role rule applies. The server enforces every rule meanwhile.
+  if (!auth.isLoggedIn && auth.offline) return true
   if (!auth.isLoggedIn) return { path: '/auth/login', query: { redirect: to.fullPath, ...(auth.consumeSessionLost() ? { expired: '1' } : {}) } }
   // An approved account has nothing to wait for any more (a reload or a bookmark of the waiting page must not strand it).
   if (to.name === 'auth-pending' && auth.isActive) return '/platform'
@@ -478,9 +512,62 @@ router.beforeEach(async (to) => {
     const tail = legacy === 'new' ? 'new' : `${String(to.params.id)}/edit`
     return { path: `${auth.role === 'admin' ? '/platform/admin/exams' : '/platform/exams'}/${tail}`, query: to.query, replace: true }
   }
+  // The student's home is their overview (admins and teachers are sent to theirs by the page itself).
+  if (to.name === 'platform-home' && auth.role === 'student' && auth.isActive) return { path: '/platform/student', replace: true }
   const roles = to.meta.roles as string[] | undefined
   if (roles && (!auth.role || !roles.includes(auth.role))) return '/platform'
   return true
+})
+
+// ── After each navigation: the document title, and (after an in-app move to another page) focus on the new page's h1
+// so a screen reader announces where the person is (WCAG 2.4.3). Only navigations the person caused move focus: a
+// redirect while the app loads does not. The new heading may show up later (lazy page, data loading, out-in transition),
+// so it is awaited for a few seconds; focus is never taken back from something the person focused meanwhile.
+let firstNavigation = true
+let lastInput = 0
+if (typeof window !== 'undefined') {
+  const mark = () => { lastInput = Date.now() }
+  window.addEventListener('pointerdown', mark, true)
+  window.addEventListener('keydown', mark, true)
+  window.addEventListener('popstate', mark) // the browser's back/forward buttons
+}
+
+function focusHeadingSoon() {
+  const main = document.getElementById('main-content')
+  if (!main) return
+  const old = main.querySelector('h1')
+  const atNavigation = document.activeElement
+  let settled = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let observer: MutationObserver | null = null
+  const stop = () => {
+    settled = true
+    observer?.disconnect()
+    if (timer) clearTimeout(timer)
+  }
+  const attempt = (): boolean => {
+    if (settled) return true
+    const h = [...main.querySelectorAll<HTMLElement>('h1')].find((x) => x !== old && x.isConnected)
+    if (!h) return false
+    stop()
+    if (!focusStillOurs(document.activeElement, atNavigation, document.body, main)) return true
+    if (!h.hasAttribute('tabindex')) h.setAttribute('tabindex', '-1')
+    h.focus({ preventScroll: true })
+    return true
+  }
+  if (attempt()) return
+  observer = new MutationObserver(() => { attempt() })
+  observer.observe(main, { childList: true, subtree: true })
+  timer = setTimeout(stop, 5000)
+}
+
+router.afterEach((to, from, failure) => {
+  if (failure) return
+  setTitleKey(titleKeyOf(to.meta))
+  const first = firstNavigation
+  firstNavigation = false
+  if (!platformEnabled || typeof document === 'undefined') return
+  if (shouldMoveFocus(to, from, first) && Date.now() - lastInput < 10_000) focusHeadingSoon()
 })
 
 // A request that carried a session the server no longer knows (expired, signed out elsewhere, suspended mid-session):
@@ -489,10 +576,18 @@ setUnauthorizedHandler(() => {
   useAuthStore().clearSession()
   resetAdminStats()
   resetTeacherStats()
+  resetStudentStats()
   const here = router.currentRoute.value
   // Public pages (and the very first navigation, whose own guard redirects) stay where they are.
   // `expired` makes the sign-in page say why the person is there (and, on an exam page, that the answers are kept).
   if (here.meta.requiresAuth) router.replace({ path: '/auth/login', query: { redirect: here.fullPath, expired: '1' } })
+})
+
+// The profile arrived after the network failed at start-up: run the guards again for the page the person is on (a role
+// page they may not open, a guest page they no longer need, the student home...). `force` because it is the same address.
+setRecoveredHandler(() => {
+  const here = router.currentRoute.value
+  router.replace({ path: here.path, query: here.query, hash: here.hash, force: true }).catch(() => { /* a redirect is not an error */ })
 })
 
 export default router

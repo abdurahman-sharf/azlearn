@@ -1,5 +1,7 @@
 import { platformFetch } from '@/lib/platformApi'
 import type { HiddenReason } from './platformContent'
+import type { Phase } from './platformExamAdmin'
+import type { StudentExamReason, StudentExamState } from './platformStudent'
 
 export interface AssessmentInfo {
   /** null for exams created by an admin */
@@ -24,6 +26,10 @@ export interface AssessmentDetail extends AssessmentInfo {
   can_start: boolean; in_progress_attempt: string | null; attempts: MyAttempt[]
   /** staff only (a student always gets false): a teacher's exam closed/archived by someone other than its owner */
   locked?: boolean
+  /** student callers only (absent or null for other roles): this exam's state for me, why I cannot start it, the effective phase */
+  state?: StudentExamState | null
+  reason?: StudentExamReason | null
+  phase?: Phase | null
 }
 export interface PublicQuestion { id: string; type: string; stem: string; options: string[]; points: number }
 export interface StartRes {

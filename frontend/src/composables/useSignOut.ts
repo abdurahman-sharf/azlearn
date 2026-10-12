@@ -2,6 +2,8 @@ import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { resetAdminStats } from '@/lib/adminStats'
 import { resetTeacherStats } from '@/lib/teacherStats'
+import { resetStudentStats } from '@/lib/studentStats'
+import { removeAttemptDrafts } from '@/utils/attemptDrafts'
 import { askClearLocalBanks } from '@/composables/signOutBank'
 import { hasLocalQuestions, LOCAL_QUESTION_CLEAR_KEYS } from '@/utils/localBanks'
 
@@ -34,7 +36,8 @@ async function clearLocalQuestions() {
  *
  * When the browser holds local question banks the person is asked whether to wipe them from this device (default: keep;
  * the question never appears when nothing is stored). The banks are not tied to the account, so on a shared computer
- * the next visitor could otherwise read them.
+ * the next visitor could otherwise read them. The local copies of exam answers (`exameow-attempt-*`) always go: they
+ * belong to this account's attempts, which keep their autosave on the server.
  */
 export function useSignOut() {
   const auth = useAuthStore()
@@ -44,7 +47,9 @@ export function useSignOut() {
     await auth.signOut()
     resetAdminStats()
     resetTeacherStats()
+    resetStudentStats()
     try { localStorage.removeItem('exameow-admin-subject') } catch { /* storage unavailable */ }
+    try { removeAttemptDrafts(localStorage) } catch { /* storage unavailable */ }
     if (clear) await clearLocalQuestions().catch(() => { /* the keys are already gone; a store that cannot be reset is not worth blocking sign-out */ })
     await router.replace('/')
   }

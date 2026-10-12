@@ -24,8 +24,17 @@ export const adminAudit = (before?: number) => platformFetch<AuditRow[]>(`/admin
 export const search = (q: string) => platformFetch<SearchResults>(`/search?q=${encodeURIComponent(q)}`)
 export const changePassword = (current: string, next: string) =>
   platformFetch<void>('/me/password', { body: { current, new: next } })
-export const deleteAccount = (password: string) => platformFetch<void>('/me', { method: 'DELETE', body: { password } })
+/** `confirm_email` (the typed account e-mail) is required from a student who has taken exams (409 `confirm_required`). */
+export const deleteAccount = (password: string, confirm_email?: string) =>
+  platformFetch<void>('/me', { method: 'DELETE', body: { password, ...(confirm_email ? { confirm_email } : {}) } })
 
-/** What deleting the caller's account would remove (the caller's own rows only; attempts = students' attempts on the caller's exams). */
-export interface DeletionImpact { exams: number; attempts: number; courses: number; posts: number; live: number }
+/**
+ * What deleting the caller's account would remove (the caller's own rows only). Teacher figures: exams, attempts
+ * (students' attempts on the caller's exams), courses, posts, live. Student figures (zero for others; optional while
+ * an older server does not send them): the exams the student took, completed lessons, enrolments and reviews.
+ */
+export interface DeletionImpact {
+  exams: number; attempts: number; courses: number; posts: number; live: number
+  attempts_taken?: number; lessons_completed?: number; enrollments?: number; reviews?: number
+}
 export const deletionImpact = () => platformFetch<DeletionImpact>('/me/deletion-impact')

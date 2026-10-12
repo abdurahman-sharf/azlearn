@@ -193,11 +193,7 @@ pub struct ExamDetail {
 }
 
 fn phase_of(i: &AssessmentInfo, now: i64) -> String {
-    if i.status == "published" && i.closes_at.map_or(false, |c| c <= now) {
-        "closed".into()
-    } else {
-        i.status.clone()
-    }
+    crate::platform_exams::effective_phase(&i.status, i.closes_at, now)
 }
 
 /// What one query returns per exam: the info, its submitted / pending counts and the hidden reason.

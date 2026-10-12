@@ -6,6 +6,7 @@ import { usePt, platformErrorMessage, formatNotification, type PlatformKey } fro
 import { notifications, markRead, type AppNotification, type NotificationGroup } from '@/api/platformEngage'
 import { useAuthStore } from '@/stores/auth'
 import { useTeacherStats } from '@/lib/teacherStats'
+import { useStudentStats } from '@/lib/studentStats'
 import { fillTemplate } from '@/utils/notificationText'
 
 const pt = usePt()
@@ -30,10 +31,15 @@ const loading = ref(false)
 const loaded = ref(false)
 const error = ref('')
 const list = ref<HTMLUListElement | null>(null)
-// the teacher's sidebar shows the unread count: reading here must update it without waiting for the next page change
+// the teacher's and the student's sidebars show the unread count: reading here must update it without waiting for the
+// next page change
 const auth = useAuthStore()
 const { refresh: refreshBadges } = useTeacherStats()
-const syncBadge = () => { if (auth.role === 'teacher') refreshBadges() }
+const { refreshAfterChange: refreshStudentBadges } = useStudentStats()
+const syncBadge = () => {
+  if (auth.role === 'teacher') refreshBadges()
+  else if (auth.role === 'student') void refreshStudentBadges()
+}
 
 const fmt = (ms: number) => new Date(ms).toLocaleString(i18n.locale === 'ar' ? 'ar' : undefined, { dateStyle: 'medium', timeStyle: 'short' })
 

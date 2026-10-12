@@ -9,6 +9,7 @@ import ContentLists from '@/components/platform/ContentLists.vue'
 import { teacherContent, type Bundle } from '@/api/platformContent'
 import { getTeacher, follow, unfollow, type TeacherPage } from '@/api/platformLearning'
 import PageError from '@/components/platform/PageError.vue'
+import PageLoading from '@/components/platform/PageLoading.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -69,4 +70,5 @@ onMounted(load)
     </ul>
   </div>
   <PageError v-else-if="error" :message="error" back-to="/platform/teachers" />
+  <PageLoading v-else />
 </template>

@@ -133,7 +133,34 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     crate::platform::add_column_if_missing(conn, "assessments", "closed_by", "TEXT")?;
     crate::platform::add_column_if_missing(conn, "assessments", "archived_by", "TEXT")?;
     settle_zero_point_answers(conn)?;
+    one_running_attempt_index(conn)?;
     Ok(())
+}
+
+/// At most ONE in-progress attempt per (exam, student) (phase 4-1), as a partial unique index, so a second running
+/// attempt can never be stored, whatever path writes it (`start_attempt` resumes the running one; every request holds
+/// the database lock, so this has always held in practice). An older database that somehow holds duplicates is left
+/// as it is (with a warning) rather than refusing to start: the index then simply is not created.
+fn one_running_attempt_index(conn: &Connection) -> Result<(), String> {
+    let e = |x: rusqlite::Error| x.to_string();
+    let exists: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_attempts_one_running')", [], |r| r.get(0))
+        .map_err(e)?;
+    if exists {
+        return Ok(());
+    }
+    let duplicates: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE status = 'in_progress' GROUP BY assessment_id, student_id HAVING count(*) > 1)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(e)?;
+    if duplicates {
+        eprintln!("Platform: some students have two running attempts on the same exam; idx_attempts_one_running is not created");
+        return Ok(());
+    }
+    conn.execute_batch("CREATE UNIQUE INDEX idx_attempts_one_running ON attempts(assessment_id, student_id) WHERE status = 'in_progress';").map_err(e)
 }
 
 /// A written answer to a question worth 0 points can never be graded (there is nothing to give, and the grading sheet
@@ -171,7 +198,8 @@ fn settle_zero_point_answers(conn: &Connection) -> Result<(), String> {
 }
 
 pub(crate) const MAX_QUESTIONS: usize = 200;
-const GRACE_MS: i64 = 60_000;
+/// How long after its deadline an attempt still counts as running (network latency of the last save / submit).
+pub(crate) const GRACE_MS: i64 = 60_000;
 const OPEN_ENDED_LIMIT_MS: i64 = 24 * 3_600_000;
 
 // ───────── grading ─────────
@@ -552,6 +580,16 @@ impl AssessmentInfo {
     pub(crate) fn can_correct_key(&self, user: &User) -> bool {
         self.owned_by(user) && self.status != "archived" && !self.is_locked()
     }
+
+    /// What a STUDENT may see of the exam's bookkeeping: not who owns or created it (`teacher_id`, `created_by` — the
+    /// owner's name stays in `teacher_name`) and not how many attempts the whole class made (`attempt_count`; the
+    /// student's own count is `attempts_used`, so that is what it carries). Every endpoint that serialises an exam to a
+    /// student calls this; the fields keep their place in the JSON, only their values are blanked.
+    pub(crate) fn redact_for_student(&mut self) {
+        self.teacher_id = None;
+        self.created_by = None;
+        self.attempt_count = self.attempts_used;
+    }
 }
 
 /// The column list `map_info` reads (26 columns), as a macro so `INFO_SELECT` can be built with `concat!` while
@@ -915,8 +953,19 @@ pub struct StartRes {
     pub(crate) saved_at: Option<i64>,
 }
 
-fn deadline(started_at: i64, duration_min: Option<i64>) -> i64 {
+pub(crate) fn deadline(started_at: i64, duration_min: Option<i64>) -> i64 {
     started_at + duration_min.map_or(OPEN_ENDED_LIMIT_MS, |m| m * 60_000)
+}
+
+/// The effective lifecycle phase of an exam: a `published` exam whose closing time has been reached reads as
+/// `closed` (nothing is written). **The one place this rule lives** (`platform_exam_admin::phase_of` and the student's
+/// exam state, `platform_student`, both call it).
+pub(crate) fn effective_phase(status: &str, closes_at: Option<i64>, now: i64) -> String {
+    if status == "published" && closes_at.map_or(false, |c| c <= now) {
+        "closed".into()
+    } else {
+        status.to_string()
+    }
 }
 
 // ───────── per-attempt shuffling (PRD F2) ─────────
@@ -1054,6 +1103,25 @@ fn settle_if_due(conn: &Connection, attempt_id: &str, assessment_id: &str, durat
         conn.execute("UPDATE attempts SET status = 'expired' WHERE id = ?1", params![attempt_id]).map_err(db_err)?;
     }
     Ok(true)
+}
+
+/// Settles every overdue attempt of ONE student, on every exam (the student's own lists read states from fresh data).
+/// Returns how many were settled.
+pub(crate) fn settle_student(conn: &Connection, student_id: &str, now: i64) -> Res<usize> {
+    let rows: Vec<(String, String, Option<i64>)> = conn
+        .prepare("SELECT t.id, t.assessment_id, a.duration_min FROM attempts t JOIN assessments a ON a.id = t.assessment_id WHERE t.student_id = ?1 AND t.status = 'in_progress'")
+        .map_err(db_err)?
+        .query_map(params![student_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    let mut n = 0;
+    for (id, aid, dur) in rows {
+        if settle_if_due(conn, &id, &aid, dur, now)? {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Settles this student's overdue attempts on one assessment.
@@ -1693,19 +1761,50 @@ fn list_mine(conn: &Connection, teacher_id: &str) -> Res<Vec<MineExam>> {
         .collect()
 }
 
-/// Published assessments of the student's enrolled subjects.
+/// The exams of the student's enrolled subjects that are worth showing on the older screens: those they can start now,
+/// will be able to start (upcoming), or are in the middle of (`platform_student::student_view` decides; closed, missed
+/// and finished ones are left out). Running attempts first, then by closing time (none last). Overdue attempts of the
+/// student are settled first.
 pub(crate) fn list_available(conn: &Connection, student_id: &str) -> Res<Vec<AssessmentInfo>> {
-    conn.prepare(&format!(
-        "{INFO_SELECT} WHERE a.status = 'published' AND {}
-           AND EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?1 AND e.subject_id = a.subject_id)
-         ORDER BY a.updated_at DESC LIMIT 30",
-        exam_standing("a")
-    ))
-    .map_err(db_err)?
-    .query_map(params![student_id], map_info)
-    .map_err(db_err)?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(db_err)
+    list_available_at(conn, student_id, now_ms())
+}
+
+pub(crate) fn list_available_at(conn: &Connection, student_id: &str, now: i64) -> Res<Vec<AssessmentInfo>> {
+    use crate::platform_student::{student_view, ExamFacts, ExamState};
+    settle_student(conn, student_id, now)?;
+    let infos: Vec<AssessmentInfo> = conn
+        .prepare(&format!(
+            "{INFO_SELECT} WHERE a.status IN ('published','closed') AND {}
+               AND EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?1 AND e.subject_id = a.subject_id)",
+            exam_standing("a")
+        ))
+        .map_err(db_err)?
+        .query_map(params![student_id], map_info)
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    let mut attempts = crate::platform_student::attempt_facts(conn, student_id, None)?;
+    let mut keep: Vec<(ExamState, AssessmentInfo)> = infos
+        .into_iter()
+        .filter_map(|info| {
+            // the query already holds the exam to "shown" and "enrolled"
+            let v = student_view(&ExamFacts::from_info(&info, true, true), &attempts.remove(&info.id).unwrap_or_default(), now);
+            matches!(v.state, ExamState::Open | ExamState::InProgress | ExamState::Upcoming).then_some((v.state, info))
+        })
+        .collect();
+    keep.sort_by(|(sa, a), (sb, b)| {
+        (*sa != ExamState::InProgress)
+            .cmp(&(*sb != ExamState::InProgress))
+            .then_with(|| match (a.closes_at, b.closes_at) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| a.title.cmp(&b.title))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(keep.into_iter().map(|(_, info)| info).take(50).collect())
 }
 
 #[derive(Serialize, Debug)]
@@ -1780,6 +1879,11 @@ pub struct AssessmentDetail {
     can_start: bool,
     in_progress_attempt: Option<String>,
     attempts: Vec<MyAttempt>,
+    /// Student callers only (`null` for everyone else): what the exam is for them, why they cannot start it and the
+    /// effective phase — `platform_student::student_view`, the same verdict as `GET /my/exams`.
+    state: Option<crate::platform_student::ExamState>,
+    reason: Option<crate::platform_student::Blocked>,
+    phase: Option<String>,
 }
 
 pub async fn detail_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>) -> Res<Json<AssessmentDetail>> {
@@ -1794,17 +1898,23 @@ pub async fn detail_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(i
     let mut can_start = false;
     let mut open_attempt = None;
     let mut attempts = Vec::new();
+    let (mut state, mut reason, mut phase) = (None, None, None);
     if u.role == "student" {
         expire_stale(&conn, &id, &u.id, info.duration_min, now)?;
+        let view = crate::platform_student::exam_view(&conn, &u.id, &info, now)?;
         attempts = my_attempts(&conn, &u.id, Some(&id))?;
         open_attempt = attempts.iter().find(|a| a.status == "in_progress").map(|a| a.attempt_id.clone());
-        let used = attempts.len() as i64;
-        can_start = is_enrolled(&conn, &u.id, &info.subject_id)?
-            && (open_attempt.is_some()
-                || (info.status == "published" && used < info.max_attempts && info.opens_at.map_or(true, |o| now >= o) && info.closes_at.map_or(true, |c| now <= c)));
+        // unchanged meaning for the older screens: "start or resume" (a running attempt resumes only while enrolled)
+        can_start = view.can_start
+            || (view.state == crate::platform_student::ExamState::InProgress && is_enrolled(&conn, &u.id, &info.subject_id)?);
+        (state, reason, phase) = (Some(view.state), view.reason, Some(view.phase));
     }
     let locked = u.role != "student" && info.is_locked();
-    Ok(Json(AssessmentDetail { info, locked, can_start, in_progress_attempt: open_attempt, attempts }))
+    let mut info = info;
+    if u.role == "student" {
+        info.redact_for_student();
+    }
+    Ok(Json(AssessmentDetail { info, locked, can_start, in_progress_attempt: open_attempt, attempts, state, reason, phase }))
 }
 
 pub async fn start_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>) -> Res<Json<StartRes>> {
@@ -1870,7 +1980,11 @@ pub async fn results_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(
 
 pub async fn subject_list_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>) -> Res<Json<Vec<AssessmentInfo>>> {
     let u = require_active(&s, &h)?;
-    list_for_subject(&*lock(&s)?, &u.id, &id).map(Json)
+    let mut list = list_for_subject(&*lock(&s)?, &u.id, &id)?;
+    if u.role == "student" {
+        list.iter_mut().for_each(AssessmentInfo::redact_for_student);
+    }
+    Ok(Json(list))
 }
 
 pub async fn mine_handler(State(s): State<Arc<AppState>>, h: HeaderMap) -> Res<Json<Vec<MineExam>>> {
@@ -1880,7 +1994,9 @@ pub async fn mine_handler(State(s): State<Arc<AppState>>, h: HeaderMap) -> Res<J
 
 pub async fn available_handler(State(s): State<Arc<AppState>>, h: HeaderMap) -> Res<Json<Vec<AssessmentInfo>>> {
     let u = require_role(&s, &h, "student")?;
-    list_available(&*lock(&s)?, &u.id).map(Json)
+    let mut list = list_available(&*lock(&s)?, &u.id)?;
+    list.iter_mut().for_each(AssessmentInfo::redact_for_student);
+    Ok(Json(list))
 }
 
 pub async fn my_attempts_handler(State(s): State<Arc<AppState>>, h: HeaderMap) -> Res<Json<Vec<MyAttempt>>> {
@@ -2894,6 +3010,51 @@ mod migration_tests {
         assert!(!crate::platform::column_exists(&c, "assessments", "created_by").unwrap());
         assert_eq!(one::<i64>(&c, "SELECT count(*) FROM assessments"), 2);
         assert_eq!(one::<i64>(&c, "PRAGMA foreign_keys"), 1);
+    }
+
+    fn running(c: &Connection, id: &str, exam: &str, student: &str) -> rusqlite::Result<usize> {
+        c.execute("INSERT INTO attempts(id, assessment_id, student_id, started_at, status) VALUES (?1, ?2, ?3, 1, 'in_progress')", params![id, exam, student])
+    }
+
+    #[test]
+    fn at_most_one_running_attempt_per_exam_and_student_once_migrated() {
+        // the real old database upgrades and gets the index
+        let c = old_db();
+        apply_schema(&c).unwrap();
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_attempts_one_running'"), 1);
+        let (exam, student): (String, String) = c.query_row("SELECT assessment_id, student_id FROM attempts LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        c.execute("DELETE FROM attempts WHERE assessment_id = ?1 AND student_id = ?2", params![exam, student]).unwrap();
+        running(&c, "r1", &exam, &student).unwrap();
+        assert!(running(&c, "r2", &exam, &student).is_err(), "a second running attempt cannot be stored");
+        // finished attempts are not limited
+        c.execute("UPDATE attempts SET status = 'submitted' WHERE id = 'r1'", []).unwrap();
+        running(&c, "r2", &exam, &student).unwrap();
+        c.execute("UPDATE attempts SET status = 'expired' WHERE id = 'r2'", []).unwrap();
+        running(&c, "r3", &exam, &student).unwrap();
+        // idempotent
+        apply_schema(&c).unwrap();
+    }
+
+    #[test]
+    fn a_database_that_already_holds_two_running_attempts_still_starts() {
+        let c = create_test_db();
+        c.execute_batch("DROP INDEX idx_attempts_one_running;").unwrap();
+        c.execute_batch(
+            "INSERT INTO users(id,email,password_hash,full_name,role,status,created_at) VALUES ('st','s@x.com','h','S','student','active',0);
+             INSERT INTO institutions(id,type,name_ar,created_at) VALUES ('i1','university','ج',0);
+             INSERT INTO subjects(id,institution_id,name_ar,created_at) VALUES ('s1','i1','م',0);
+             INSERT INTO assessments(id,subject_id,title,questions,question_count,total_points,status,created_at,updated_at) VALUES ('e1','s1','ا','[]',1,1,'published',0,0);",
+        )
+        .unwrap();
+        running(&c, "r1", "e1", "st").unwrap();
+        running(&c, "r2", "e1", "st").unwrap();
+        apply_schema(&c).expect("never refuses to start");
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_attempts_one_running'"), 0, "left out, not forced");
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM attempts"), 2, "nothing is touched");
+        // once the data allows it, the next start creates it
+        c.execute("UPDATE attempts SET status = 'expired' WHERE id = 'r1'", []).unwrap();
+        apply_schema(&c).unwrap();
+        assert_eq!(one::<i64>(&c, "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_attempts_one_running'"), 1);
     }
 }
 

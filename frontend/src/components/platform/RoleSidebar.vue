@@ -21,7 +21,7 @@ export interface NavGroup {
 // supplies its groups and a few labels/test ids; the look, the badges, the user chip and the sign-out are common.
 const props = defineProps<{
   groups: NavGroup[]
-  /** names the CSS classes (`<variant>-nav`, `<variant>-nav-link`) */
+  /** names the CSS classes (`<variant>-nav`, `<variant>-nav-link`); the look itself is shared (`role-nav-link`) */
   variant: string
   /** accessible name of the <nav> landmark */
   navLabel: PlatformKey
@@ -79,7 +79,7 @@ const initial = computed(() => (auth.profile?.full_name || auth.profile?.email |
               :data-testid="i.testid"
               :aria-current="isActive(i) ? 'page' : undefined"
               class="flex items-center gap-3 whitespace-nowrap rounded-xl border-s-4 px-3 py-2.5 text-body-md font-semibold no-underline transition-colors"
-              :class="isActive(i) ? '' : props.variant + '-nav-link'"
+              :class="isActive(i) ? '' : ['role-nav-link', props.variant + '-nav-link']"
               :style="isActive(i)
                 ? { backgroundColor: 'rgb(var(--md-primary))', color: 'rgb(var(--md-on-primary))', borderColor: 'rgb(var(--azl-deep-blue))' }
                 : { color: 'rgb(var(--md-on-surface))', borderColor: 'transparent' }"
@@ -99,7 +99,7 @@ const initial = computed(() => (auth.profile?.full_name || auth.profile?.email |
       <button
         type="button"
         class="shrink-0 flex items-center gap-3 whitespace-nowrap rounded-xl border-s-4 border-transparent px-3 py-2.5 text-body-md font-semibold text-start"
-        :class="props.variant + '-nav-link'"
+        :class="['role-nav-link', props.variant + '-nav-link']"
         style="color: rgb(var(--md-on-surface))"
         data-testid="nav-logout"
         @click="signOut"
@@ -112,6 +112,6 @@ const initial = computed(() => (auth.profile?.full_name || auth.profile?.email |
 </template>
 
 <style scoped>
-.admin-nav-link:hover,
-.teacher-nav-link:hover { background-color: rgb(var(--md-primary-container)); }
+/* one hover look for every role (the `<variant>-nav-link` class stays as a hook for tests and role-specific tweaks) */
+.role-nav-link:hover { background-color: rgb(var(--md-primary-container)); }
 </style>

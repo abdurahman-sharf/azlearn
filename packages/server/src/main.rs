@@ -18,6 +18,7 @@ mod platform_public;
 mod platform_reminders;
 mod platform_settings;
 mod platform_stats;
+mod platform_student;
 mod platform_learning;
 mod platform_teacher;
 mod relay;
@@ -117,6 +118,7 @@ async fn main() {
     let token_limiter = Arc::new(token_limit::TokenLimiter::from_env());
     println!("Signed-in API budget: {} requests/minute per session (PLATFORM_TOKEN_RPM, 0 = off)", token_limiter.per_minute());
     println!("Client address: trusted proxy hops = {}", proxy.describe());
+    println!("Sign-in limits: {}", state.platform.limits.describe());
 
     let static_dir =
         std::env::var("STATIC_DIR").unwrap_or_else(|_| "../frontend/dist".to_string());
@@ -262,6 +264,8 @@ async fn main() {
         .route("/api/platform/admin/bank/{id}", axum::routing::patch(platform_bank::update_handler))
         // the exam builder, both doors (admin and teacher) and the answer-key correction: see platform_exam_teacher::routes
         .merge(platform_exam_teacher::routes())
+        // the student's screens (phase 4-1): My exams, the overview, suggested subjects and bulk enrolment
+        .merge(platform_student::routes())
         .route("/api/platform/attempts/{id}/answers", axum::routing::put(platform_exams::save_handler))
         .route("/api/platform/attempts/{id}/events", post(platform_exams::event_handler))
         .route("/api/platform/grading/pending", get(platform_grading::pending_handler))

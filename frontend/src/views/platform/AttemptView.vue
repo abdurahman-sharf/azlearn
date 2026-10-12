@@ -5,8 +5,10 @@ import { useAuthStore } from '@/stores/auth'
 import { usePracticeStore } from '@/stores/practice'
 import { useI18nStore } from '@/stores/i18n'
 import { usePt, platformErrorMessage, gradingErrorMessage } from '@/i18n/platform'
-import { getAttempt, gradeAttempt, type AttemptResult, type ItemResult } from '@/api/platformExams'
+import { getAttempt, gradeAttempt, myAttempts, type AttemptResult, type ItemResult } from '@/api/platformExams'
+import { PlatformError } from '@/lib/platformApi'
 import GradeInput from '@/components/platform/GradeInput.vue'
+import PageLoading from '@/components/platform/PageLoading.vue'
 import { fillTemplate } from '@/utils/notificationText'
 import { buildItems, mergeSheet, sheetFromAttempt, toAttemptBody, validateItems, type CellMap, type GradeCell, type ServerMap } from '@/utils/gradeSheet'
 import type { Question, QuestionType } from '@exameow/shared'
@@ -50,12 +52,23 @@ function seed(res: AttemptResult) {
   if (res.items) mergeSheet(state, base, sheetFromAttempt(res.attempt_id, res.items.filter(editable)))
 }
 
+/** The attempt is still running (409 `in_progress`): its own student gets a way back into it. */
+const resumeLink = ref('')
 async function load() {
   try {
     r.value = await getAttempt(id)
     seed(r.value)
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
+    if (e instanceof PlatformError && e.code === 'in_progress' && auth.role === 'student') {
+      // the address only names the attempt; my attempts list says which exam it belongs to
+      myAttempts()
+        .then((list) => {
+          const mine = list.find((t) => t.attempt_id === id)
+          if (mine) resumeLink.value = `/platform/assessments/${mine.assessment_id}/take`
+        })
+        .catch(() => { /* the message alone still explains it */ })
+    }
   }
 }
 
@@ -162,8 +175,10 @@ onMounted(load)
       {{ saving ? pt('gdSaving') : pt('saveGrades') }}<template v-if="changes.length && !saving"> <span dir="ltr" class="inline-block">({{ changes.length }})</span></template>
     </button>
   </div>
-  <div v-else-if="error" class="max-w-3xl mx-auto">
+  <div v-else-if="error" class="max-w-3xl mx-auto space-y-3">
     <h1 class="sr-only">{{ pt('attemptPageTitle') }}</h1>
-    <p role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
+    <p role="alert" style="color: rgb(var(--md-error))" data-testid="attempt-load-error">{{ error }}</p>
+    <router-link v-if="resumeLink" :to="resumeLink" class="btn-filled inline-flex" data-testid="attempt-resume">{{ pt('resumeAssessment') }}</router-link>
   </div>
+  <PageLoading v-else />
 </template>

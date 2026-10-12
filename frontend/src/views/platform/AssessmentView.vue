@@ -1,15 +1,19 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useI18nStore } from '@/stores/i18n'
-import { usePt, platformErrorMessage, platformAdminErrorMessage } from '@/i18n/platform'
+import { usePt, platformErrorMessage, platformAdminErrorMessage, type PlatformKey } from '@/i18n/platform'
 import ReportButton from '@/components/platform/ReportButton.vue'
 import { getAssessment, type AssessmentDetail } from '@/api/platformExams'
 import { adminExams, type ExamAction } from '@/api/platformExamAdmin'
 import PageError from '@/components/platform/PageError.vue'
 import ConfirmDeleteDialog from '@/components/platform/ConfirmDeleteDialog.vue'
+import PageLoading from '@/components/platform/PageLoading.vue'
 import { PlatformError } from '@/lib/platformApi'
+import { enroll } from '@/api/platformLearning'
+import { countdown, openRecheck, reasonKey, stateChip } from '@/utils/studentExams'
+import { useStudentStats } from '@/lib/studentStats'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -86,6 +90,74 @@ async function remove() {
     busy.value = false
   }
 }
+
+// ── the student's view of the exam: its state for me, why I cannot start it, enrolling from here, and the time left
+// until an upcoming exam opens (the page asks the server again when it does, and keeps asking until the server agrees)
+const isStudent = computed(() => auth.role === 'student')
+const running = computed(() => !!a.value?.in_progress_attempt || a.value?.state === 'in_progress')
+/** the chip: "open but not enrolled" reads "Not enrolled", never "Missed" (the exam is still there to be taken) */
+const chip = computed(() => stateChip(a.value?.state, a.value?.reason))
+const stateLabel = computed(() => (chip.value ? pt(`stexState_${chip.value}` as PlatformKey) : ''))
+const reasonText = computed(() => {
+  const k = a.value?.state === 'in_progress' ? null : reasonKey(a.value?.reason)
+  return k ? pt(k as PlatformKey) : ''
+})
+const { refreshAfterChange: refreshStudent } = useStudentStats()
+const enrolling = ref(false)
+async function enrollHere() {
+  if (!a.value || enrolling.value) return
+  enrolling.value = true
+  error.value = ''
+  try {
+    await enroll(a.value.subject_id)
+    await load()
+    void refreshStudent() // the sidebar's "My exams" badge changes with the enrolment
+  } catch (e) {
+    error.value = platformErrorMessage(pt, e)
+  } finally {
+    enrolling.value = false
+  }
+}
+const now = ref(Date.now())
+let tick: ReturnType<typeof setInterval> | null = null
+const waitingToOpen = computed(() => isStudent.value && a.value?.state === 'upcoming' && !!a.value.opens_at)
+const opensIn = computed(() => (waitingToOpen.value && a.value?.opens_at ? countdown(a.value.opens_at, now.value) : null))
+const two = (n: number) => String(n).padStart(2, '0')
+// Once this device's clock reaches `opens_at` the page asks again, every few seconds while the server still says
+// "upcoming" (its clock may be a little behind), then hands over to a button.
+let tries = 0
+let lastTryAt = 0
+let asking = false
+const gaveUp = ref(false)
+async function askAgain() {
+  if (asking) return
+  asking = true
+  tries++
+  lastTryAt = Date.now()
+  try {
+    await load()
+  } finally {
+    asking = false
+  }
+}
+watch(now, (n) => {
+  if (!waitingToOpen.value || asking) return
+  const next = openRecheck({ state: a.value?.state, opensAt: a.value?.opens_at, now: n, tries, lastTryAt })
+  if (next === 'retry') void askAgain()
+  else if (next === 'give_up') gaveUp.value = true
+})
+function checkAgain() {
+  tries = 0
+  gaveUp.value = false
+  void askAgain()
+}
+watch(waitingToOpen, (on) => {
+  if (on && !tick) tick = setInterval(() => { now.value = Date.now() }, 1000)
+  if (!on && tick) { clearInterval(tick); tick = null }
+  if (!on) { tries = 0; gaveUp.value = false }
+}, { immediate: true })
+onBeforeUnmount(() => { if (tick) clearInterval(tick) })
+
 onMounted(load)
 </script>
 
@@ -110,13 +182,32 @@ onMounted(load)
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
 
     <template v-if="auth.role === 'student'">
+      <div v-if="a.state" class="flex flex-wrap items-center gap-2 mb-3">
+        <span class="text-sm font-semibold px-3 py-1 rounded-full" style="background-color: rgb(var(--md-secondary-container)); color: rgb(var(--md-on-secondary-container))" data-testid="exam-state">{{ stateLabel }}</span>
+        <span v-if="reasonText" class="text-body-md" data-testid="exam-reason">{{ reasonText }}</span>
+      </div>
+      <p v-if="opensIn && !opensIn.done" class="text-body-md mb-3" role="timer" data-testid="exam-opens-in">
+        {{ pt('stexOpensIn') }}:
+        <template v-if="opensIn.days"><span dir="ltr" class="inline-block font-bold">{{ opensIn.days }}</span> {{ pt('stexDays') }} · </template>
+        <span dir="ltr" class="inline-block font-bold tabular-nums">{{ two(opensIn.hours) }}:{{ two(opensIn.minutes) }}:{{ two(opensIn.seconds) }}</span>
+      </p>
+      <!-- the opening time has passed here but the server still says "upcoming": it keeps being asked; after a while a button takes over -->
+      <p v-else-if="opensIn" class="text-body-md mb-3 flex flex-wrap items-center gap-2" role="status" data-testid="exam-opens-checking">
+        <template v-if="!gaveUp">{{ pt('stexOpensChecking') }}</template>
+        <button v-else type="button" class="btn-tonal" data-testid="exam-opens-refresh" @click="checkAgain">{{ pt('stexOpensRefresh') }}</button>
+      </p>
+      <div v-if="a.reason === 'not_enrolled'" class="card-filled p-4 mb-4 flex flex-wrap items-center gap-3">
+        <p class="text-body-md flex-1 min-w-0">{{ pt('stexEnrollFirst') }}</p>
+        <button type="button" class="btn-filled" :disabled="enrolling" data-testid="exam-enroll" @click="enrollHere">{{ pt('enroll') }}</button>
+      </div>
       <section v-if="a.can_start && !a.in_progress_attempt" class="card-filled p-4 mb-4 space-y-1" data-testid="exam-rules">
         <h2 class="font-bold">{{ pt('tkRulesTitle') }}</h2>
         <ul class="list-disc ps-5 text-body-sm space-y-0.5"><li>{{ pt('tkRules1') }}</li><li>{{ pt('tkRules2') }}</li><li v-if="a.shuffle_questions || a.shuffle_options">{{ pt('tkRules3') }}</li><li>{{ pt('tkRules4') }}</li></ul>
       </section>
       <p class="text-body-sm mb-3">{{ pt('attemptsUsed') }}: <span dir="ltr" class="inline-block">{{ a.attempts_used }} / {{ a.max_attempts }}</span></p>
-      <router-link v-if="a.can_start" :to="`/platform/assessments/${a.id}/take`" class="btn-filled inline-flex mb-4">
-        {{ a.in_progress_attempt ? pt('resumeAssessment') : pt('startAssessment') }}
+      <!-- the server decides (can_start also covers resuming a running attempt); the label says which -->
+      <router-link v-if="a.can_start" :to="`/platform/assessments/${a.id}/take`" class="btn-filled inline-flex mb-4" :data-testid="running ? 'exam-resume' : 'exam-start'">
+        {{ running ? pt('resumeAssessment') : pt('startAssessment') }}
       </router-link>
       <ul class="space-y-2">
         <li v-for="t in a.attempts.filter(x => x.status !== 'in_progress')" :key="t.attempt_id">
@@ -163,4 +254,5 @@ onMounted(load)
     />
   </div>
   <PageError v-else-if="error" :message="error" />
+  <PageLoading v-else />
 </template>

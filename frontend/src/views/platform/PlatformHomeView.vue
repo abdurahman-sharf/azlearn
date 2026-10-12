@@ -25,12 +25,14 @@ const unread = ref(0)
 const searchQ = ref('')
 const available = ref<AssessmentInfo[]>([])
 const progress = ref<ProgressItem[]>([])
-// Admins and teachers have their own home (with its own navigation); this page is the student's, so it only redirects them.
-const leaving = auth.role === 'admin' || auth.role === 'teacher'
+// Admins, teachers and students have their own home (with its own navigation): this page only redirects them. It stays
+// for the roles without one (and for a profile that is not known yet).
+const OWN_HOME: Partial<Record<string, string>> = { admin: '/platform/admin', teacher: '/platform/teacher', student: '/platform/student' }
+const ownHome = auth.role ? OWN_HOME[auth.role] : undefined
+const leaving = !!ownHome
 
 onMounted(async () => {
-  if (auth.role === 'admin') { router.replace('/platform/admin'); return }
-  if (auth.role === 'teacher') { router.replace('/platform/teacher'); return }
+  if (ownHome) { router.replace(ownHome); return }
   notifications().then((n) => { unread.value = n.unread }).catch(() => { /* the bell is optional */ })
   // Everyone sees the institutions of the type they registered with; students also get their learning feed. The
   // requests run in parallel and are settled one by one: a section whose request failed reports the error, the

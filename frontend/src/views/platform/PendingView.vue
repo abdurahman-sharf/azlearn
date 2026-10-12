@@ -20,8 +20,10 @@ const error = ref('')
 let timer: ReturnType<typeof setInterval> | null = null
 
 const status = computed(() => auth.profile?.status)
+// A student's account is not a teaching request: no "publishing", no "subjects you teach" in its wording.
+const isStudent = computed(() => auth.role === 'student')
 const title = computed(() => {
-  if (status.value === 'rejected') return pt('rejectedTitle')
+  if (status.value === 'rejected') return isStudent.value ? pt('rejectedTitleStudent') : pt('rejectedTitle')
   if (status.value === 'suspended') return pt('suspendedTitle')
   return pt('pendingTitle')
 })
@@ -64,13 +66,13 @@ onBeforeUnmount(() => {
       <h1 class="text-headline-sm font-bold" data-testid="pending-title">{{ title }}</h1>
 
       <template v-if="status === 'pending'">
-        <p class="text-body-lg">{{ pt('pendingDesc') }}</p>
+        <p class="text-body-lg" data-testid="pending-desc">{{ isStudent ? pt('pendingDescStudent') : pt('pendingDesc') }}</p>
         <section aria-labelledby="pending-next-title" data-testid="pending-next">
           <h2 id="pending-next-title" class="text-title-md font-bold mb-2">{{ pt('pendingNextTitle') }}</h2>
           <ol class="list-decimal ps-5 space-y-1 text-body-md">
             <li>{{ pt('pendingNext1') }}</li>
             <li>{{ pt('pendingNext2') }}</li>
-            <li>{{ pt('pendingNext3') }}</li>
+            <li>{{ isStudent ? pt('pendingNext3Student') : pt('pendingNext3') }}</li>
           </ol>
         </section>
         <p class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ pt('pendingAuto') }}</p>
@@ -80,7 +82,7 @@ onBeforeUnmount(() => {
       <template v-else>
         <p v-if="reason" class="text-body-lg" data-testid="pending-reason">{{ pt('reason') }}: <span dir="auto">{{ reason }}</span></p>
         <p v-else class="text-body-lg" data-testid="pending-no-reason">{{ pt('pendingNoReason') }}</p>
-        <p class="text-body-md">{{ pt('pendingContact') }}</p>
+        <p class="text-body-md" data-testid="pending-contact">{{ isStudent ? pt('pendingContactStudent') : pt('pendingContact') }}</p>
       </template>
 
       <p v-if="error" class="text-body-sm" role="alert" style="color: rgb(var(--md-error))" data-testid="pending-error">{{ error }}</p>
