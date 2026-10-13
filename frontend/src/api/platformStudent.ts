@@ -1,4 +1,5 @@
-import { platformFetch } from '@/lib/platformApi'
+import { platformBlob, platformFetch } from '@/lib/platformApi'
+import { saveBlob } from '@/utils/saveFile'
 import type { Phase } from './platformExamAdmin'
 
 // The student's own screens (phase 4-1). Every figure is computed by the server from the session user; nothing here
@@ -115,3 +116,122 @@ export const BULK_ENROLL_MAX = 30
 /** Each id goes through the single-enrolment rules; one that fails a rule or is already enrolled is counted as skipped. */
 export const bulkEnroll = (subject_ids: string[]) =>
   platformFetch<{ enrolled: number; skipped: number }>('/enrollments/bulk', { body: { subject_ids } })
+
+// ── phase 4-2: learning hub, schedule, live page, following and saved items ──────────────────────────────────────────
+
+export type LearningState = 'in_progress' | 'not_started' | 'completed'
+export type LearningTab = 'all' | LearningState
+export interface LearningItem {
+  course_id: string
+  title: string
+  /** the first 160 characters of the description */
+  description: string | null
+  subject_id: string
+  subject_name: string
+  teacher_id: string
+  teacher_name: string
+  total: number
+  completed: number
+  /** 0..100, two decimals */
+  percent: number
+  state: LearningState
+  /** the first lesson not completed yet (null once the course is completed) */
+  next_lesson_id: string | null
+  /** when I last completed a lesson of this course */
+  last_at: number | null
+  updated_at: number
+}
+/** Counts after the subject / search filters, whatever the state filter is. */
+export type LearningCounts = Record<LearningState, number>
+export interface LearningList { items: LearningItem[]; total: number; counts: LearningCounts }
+export interface LearningQuery { state?: LearningTab; subject_id?: string; q?: string; limit?: number; offset?: number }
+
+export function myLearning(f: LearningQuery = {}): Promise<LearningList> {
+  const p = new URLSearchParams()
+  if (f.state && f.state !== 'all') p.set('state', f.state)
+  if (f.subject_id) p.set('subject_id', f.subject_id)
+  if (f.q) p.set('q', f.q)
+  if (f.limit !== undefined) p.set('limit', String(f.limit))
+  if (f.offset) p.set('offset', String(f.offset))
+  const qs = p.toString()
+  return platformFetch(`/my/learning${qs ? `?${qs}` : ''}`)
+}
+
+export type ScheduleKind = 'live' | 'exam_opens' | 'exam_closes'
+/** One entry of my timetable. The join link is never part of it: the live page decides what I may see. */
+export interface ScheduleItem {
+  kind: ScheduleKind
+  /** the live session's or the exam's id */
+  id: string
+  title: string
+  subject_id: string
+  subject_name: string
+  teacher_name: string
+  /** live: the start; exams: the opening / closing time */
+  at: number
+  /** live only: start + duration */
+  ends_at: number | null
+  /** live only */
+  duration_min: number | null
+  /** live only: the join link is withheld (not enrolled in the subject) */
+  locked: boolean
+  /** an in-app path: /platform/live/<id> or /platform/assessments/<id> */
+  link: string
+}
+/** `from` / `to` are epoch ms; the server defaults to now - 2 h .. + 7 days and refuses more than 62 days (400 `invalid_range`). */
+export const mySchedule = (from: number, to: number) =>
+  platformFetch<{ items: ScheduleItem[] }>(`/my/schedule?from=${Math.round(from)}&to=${Math.round(to)}`)
+
+export type LivePhase = 'upcoming' | 'live_now' | 'ended'
+/** `GET /live/{id}` for a student (the owner and admins get the editor's shape from `getLive`). */
+export interface StudentLive {
+  id: string
+  title: string
+  description: string | null
+  teacher_id: string
+  teacher_name: string
+  subject_id: string
+  subject_name: string
+  starts_at: number
+  duration_min: number
+  status: 'scheduled' | 'cancelled'
+  /** "" while locked */
+  join_url: string
+  locked: boolean
+  /** I am enrolled in the subject */
+  enrolled: boolean
+  phase: LivePhase
+  /** starts_at - 15 minutes */
+  joinable_from: number
+}
+export const studentLive = (id: string) => platformFetch<StudentLive>(`/live/${encodeURIComponent(id)}`)
+
+export interface FollowedTeacher { id: string; full_name: string; bio: string | null; subject_count: number; followed_at: number }
+export const myFollowing = () => platformFetch<{ items: FollowedTeacher[] }>('/my/following')
+
+export type BookmarkType = 'post' | 'course'
+export interface BookmarkRow {
+  target_type: BookmarkType
+  target_id: string
+  title: string
+  subject_name: string
+  teacher_name: string
+  saved_at: number
+  updated_at: number
+}
+/** At most this many saved items per student (the server answers 409 `too_many_bookmarks` beyond it). */
+export const BOOKMARK_MAX = 200
+export const myBookmarks = () => platformFetch<{ items: BookmarkRow[] }>('/my/bookmarks')
+export const putBookmark = (target_type: BookmarkType, target_id: string) =>
+  platformFetch<void>('/bookmarks', { method: 'PUT', body: { target_type, target_id } })
+export const deleteBookmark = (target_type: BookmarkType, target_id: string) =>
+  platformFetch<void>(`/bookmarks/${target_type}/${encodeURIComponent(target_id)}`, { method: 'DELETE' })
+
+/**
+ * Downloads my timetable (live sessions and exam windows, from yesterday to 90 days ahead) as a calendar file. `lang` is the
+ * language of the file's fixed words ("Teacher", "Exam opens", ...): the interface language, so the file reads like the page.
+ */
+export async function downloadScheduleIcs(lang: 'ar' | 'en' = 'ar'): Promise<void> {
+  const blob = await platformBlob(`/my/schedule.ics?lang=${lang}`)
+  saveBlob(new Blob([blob], { type: 'text/calendar;charset=utf-8' }), 'azlearn-schedule.ics')
+}

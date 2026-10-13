@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
+import { useRouteParam } from '@/composables/useRouteParam'
 import ReportButton from '@/components/platform/ReportButton.vue'
+import BookmarkButton from '@/components/platform/BookmarkButton.vue'
 import { getPost, updatePost, deletePost, downloadFile, type Post } from '@/api/platformContent'
 import PageError from '@/components/platform/PageError.vue'
 import PageLoading from '@/components/platform/PageLoading.vue'
@@ -11,17 +13,20 @@ import ConfirmDeleteDialog from '@/components/platform/ConfirmDeleteDialog.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
-const route = useRoute()
 const router = useRouter()
-const id = route.params.id as string
+const id = useRouteParam('id')
 const post = ref<Post | null>(null)
 const error = ref('')
 
+// Answers to the latest load only: a slow answer for the post we just left must not land on the one we are opening.
+let seq = 0
 async function load() {
+  const mine = ++seq
   try {
-    post.value = await getPost(id)
+    const p = await getPost(id.value)
+    if (mine === seq) { post.value = p; error.value = '' }
   } catch (e) {
-    error.value = platformErrorMessage(pt, e)
+    if (mine === seq) error.value = platformErrorMessage(pt, e)
   }
 }
 async function download() {
@@ -29,7 +34,7 @@ async function download() {
   try { await downloadFile(post.value.file) } catch (e) { error.value = platformErrorMessage(pt, e) }
 }
 async function unpublish() {
-  try { await updatePost(id, { status: 'draft' }); await load() } catch (e) { error.value = platformErrorMessage(pt, e) }
+  try { await updatePost(id.value, { status: 'draft' }); await load() } catch (e) { error.value = platformErrorMessage(pt, e) }
 }
 const deleting = ref(false)
 const deleteBusy = ref(false)
@@ -39,7 +44,7 @@ async function remove() {
   deleteBusy.value = true
   deleteError.value = ''
   try {
-    await deletePost(id)
+    await deletePost(id.value)
     deleting.value = false
     await router.replace('/platform')
   } catch (e) {
@@ -48,13 +53,23 @@ async function remove() {
     deleteBusy.value = false
   }
 }
-onMounted(load)
+// Moving to another post (a link, a notification, back/forward) re-uses this page: forget the old one and load the new.
+watch(id, () => {
+  seq++
+  post.value = null
+  error.value = ''
+  deleting.value = false
+  void load()
+}, { immediate: true })
 </script>
 
 <template>
   <div v-if="post" class="max-w-3xl mx-auto pb-8">
     <router-link :to="`/platform/subjects/${post.subject_id}`" class="text-body-sm underline">{{ post.subject_name }}</router-link>
-    <h1 class="text-display-sm font-bold tracking-tight mt-3 break-words" dir="auto">{{ post.title }}</h1>
+    <div class="flex flex-wrap items-start gap-3 mt-3">
+      <h1 class="flex-1 min-w-[12rem] text-display-sm font-bold tracking-tight break-words" dir="auto">{{ post.title }}</h1>
+      <BookmarkButton v-if="auth.role === 'student'" target-type="post" :target-id="post.id" testid="post-bookmark" />
+    </div>
     <p class="text-body-sm mb-4" style="color: rgb(var(--md-on-surface-variant))">
       {{ post.kind === 'summary' ? pt('kindSummary') : pt('kindArticle') }} · {{ pt('by') }}
       <router-link :to="`/platform/teachers/${post.teacher_id}`" class="underline">{{ post.teacher_name }}</router-link>

@@ -202,6 +202,36 @@ pub(crate) fn tell_new_follower(conn: &Connection, teacher_id: &str, now: i64) -
     })
 }
 
+/// A lesson was added to a published course that students can see (the caller checks that): every ACTIVE student enrolled in
+/// its subject gets ONE unread `new_lesson {course, subject, title, count}` per course, however many lessons are added while it
+/// stays unread — `title` is the latest lesson's, `count` the number of lessons added since the student last opened the
+/// notice. The notice links to the course. A student who read the previous one starts a new notice. All or nothing.
+pub(crate) fn tell_new_lesson(conn: &Connection, course_id: &str, lesson_title: &str, now: i64) -> Res<()> {
+    let row: Option<(String, String, String)> = conn
+        .query_row("SELECT c.title, c.subject_id, s.name_ar FROM courses c JOIN subjects s ON s.id = c.subject_id WHERE c.id = ?1", params![course_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()
+        .map_err(db_err)?;
+    let Some((course, subject_id, subject)) = row else { return Ok(()) };
+    let students: Vec<String> = conn
+        .prepare(
+            "SELECT e.student_id FROM subject_enrollments e JOIN users st ON st.id = e.student_id
+              WHERE e.subject_id = ?1 AND st.role = 'student' AND st.status = 'active' ORDER BY e.student_id",
+        )
+        .map_err(db_err)?
+        .query_map(params![subject_id], |r| r.get(0))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    let link = format!("/platform/courses/{course_id}");
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    for student in &students {
+        upsert_unread(&tx, student, "new_lesson", &link, now, |cur| {
+            Ok(Fold::Write(json!({ "course": course, "subject": subject, "title": lesson_title, "count": next_count(&cur) })))
+        })?;
+    }
+    tx.commit().map_err(db_err)
+}
+
 /// The least time between two "answers wait for you" notices of one exam (when the first was read in between).
 pub(crate) const SUBMISSION_NOTICE_GAP_MS: i64 = 3_600_000;
 
@@ -278,8 +308,8 @@ const NOTIF_MAX_LIMIT: i64 = 50;
 /// The SQL condition for a notification group. The strings are literals of this file (never request text).
 fn group_condition(group: &str) -> Res<&'static str> {
     Ok(match group {
-        "exams" => "kind IN ('new_assessment','assessment_graded','exam_closing','exam_results','score_changed','feedback_added','submission_pending','exam_admin_closed','exam_admin_archived','exam_admin_released')",
-        "content" => "kind IN ('new_post','new_course','live_scheduled','live_cancelled','live_updated','new_review','content_unpublished','content_auto_hidden')",
+        "exams" => "kind IN ('new_assessment','assessment_graded','exam_closing','exam_opened','exam_results','score_changed','feedback_added','submission_pending','exam_admin_closed','exam_admin_archived','exam_admin_released')",
+        "content" => "kind IN ('new_post','new_course','new_lesson','live_scheduled','live_cancelled','live_updated','live_soon','new_review','content_unpublished','content_auto_hidden')",
         "people" => "kind IN ('new_enrollment','new_follower')",
         "account" => "(kind LIKE 'account\\_%' ESCAPE '\\' OR kind LIKE 'teaching\\_%' ESCAPE '\\')",
         _ => return Err(bad("invalid_group")),
@@ -448,32 +478,27 @@ pub async fn course_progress_handler(State(state): State<Arc<AppState>>, headers
 pub struct ProgressItem {
     course_id: String,
     title: String,
+    subject_id: String,
     subject_name: String,
     total: i64,
     completed: i64,
+    /// Completed lessons in percent of the course's lessons, two decimals.
+    percent: f64,
+    /// The first lesson (by position) the student has not completed; `null` for a finished course.
+    next_lesson_id: Option<String>,
 }
 
+/// The courses the student has started (at least one lesson done), newest activity first, at most 20 — finished ones
+/// included. Built from the same [`crate::platform_student_learning::learning_items`] as `GET /my/learning` and the overview,
+/// so the three always agree on what a student can open and how far they are.
 fn my_progress(conn: &Connection, student_id: &str) -> Res<Vec<ProgressItem>> {
-    // only courses the student can still open: published, teacher in good standing, subject and institution active
-    conn.prepare(&format!(
-        "SELECT c.id, c.title, s.name_ar,
-                (SELECT count(*) FROM lessons l WHERE l.course_id = c.id),
-                (SELECT count(*) FROM lesson_progress p JOIN lessons l ON l.id = p.lesson_id WHERE l.course_id = c.id AND p.student_id = ?1),
-                (SELECT max(p.completed_at) FROM lesson_progress p JOIN lessons l ON l.id = p.lesson_id WHERE l.course_id = c.id AND p.student_id = ?1) AS last
-         FROM courses c JOIN subjects s ON s.id = c.subject_id JOIN users u ON u.id = c.teacher_id
-         WHERE {}
-           AND EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?1 AND e.subject_id = c.subject_id)
-           AND last IS NOT NULL
-         ORDER BY last DESC LIMIT 20",
-        crate::platform_content::visible("c", "published")
-    ))
-    .map_err(db_err)?
-    .query_map(params![student_id], |r| {
-        Ok(ProgressItem { course_id: r.get(0)?, title: r.get(1)?, subject_name: r.get(2)?, total: r.get(3)?, completed: r.get(4)? })
-    })
-    .map_err(db_err)?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(db_err)
+    let mut items: Vec<_> = crate::platform_student_learning::learning_items(conn, student_id, None, None)?.into_iter().filter(|i| i.completed > 0).collect();
+    items.sort_by(|a, b| b.last_at.cmp(&a.last_at).then_with(|| a.course_id.cmp(&b.course_id)));
+    Ok(items
+        .into_iter()
+        .take(20)
+        .map(|i| ProgressItem { course_id: i.course_id, title: i.title, subject_id: i.subject_id, subject_name: i.subject_name, total: i.total, completed: i.completed, percent: i.percent, next_lesson_id: i.next_lesson_id })
+        .collect())
 }
 
 pub async fn my_progress_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res<Json<Vec<ProgressItem>>> {
@@ -653,7 +678,16 @@ fn review_summary(conn: &Connection, viewer: &User, target_type: &str, target_id
         .map_err(db_err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
-    let mine = items.iter().find(|r| r.mine).cloned();
+    // The viewer's own review is looked up directly: it is shown whatever its position among the newest 30.
+    let mine = conn
+        .query_row(
+            "SELECT r.id, r.rating, r.comment, u.full_name, r.created_at FROM reviews r JOIN users u ON u.id = r.student_id
+             WHERE r.student_id = ?1 AND r.target_type = ?2 AND r.target_id = ?3",
+            params![viewer.id, target_type, target_id],
+            |r| Ok(Review { id: r.get(0)?, rating: r.get(1)?, comment: r.get(2)?, student_name: first_name(&r.get::<_, String>(3)?), mine: true, created_at: r.get(4)? }),
+        )
+        .optional()
+        .map_err(db_err)?;
     let eligible = viewer.role == "student" && can_review(conn, &viewer.id, target_type, target_id)?;
     Ok(ReviewSummary { average: (average.unwrap_or(0.0) * 10.0).round() / 10.0, count, can_review: eligible, mine, items })
 }
@@ -1118,5 +1152,135 @@ mod tests {
         let d: String = w2.conn.query_row("SELECT data FROM notifications WHERE kind = 'new_review'", [], |r| r.get(0)).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&d).unwrap()["comment"].as_str(), Some("جيدة"));
         assert_eq!(w2.conn.query_row::<i64, _, _>("SELECT count(*) FROM notifications WHERE kind = 'new_review'", [], |r| r.get(0)).unwrap(), 1);
+    }
+}
+
+/// Phase 4-2: the student's own review is looked up directly, the progress list shares the learning rows, and the new
+/// notification kinds belong to a group.
+#[cfg(test)]
+mod phase_4_2_tests {
+    use super::*;
+    use crate::platform::{create_test_db, insert_test_user};
+
+    struct W {
+        conn: Connection,
+        me: User,
+        admin: User,
+        teacher: User,
+    }
+
+    fn world() -> W {
+        let conn = create_test_db();
+        conn.execute_batch(
+            "INSERT INTO institutions(id,type,name_ar,is_active,created_at) VALUES ('i1','university','ج',1,0);
+             INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES ('s1','i1','برمجة',1,0);",
+        )
+        .unwrap();
+        let teacher = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        let me = insert_test_user(&conn, "me@x.com", "student", "active");
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        conn.execute("INSERT INTO teacher_subjects(teacher_id,subject_id,status,created_at,decided_at) VALUES (?1,'s1','approved',0,0)", params![teacher.id]).unwrap();
+        conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![me.id]).unwrap();
+        conn.execute("INSERT INTO courses(id,teacher_id,subject_id,title,status,created_at,updated_at) VALUES ('c1',?1,'s1','دورة','published',0,0)", params![teacher.id]).unwrap();
+        W { conn, me, admin, teacher }
+    }
+
+    fn student_review(w: &W, n: usize, rating: i64, at: i64) -> User {
+        let u = insert_test_user(&w.conn, &format!("r{n}@x.com"), "student", "active");
+        w.conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![u.id]).unwrap();
+        w.conn
+            .execute("INSERT INTO reviews(id,student_id,target_type,target_id,rating,comment,created_at,updated_at) VALUES (?1,?2,'course','c1',?3,'تعليق',?4,?4)", params![format!("rv{n}"), u.id, rating, at])
+            .unwrap();
+        u
+    }
+
+    #[test]
+    fn the_viewers_own_review_is_found_even_when_it_is_not_among_the_newest_thirty() {
+        let w = world();
+        // mine is the OLDEST of 36; the list shows the newest 30
+        w.conn
+            .execute("INSERT INTO reviews(id,student_id,target_type,target_id,rating,comment,created_at,updated_at) VALUES ('mine',?1,'course','c1',2,'رأيي',1,1)", params![w.me.id])
+            .unwrap();
+        for n in 0..35 {
+            student_review(&w, n, 5, 100 + n as i64);
+        }
+        let s = review_summary(&w.conn, &w.me, "course", "c1").unwrap();
+        assert_eq!(s.items.len(), 30, "the list is the newest 30");
+        assert!(!s.items.iter().any(|r| r.id == "mine"), "mine is not in it");
+        let mine = s.mine.expect("the student's own review");
+        assert_eq!((mine.id.as_str(), mine.rating, mine.comment.as_deref(), mine.mine), ("mine", 2, Some("رأيي"), true));
+        assert_eq!((s.count, s.average), (36, (((35.0 * 5.0 + 2.0) / 36.0) * 10.0f64).round() / 10.0));
+        assert!(s.can_review);
+        // nobody else gets it
+        let other = student_review(&w, 99, 4, 500);
+        let theirs = review_summary(&w.conn, &other, "course", "c1").unwrap().mine.unwrap();
+        assert_eq!((theirs.id.as_str(), theirs.rating), ("rv99", 4));
+        // staff and a student without a review have none
+        for who in [&w.admin, &w.teacher] {
+            assert!(review_summary(&w.conn, who, "course", "c1").unwrap().mine.is_none());
+        }
+        let nobody = insert_test_user(&w.conn, "none@x.com", "student", "active");
+        assert!(review_summary(&w.conn, &nobody, "course", "c1").unwrap().mine.is_none());
+        // and it is still the same row when it is among the newest
+        w.conn.execute("UPDATE reviews SET created_at = 9999, updated_at = 9999 WHERE id = 'mine'", []).unwrap();
+        let s = review_summary(&w.conn, &w.me, "course", "c1").unwrap();
+        assert!(s.items.iter().any(|r| r.id == "mine" && r.mine) && s.mine.unwrap().id == "mine");
+    }
+
+    #[test]
+    fn the_progress_list_carries_the_subject_the_percent_and_the_next_lesson() {
+        let w = world();
+        for (n, id) in ["a", "b", "c"].iter().enumerate() {
+            w.conn.execute("INSERT INTO lessons(id,course_id,position,title,video_url,video_kind,created_at) VALUES (?1,'c1',?2,?1,'https://x.example/v','link',?2)", params![id, n as i64 + 1]).unwrap();
+        }
+        assert!(my_progress(&w.conn, &w.me.id).unwrap().is_empty(), "a course not started is not 'progress'");
+        set_complete(&w.conn, &w.me, "a", true).unwrap();
+        set_complete(&w.conn, &w.me, "c", true).unwrap();
+        let items = my_progress(&w.conn, &w.me.id).unwrap();
+        let v = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "course_id": "c1", "title": "دورة", "subject_id": "s1", "subject_name": "برمجة", "total": 3, "completed": 2, "percent": 66.67, "next_lesson_id": "b" })
+        );
+        set_complete(&w.conn, &w.me, "b", true).unwrap();
+        let v = serde_json::to_value(&my_progress(&w.conn, &w.me.id).unwrap()[0]).unwrap();
+        assert_eq!((v["percent"].clone(), v["next_lesson_id"].clone()), (serde_json::json!(100.0), serde_json::Value::Null), "a finished course is still listed");
+        // it follows the one visibility rule
+        w.conn.execute("UPDATE courses SET status = 'draft'", []).unwrap();
+        assert!(my_progress(&w.conn, &w.me.id).unwrap().is_empty());
+    }
+
+    fn put(w: &W, kind: &str, at: i64) {
+        w.conn.execute("INSERT INTO notifications(id,user_id,kind,data,created_at) VALUES (?1,?2,?3,'{}',?4)", params![format!("n-{kind}"), w.me.id, kind, at]).unwrap();
+    }
+
+    fn group(w: &W, name: &str) -> Vec<String> {
+        let q = NotifQuery { group: Some(name.into()), limit: Some(50), ..Default::default() };
+        let mut v: Vec<String> = list_notifications(&w.conn, &w.me.id, &q).unwrap().items.into_iter().map(|n| n.kind).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn the_new_notification_kinds_belong_to_the_right_chips() {
+        let w = world();
+        for (i, kind) in ["new_lesson", "live_soon", "exam_opened", "live_scheduled", "exam_closing", "new_enrollment", "teaching_approved"].iter().enumerate() {
+            put(&w, kind, i as i64 + 1);
+        }
+        assert_eq!(group(&w, "content"), ["live_scheduled", "live_soon", "new_lesson"]);
+        assert_eq!(group(&w, "exams"), ["exam_closing", "exam_opened"]);
+        assert_eq!(group(&w, "people"), ["new_enrollment"]);
+        assert_eq!(group(&w, "account"), ["teaching_approved"]);
+    }
+
+    #[test]
+    fn a_new_lesson_for_a_course_that_does_not_exist_is_a_no_op() {
+        let w = world();
+        tell_new_lesson(&w.conn, "nope", "درس", 5).unwrap();
+        let n: i64 = w.conn.query_row("SELECT count(*) FROM notifications", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+        tell_new_lesson(&w.conn, "c1", "درس", 5).unwrap();
+        let (kind, link): (String, String) = w.conn.query_row("SELECT kind, link FROM notifications WHERE user_id = ?1", params![w.me.id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((kind.as_str(), link.as_str()), ("new_lesson", "/platform/courses/c1"));
     }
 }

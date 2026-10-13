@@ -39,6 +39,9 @@ export interface TeacherCard {
   bio: string | null
   subject_count: number
 }
+/** A row of the teachers directory (`following` is true only for a student who follows the teacher). */
+export interface DirectoryTeacher extends TeacherCard { following: boolean }
+export interface TeacherDirectoryQuery { q?: string; subject_id?: string; limit?: number; offset?: number }
 export interface TeacherPage {
   id: string
   full_name: string
@@ -107,6 +110,16 @@ export const enroll = (subject_id: string) => platformFetch<void>('/enrollments'
 export const unenroll = (subject_id: string) => platformFetch<void>(`/enrollments/${subject_id}`, { method: 'DELETE' })
 
 export const listTeachers = (q?: string) => platformFetch<TeacherCard[]>(`/teachers${q ? `?q=${encodeURIComponent(q)}` : ''}`)
+/** Paged, searchable, optionally narrowed to one subject; ordered by name. */
+export function teachersDirectory(f: TeacherDirectoryQuery = {}): Promise<{ items: DirectoryTeacher[]; total: number }> {
+  const p = new URLSearchParams()
+  if (f.q) p.set('q', f.q)
+  if (f.subject_id) p.set('subject_id', f.subject_id)
+  if (f.limit !== undefined) p.set('limit', String(f.limit))
+  if (f.offset) p.set('offset', String(f.offset))
+  const qs = p.toString()
+  return platformFetch(`/teachers/directory${qs ? `?${qs}` : ''}`)
+}
 export const getTeacher = (id: string) => platformFetch<TeacherPage>(`/teachers/${id}`)
 export const follow = (id: string) => platformFetch<void>(`/teachers/${id}/follow`, { method: 'POST', body: {} })
 export const unfollow = (id: string) => platformFetch<void>(`/teachers/${id}/follow`, { method: 'DELETE' })

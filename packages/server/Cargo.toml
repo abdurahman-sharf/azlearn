@@ -11,7 +11,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
 tempfile = "3"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "functions"] }
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"

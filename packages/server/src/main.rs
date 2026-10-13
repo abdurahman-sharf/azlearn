@@ -6,6 +6,7 @@ mod platform_admin;
 mod platform_ai;
 mod platform_backup;
 mod platform_bank;
+mod platform_bookmarks;
 mod platform_exam_admin;
 mod platform_exam_key;
 mod platform_exam_teacher;
@@ -16,9 +17,11 @@ mod platform_exams;
 mod platform_ops;
 mod platform_public;
 mod platform_reminders;
+mod platform_search;
 mod platform_settings;
 mod platform_stats;
 mod platform_student;
+mod platform_student_learning;
 mod platform_learning;
 mod platform_teacher;
 mod relay;
@@ -119,6 +122,7 @@ async fn main() {
     println!("Signed-in API budget: {} requests/minute per session (PLATFORM_TOKEN_RPM, 0 = off)", token_limiter.per_minute());
     println!("Client address: trusted proxy hops = {}", proxy.describe());
     println!("Sign-in limits: {}", state.platform.limits.describe());
+    println!("Reports: {}", state.platform.report_limits.describe());
 
     let static_dir =
         std::env::var("STATIC_DIR").unwrap_or_else(|_| "../frontend/dist".to_string());
@@ -176,6 +180,8 @@ async fn main() {
         .route("/api/platform/enrollments", get(platform_learning::my_enrollments_handler).post(platform_learning::enroll_handler))
         .route("/api/platform/enrollments/{subject_id}", delete(platform_learning::unenroll_handler))
         .route("/api/platform/teachers", get(platform_learning::list_teachers_handler))
+        // the paged directory and the following list (phase 4-2); `/teachers/directory` is a static segment next to `{id}`
+        .merge(platform_learning::directory_routes())
         .route("/api/platform/teachers/{id}", get(platform_learning::teacher_page_handler))
         .route("/api/platform/teachers/{id}/follow", post(platform_learning::follow_handler).delete(platform_learning::unfollow_handler))
         .route("/api/platform/subjects/{id}", get(platform_learning::subject_page_handler))
@@ -244,7 +250,8 @@ async fn main() {
         .route("/api/platform/admin/backups/{id}", get(platform_backup::download_handler))
         .route("/api/platform/admin/system", get(platform_backup::system_handler))
         .route("/api/platform/admin/audit", get(platform_ops::audit_handler))
-        .route("/api/platform/search", get(platform_ops::search_handler))
+        // unified search over six groups (phase 4-2)
+        .merge(platform_search::routes())
         .route("/api/platform/me/password", post(platform_ops::change_password_handler))
         .route("/api/platform/me/deletion-impact", get(platform_ops::deletion_impact_handler))
         .route("/api/platform/me", delete(platform_ops::delete_account_handler))
@@ -266,6 +273,9 @@ async fn main() {
         .merge(platform_exam_teacher::routes())
         // the student's screens (phase 4-1): My exams, the overview, suggested subjects and bulk enrolment
         .merge(platform_student::routes())
+        // the student's learning hub, live page schedule and calendar file, and saved items (phase 4-2)
+        .merge(platform_student_learning::routes())
+        .merge(platform_bookmarks::routes())
         .route("/api/platform/attempts/{id}/answers", axum::routing::put(platform_exams::save_handler))
         .route("/api/platform/attempts/{id}/events", post(platform_exams::event_handler))
         .route("/api/platform/grading/pending", get(platform_grading::pending_handler))

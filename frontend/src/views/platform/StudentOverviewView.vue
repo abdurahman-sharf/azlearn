@@ -7,6 +7,7 @@ import { usePt, type PlatformKey } from '@/i18n/platform'
 import { useStudentStats } from '@/lib/studentStats'
 import { feed, type Bundle } from '@/api/platformContent'
 import { fmtScore, overviewEmpty, overviewSteps, pct, showOverviewChecklist, type OverviewStep } from '@/utils/studentExams'
+import { continueLink } from '@/utils/learning'
 import ContentLists from '@/components/platform/ContentLists.vue'
 import PageLoading from '@/components/platform/PageLoading.vue'
 import PageError from '@/components/platform/PageError.vue'
@@ -147,10 +148,13 @@ const feedHasItems = computed(() => !!latest.value && (latest.value.posts.length
     </section>
 
     <section v-if="ov.courses.length" aria-labelledby="ov-courses-title" data-testid="ov-courses">
-      <h2 id="ov-courses-title" class="text-title-md font-bold mb-3">{{ pt('continueLearning') }}</h2>
+      <div class="flex items-center gap-3 mb-3">
+        <h2 id="ov-courses-title" class="text-title-md font-bold flex-1">{{ pt('continueLearning') }}</h2>
+        <router-link to="/platform/learning" class="btn-text" data-testid="ov-courses-all">{{ pt('crsAllCourses') }}</router-link>
+      </div>
       <ul class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <li v-for="c in ov.courses" :key="c.course_id">
-          <router-link :to="`/platform/courses/${c.course_id}`" class="card-filled block p-4 no-underline h-full" :data-testid="`ov-course-${c.course_id}`">
+          <router-link :to="continueLink(c)" class="card-filled block p-4 no-underline h-full" :data-testid="`ov-course-${c.course_id}`">
             <span class="block font-bold break-words" dir="auto">{{ c.title }}</span>
             <span class="block text-body-sm" style="color: rgb(var(--md-on-surface-variant))"><bdi>{{ c.subject_name }}</bdi> · <span dir="ltr" class="inline-block">{{ pct(c.percent) }}%</span></span>
             <span class="block h-1.5 rounded-full overflow-hidden mt-2" style="background-color: rgb(var(--md-surface-container-high))" aria-hidden="true">
@@ -163,7 +167,7 @@ const feedHasItems = computed(() => !!latest.value && (latest.value.posts.length
 
     <section v-if="ov.next_live" aria-labelledby="ov-live-title">
       <h2 id="ov-live-title" class="text-title-md font-bold mb-3">{{ pt('stuNextLive') }}</h2>
-      <router-link :to="`/platform/subjects/${ov.next_live.subject_id}`" class="card-filled flex items-center gap-3 p-4 no-underline" data-testid="ov-next-live">
+      <router-link :to="`/platform/live/${ov.next_live.id}`" class="card-filled flex items-center gap-3 p-4 no-underline" data-testid="ov-next-live">
         <VideoCameraIcon class="w-6 h-6 shrink-0" style="color: rgb(var(--md-primary))" aria-hidden="true" />
         <span class="flex-1 min-w-0">
           <span class="block font-bold break-words" dir="auto">{{ ov.next_live.title }}</span>

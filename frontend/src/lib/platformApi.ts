@@ -72,3 +72,27 @@ export async function platformFetch<T>(path: string, init: { method?: string; bo
   if (!res.ok) throw new PlatformError((data as { error?: string }).error ?? 'unknown', res.status, data as Record<string, unknown>)
   return data as T
 }
+
+/**
+ * Fetches a file (not JSON) from the platform API with the session token - a plain link cannot send the Bearer header.
+ * Errors and a lost session are handled exactly like `platformFetch`.
+ */
+export async function platformBlob(path: string): Promise<Blob> {
+  const token = getToken()
+  let res: Response
+  try {
+    res = await fetch(`${base}/api/platform${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+  } catch {
+    throw new PlatformError('network', 0)
+  }
+  if (res.ok) return res.blob()
+  const data = (await res.json().catch(() => ({}))) as Record<string, unknown>
+  if (res.status === 401 && token) {
+    if (getToken() === token) {
+      setToken(null)
+      onUnauthorized?.()
+    }
+    throw new PlatformError('unauthorized', 401, data)
+  }
+  throw new PlatformError((data as { error?: string }).error ?? 'unknown', res.status, data)
+}

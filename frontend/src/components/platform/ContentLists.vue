@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { LockClosedIcon } from '@heroicons/vue/24/outline'
+import { useAuthStore } from '@/stores/auth'
 import { useI18nStore } from '@/stores/i18n'
 import { usePt, type PlatformKey } from '@/i18n/platform'
 import type { Bundle } from '@/api/platformContent'
@@ -23,6 +25,10 @@ const props = defineProps<{
 const emit = defineEmits<{ duplicate: [kind: 'post' | 'course', id: string, title: string] }>()
 const pt = usePt()
 const i18n = useI18nStore()
+const auth = useAuthStore()
+const isStudent = computed(() => auth.role === 'student')
+/** The join link is withheld (the server sends `locked` and an empty link): the lists then say so instead of offering a dead button. */
+const linkLocked = (l: { locked?: boolean; join_url: string }) => !!l.locked || !l.join_url
 
 const fmt = (ms: number) => new Date(ms).toLocaleString(i18n.locale === 'ar' ? 'ar' : undefined, { dateStyle: 'medium', timeStyle: 'short' })
 const statusKey: Record<string, PlatformKey> = { draft: 'statusDraft', published: 'statusPublished' }
@@ -48,8 +54,12 @@ const empty = computed(() => !props.bundle.posts.length && !props.bundle.courses
             <span v-else-if="l.status === 'cancelled'" class="text-xs font-semibold px-2 py-0.5 rounded-full" style="background-color: rgb(var(--md-surface-container-high))">{{ pt('cancelled') }}</span>
           </div>
           <HiddenWhy v-if="own && l.status === 'scheduled' && !l.ended" :reason="l.hidden_reason" class="mt-1" />
+          <p v-if="!own && l.status === 'scheduled' && !l.ended && linkLocked(l)" class="text-body-sm mt-2 flex items-start gap-1 font-semibold" :data-testid="`content-live-locked-${l.id}`">
+            <LockClosedIcon class="w-4 h-4 shrink-0 mt-0.5" aria-hidden="true" /><span>{{ pt('lvLocked') }}<template v-if="isStudent"> · <span class="font-normal">{{ pt('lvLockedWhy') }}</span></template></span>
+          </p>
           <div class="flex flex-wrap gap-2 mt-2">
-            <a v-if="l.status === 'scheduled' && !l.ended" :href="l.join_url" target="_blank" rel="noopener noreferrer" class="btn-tonal" :aria-label="`${pt('join')}: ${l.title}`" :data-testid="`content-join-${l.id}`">{{ pt('join') }}</a>
+            <a v-if="l.status === 'scheduled' && !l.ended && (own || !linkLocked(l))" :href="l.join_url" target="_blank" rel="noopener noreferrer" class="btn-tonal" :aria-label="`${pt('join')}: ${l.title}`" :data-testid="`content-join-${l.id}`">{{ pt('join') }}</a>
+            <router-link v-if="!own && isStudent && l.status === 'scheduled'" :to="`/platform/live/${l.id}`" class="btn-text" :aria-label="`${pt('schDetails')}: ${l.title}`" :data-testid="`content-live-details-${l.id}`">{{ pt('schDetails') }}</router-link>
             <router-link v-if="showEdit" :to="`/platform/live/${l.id}/edit`" class="btn-text" :aria-label="`${pt('edit')}: ${l.title}`">{{ pt('edit') }}</router-link>
           </div>
         </li>

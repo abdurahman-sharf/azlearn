@@ -3,6 +3,7 @@ import { useAuthStore } from '@/stores/auth'
 import { resetAdminStats } from '@/lib/adminStats'
 import { resetTeacherStats } from '@/lib/teacherStats'
 import { resetStudentStats } from '@/lib/studentStats'
+import { resetBookmarks } from '@/lib/bookmarks'
 import { removeAttemptDrafts } from '@/utils/attemptDrafts'
 import { askClearLocalBanks } from '@/composables/signOutBank'
 import { hasLocalQuestions, LOCAL_QUESTION_CLEAR_KEYS } from '@/utils/localBanks'
@@ -48,6 +49,7 @@ export function useSignOut() {
     resetAdminStats()
     resetTeacherStats()
     resetStudentStats()
+    resetBookmarks()
     try { localStorage.removeItem('exameow-admin-subject') } catch { /* storage unavailable */ }
     try { removeAttemptDrafts(localStorage) } catch { /* storage unavailable */ }
     if (clear) await clearLocalQuestions().catch(() => { /* the keys are already gone; a store that cannot be reset is not worth blocking sign-out */ })

@@ -626,7 +626,7 @@ pub struct StudentOverview {
 pub(crate) const CLOSING_SOON_MS: i64 = 48 * 3_600_000;
 pub(crate) const CLOSING_SOON_MAX: usize = 5;
 const RECENT_RESULTS: i64 = 3;
-const COURSE_CARDS: i64 = 4;
+const COURSE_CARDS: usize = 4;
 
 fn count(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Res<i64> {
     conn.query_row(sql, p, |r| r.get(0)).map_err(db_err)
@@ -702,38 +702,18 @@ pub(crate) fn student_overview(conn: &Connection, student: &User, now: i64) -> R
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
 
-    // courses the student can still open (the same rule as `platform_engage::my_progress`: published and shown, in an
-    // enrolled subject), started and not finished
-    let courses = conn
-        .prepare(&format!(
-            "SELECT c.id, c.title, s.name_ar,
-                    (SELECT count(*) FROM lessons l WHERE l.course_id = c.id) AS total,
-                    (SELECT count(*) FROM lesson_progress p JOIN lessons l ON l.id = p.lesson_id WHERE l.course_id = c.id AND p.student_id = ?1) AS done,
-                    (SELECT max(p.completed_at) FROM lesson_progress p JOIN lessons l ON l.id = p.lesson_id WHERE l.course_id = c.id AND p.student_id = ?1) AS last,
-                    (SELECT l.id FROM lessons l WHERE l.course_id = c.id
-                       AND NOT EXISTS(SELECT 1 FROM lesson_progress p WHERE p.lesson_id = l.id AND p.student_id = ?1)
-                     ORDER BY l.position, l.created_at, l.id LIMIT 1)
-             FROM courses c JOIN subjects s ON s.id = c.subject_id JOIN users u ON u.id = c.teacher_id
-             WHERE {}
-               AND EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?1 AND e.subject_id = c.subject_id)
-               AND last IS NOT NULL AND done < total
-             ORDER BY last DESC, c.id LIMIT ?2",
-            visible("c", "published")
-        ))
-        .map_err(db_err)?
-        .query_map(params![id, COURSE_CARDS], |r| {
-            let (total, done): (i64, i64) = (r.get(3)?, r.get(4)?);
-            Ok(CourseCard {
-                course_id: r.get(0)?,
-                title: r.get(1)?,
-                subject_name: r.get(2)?,
-                percent: if total > 0 { round2(done as f64 / total as f64 * 100.0) } else { 0.0 },
-                next_lesson_id: r.get(6)?,
-            })
-        })
-        .map_err(db_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_err)?;
+    // courses the student can still open and has started but not finished, newest activity first: the same rows, and the same
+    // percent / next lesson, as the learning hub and `GET /my/progress` (`platform_student_learning::learning_items`)
+    let mut started: Vec<_> = crate::platform_student_learning::learning_items(conn, id, None, None)?
+        .into_iter()
+        .filter(|c| c.state == crate::platform_student_learning::LearningState::InProgress)
+        .collect();
+    started.sort_by(|a, b| b.last_at.cmp(&a.last_at).then_with(|| a.course_id.cmp(&b.course_id)));
+    let courses = started
+        .into_iter()
+        .take(COURSE_CARDS)
+        .map(|c| CourseCard { course_id: c.course_id, title: c.title, subject_name: c.subject_name, percent: c.percent, next_lesson_id: c.next_lesson_id })
+        .collect();
 
     let next_live = conn
         .query_row(

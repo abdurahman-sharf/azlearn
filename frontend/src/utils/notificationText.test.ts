@@ -28,6 +28,10 @@ const templates: Record<string, string> = {
   n_live_updated: '{teacher} changed {title}, now {starts_at}.',
   n_content_auto_hidden: '{title} was hidden automatically.',
   n_feedback_added: 'Feedback on {title}.',
+  n_new_lesson: 'New lesson in {course}: {title}',
+  n_new_lesson_many: '{count} new lessons in {course}, latest: {title}',
+  n_live_soon: '{title} ({subject}) with {teacher} starts {starts_at}.',
+  n_exam_opened: '{title} is open.',
 }
 const lookup = (k: string): string => templates[k] ?? ''
 
@@ -101,6 +105,16 @@ eq(renderNotification(lookup, 'new_review', { rating: 2, title: '', comment: 'Sl
 eq(renderNotification(lookup, 'live_updated', { title: 'Lab', teacher: 'Sara', starts_at: 5 }, (ms) => `T${ms}`), 'Sara changed Lab, now T5.', 'live update formats the time')
 eq(renderNotification(lookup, 'content_auto_hidden', { title: 'Post' }), 'Post was hidden automatically.', 'auto hidden')
 eq(renderNotification(lookup, 'feedback_added', { title: 'Quiz' }), 'Feedback on Quiz.', 'feedback added')
+
+// --- phase 4-2 kinds: new lessons are folded per course; the live reminder and the opened exam are one-offs ------------------------------
+eq(notificationKey('new_lesson', { course: 'Algebra', count: 1 }), 'n_new_lesson', 'one new lesson')
+eq(notificationKey('new_lesson', { course: 'Algebra', count: 3 }), 'n_new_lesson_many', 'several new lessons');
+eq(renderNotification(lookup, 'new_lesson', { course: 'Algebra', subject: 'Math', title: 'Limits', count: 1 }), 'New lesson in Algebra: Limits', 'singular lesson')
+eq(renderNotification(lookup, 'new_lesson', { course: 'Algebra', subject: 'Math', title: 'Limits', count: 4 }), '4 new lessons in Algebra, latest: Limits', 'plural lesson')
+eq(renderNotification(lookup, 'new_lesson', { course: "A$& {title}", title: "L$'", count: 2 }), "2 new lessons in A$& {title}, latest: L$'", 'course and lesson titles are data')
+eq(renderNotification((k) => (k === 'n_new_lesson' ? 'lesson {title}' : ''), 'new_lesson', { title: 'T', count: 9 }), 'lesson T', 'a language without the plural wording falls back to the singular one')
+eq(renderNotification(lookup, 'live_soon', { title: 'Lab', teacher: 'Sara', subject: 'Physics', starts_at: 7 }, (ms) => `T${ms}`), 'Lab (Physics) with Sara starts T7.', 'live reminder formats the start')
+eq(renderNotification(lookup, 'exam_opened', { title: 'Midterm', opens_at: 1 }), 'Midterm is open.', 'exam opened')
 
 // --- fillTemplate on its own ---------------------------------------------------------------------------------------------------------------
 eq(fillTemplate('{a}-{b}-{c}', { a: 1, b: 'x', c: null }), '1-x-', 'null prints nothing')

@@ -1,7 +1,7 @@
 //! Teaching assignments (teacher <-> subject, admin-approved), student placement and
 //! enrollment, following teachers, public teacher/subject pages.
 
-use crate::platform::{audit, authenticate, bad, db_err, like_pattern, lock, opt_text, require_active, require_admin, require_role, Res, User, INSTITUTION_ACTIVE, SUBJECT_ACTIVE};
+use crate::platform::{audit, authenticate, bad, db_err, fold_like, like_pattern, lock, opt_text, require_active, require_admin, require_role, Res, User, INSTITUTION_ACTIVE, SUBJECT_ACTIVE};
 use crate::relay::{err, now_ms};
 use crate::routes::AppState;
 use axum::{
@@ -992,12 +992,23 @@ pub struct TeacherQuery {
     subject_id: Option<String>,
 }
 
+/// `AND <the subject and its institution are switched on>` for a query over `teacher_subjects t JOIN subjects s`: the
+/// subjects students can reach. **The one definition of "reachable"** for the teacher lists, the directory and the
+/// following list; empty for an admin looking at everything.
+fn reachable_clause(only_active: bool) -> String {
+    if only_active {
+        format!("AND {SUBJECT_ACTIVE} AND {INSTITUTION_ACTIVE}")
+    } else {
+        String::new()
+    }
+}
+
 /// Teachers for the public directory. `only_active`: count and match only the approved subjects students can reach
 /// (the subject AND its institution switched on); an admin looking at a hidden subject passes `false` to see who is
 /// attached to it.
 fn list_teachers_in(conn: &Connection, q: &TeacherQuery, only_active: bool) -> Res<Vec<TeacherCard>> {
     let like = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(like_pattern);
-    let reachable = if only_active { format!("AND {SUBJECT_ACTIVE} AND {INSTITUTION_ACTIVE}") } else { String::new() };
+    let reachable = reachable_clause(only_active);
     conn.prepare(&format!(
         "SELECT u.id, u.full_name, u.bio,
                 (SELECT count(*) FROM teacher_subjects t JOIN subjects s ON s.id = t.subject_id
@@ -1029,6 +1040,137 @@ pub async fn list_teachers_handler(
 ) -> Res<Json<Vec<TeacherCard>>> {
     require_active(&state, &headers)?;
     list_teachers(&*lock(&state)?, &q).map(Json)
+}
+
+// ───────── the teachers directory, and the teachers a student follows (phase 4-2) ─────────
+
+/// A teacher of the paged directory (`GET /teachers/directory`).
+#[derive(Serialize, Debug, PartialEq)]
+pub struct DirectoryTeacher {
+    id: String,
+    full_name: String,
+    bio: Option<String>,
+    /// Approved subjects students can reach (subject AND institution on), like [`TeacherCard`].
+    subject_count: i64,
+    /// Only ever `true` for a student who follows the teacher; `false` for everyone else.
+    following: bool,
+}
+
+#[derive(Serialize, Debug)]
+pub struct DirectoryPage {
+    items: Vec<DirectoryTeacher>,
+    total: i64,
+}
+
+/// `GET /teachers/directory` query. Blank values count as absent.
+#[derive(Deserialize, Default, Debug)]
+pub struct DirectoryQuery {
+    /// Name search (Arabic-folded, case-insensitive; `%`, `_` and `\` are literal).
+    pub q: Option<String>,
+    pub subject_id: Option<String>,
+    /// Default 24, at most 60.
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+const DIRECTORY_DEFAULT_LIMIT: i64 = 24;
+const DIRECTORY_MAX_LIMIT: i64 = 60;
+const DIRECTORY_MAX_SEARCH_CHARS: usize = 100;
+
+/// The teachers a viewer can browse, by name then id, paged. Same reachability as [`list_teachers_in`] (active teacher
+/// accounts; the subject count and the subject filter see only subjects students can reach). `following` reads the VIEWER's
+/// follows and only for a student.
+pub(crate) fn teachers_directory(conn: &Connection, viewer: &User, q: &DirectoryQuery) -> Res<DirectoryPage> {
+    let clean = |o: &Option<String>| o.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let like = clean(&q.q).map(|s| fold_like(&s.chars().take(DIRECTORY_MAX_SEARCH_CHARS).collect::<String>()));
+    let subject = clean(&q.subject_id);
+    let student: Option<&str> = (viewer.role == "student").then_some(viewer.id.as_str());
+    let reachable = reachable_clause(true);
+    let filter = format!(
+        "u.role = 'teacher' AND u.status = 'active'
+           AND (?1 IS NULL OR ar_fold(u.full_name) LIKE ?1 ESCAPE '\\')
+           AND (?2 IS NULL OR EXISTS(SELECT 1 FROM teacher_subjects t JOIN subjects s ON s.id = t.subject_id
+                                      WHERE t.teacher_id = u.id AND t.subject_id = ?2 AND t.status = 'approved' {reachable}))"
+    );
+    let total: i64 = conn.query_row(&format!("SELECT count(*) FROM users u WHERE {filter}"), params![like, subject], |r| r.get(0)).map_err(db_err)?;
+    let limit = q.limit.unwrap_or(DIRECTORY_DEFAULT_LIMIT).clamp(1, DIRECTORY_MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let items = conn
+        .prepare(&format!(
+            "SELECT u.id, u.full_name, u.bio,
+                    (SELECT count(*) FROM teacher_subjects t JOIN subjects s ON s.id = t.subject_id
+                      WHERE t.teacher_id = u.id AND t.status = 'approved' {reachable}),
+                    (?3 IS NOT NULL AND EXISTS(SELECT 1 FROM teacher_follows f WHERE f.teacher_id = u.id AND f.student_id = ?3))
+             FROM users u WHERE {filter}
+             ORDER BY u.full_name, u.id LIMIT ?4 OFFSET ?5"
+        ))
+        .map_err(db_err)?
+        .query_map(params![like, subject, student, limit, offset], |r| {
+            Ok(DirectoryTeacher { id: r.get(0)?, full_name: r.get(1)?, bio: r.get(2)?, subject_count: r.get(3)?, following: r.get(4)? })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(DirectoryPage { items, total })
+}
+
+pub async fn teachers_directory_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<DirectoryQuery>) -> Res<Json<DirectoryPage>> {
+    let viewer = require_active(&state, &headers)?;
+    teachers_directory(&*lock(&state)?, &viewer, &q).map(Json)
+}
+
+/// A teacher the student follows.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct FollowedTeacher {
+    id: String,
+    full_name: String,
+    bio: Option<String>,
+    subject_count: i64,
+    followed_at: i64,
+}
+
+#[derive(Serialize, Debug)]
+pub struct FollowingList {
+    items: Vec<FollowedTeacher>,
+}
+
+/// At most this many followed teachers are listed (a student follows a handful).
+const FOLLOWING_LIMIT: i64 = 500;
+
+/// The teachers `student_id` follows, newest follow first - only those who are still active teachers. Only the caller's rows.
+pub(crate) fn my_following(conn: &Connection, student_id: &str) -> Res<FollowingList> {
+    let reachable = reachable_clause(true);
+    let items = conn
+        .prepare(&format!(
+            "SELECT u.id, u.full_name, u.bio,
+                    (SELECT count(*) FROM teacher_subjects t JOIN subjects s ON s.id = t.subject_id
+                      WHERE t.teacher_id = u.id AND t.status = 'approved' {reachable}),
+                    f.created_at
+             FROM teacher_follows f JOIN users u ON u.id = f.teacher_id
+             WHERE f.student_id = ?1 AND u.role = 'teacher' AND u.status = 'active'
+             ORDER BY f.created_at DESC, u.id LIMIT ?2"
+        ))
+        .map_err(db_err)?
+        .query_map(params![student_id, FOLLOWING_LIMIT], |r| {
+            Ok(FollowedTeacher { id: r.get(0)?, full_name: r.get(1)?, bio: r.get(2)?, subject_count: r.get(3)?, followed_at: r.get(4)? })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(FollowingList { items })
+}
+
+pub async fn my_following_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res<Json<FollowingList>> {
+    let student = require_role(&state, &headers, "student")?;
+    my_following(&*lock(&state)?, &student.id).map(Json)
+}
+
+/// The directory and the following list (merged into the app in `main.rs`). `/teachers/directory` is a static segment next
+/// to `/teachers/{id}`: the static one wins, so "directory" is never taken for a teacher id.
+pub fn directory_routes() -> axum::Router<Arc<AppState>> {
+    axum::Router::new()
+        .route("/api/platform/teachers/directory", axum::routing::get(teachers_directory_handler))
+        .route("/api/platform/my/following", axum::routing::get(my_following_handler))
 }
 
 #[derive(Serialize, Debug)]
@@ -2347,5 +2489,233 @@ mod tests {
         assert!(enrolments(&conn, &s).is_empty(), "rolled back");
         conn.execute_batch("DROP TRIGGER boom;").unwrap();
         assert_eq!(bulk_enroll(&conn, &s, &["sL1".into(), "sD".into(), "sT1".into()], 6).unwrap(), BulkEnrollRes { enrolled: 3, skipped: 0 });
+    }
+}
+
+/// Phase 4-2: the paged teachers directory and the list of the teachers a student follows.
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+    use crate::platform::{create_test_db, insert_test_user};
+
+    struct W {
+        conn: Connection,
+        me: User,
+        other: User,
+        teacher_viewer: User,
+        admin: User,
+        ali: User,
+        bob: User,
+    }
+
+    fn teacher(conn: &Connection, email: &str, name: &str, status: &str) -> User {
+        let u = insert_test_user(conn, email, "teacher", status);
+        conn.execute("UPDATE users SET full_name = ?2, bio = ?3 WHERE id = ?1", params![u.id, name, format!("نبذة {name}")]).unwrap();
+        User { full_name: name.into(), ..u }
+    }
+
+    fn approve(conn: &Connection, t: &User, subject: &str, status: &str) {
+        conn.execute("INSERT INTO teacher_subjects(teacher_id,subject_id,status,created_at,decided_at) VALUES (?1,?2,?3,0,0)", params![t.id, subject, status]).unwrap();
+    }
+
+    fn follow_at(conn: &Connection, s: &User, t: &User, at: i64) {
+        conn.execute("INSERT INTO teacher_follows(student_id,teacher_id,created_at) VALUES (?1,?2,?3)", params![s.id, t.id, at]).unwrap();
+    }
+
+    fn world() -> W {
+        let conn = create_test_db();
+        conn.execute_batch(
+            "INSERT INTO institutions(id,type,name_ar,is_active,created_at) VALUES ('i1','university','جامعة',1,0), ('i2','school','مدرسة مغلقة',0,0);
+             INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES ('s1','i1','برمجة',1,0), ('s2','i1','رياضيات',1,0), ('s3','i1','مغلقة',0,0), ('s4','i2','في مؤسسة مغلقة',1,0);",
+        )
+        .unwrap();
+        let me = insert_test_user(&conn, "me@x.com", "student", "active");
+        let other = insert_test_user(&conn, "o@x.com", "student", "active");
+        let teacher_viewer = teacher(&conn, "tv@x.com", "ياسر المشاهد", "active");
+        let admin = insert_test_user(&conn, "adm@x.com", "admin", "active");
+        let ali = teacher(&conn, "ali@x.com", "أحمد علي", "active");
+        let bob = teacher(&conn, "bob@x.com", "بسام", "active");
+        approve(&conn, &ali, "s1", "approved");
+        approve(&conn, &ali, "s2", "approved");
+        approve(&conn, &bob, "s3", "approved"); // a subject that is switched off: reachable by nobody
+        let cara = teacher(&conn, "cara@x.com", "كارا", "active");
+        approve(&conn, &cara, "s1", "pending");
+        let dan = teacher(&conn, "dan@x.com", "دانيال", "active");
+        approve(&conn, &dan, "s4", "approved");
+        let eve = teacher(&conn, "eve@x.com", "إيف المعلقة", "pending");
+        approve(&conn, &eve, "s1", "approved");
+        let fran = teacher(&conn, "fran@x.com", "فران الموقوفة", "suspended");
+        approve(&conn, &fran, "s1", "approved");
+        follow_at(&conn, &me, &ali, 100);
+        follow_at(&conn, &me, &bob, 200);
+        W { conn, me, other, teacher_viewer, admin, ali, bob }
+    }
+
+    fn dir(w: &W, who: &User, q: DirectoryQuery) -> DirectoryPage {
+        teachers_directory(&w.conn, who, &q).unwrap()
+    }
+
+    fn names(p: &DirectoryPage) -> Vec<&str> {
+        p.items.iter().map(|t| t.full_name.as_str()).collect()
+    }
+
+    fn query(q: Option<&str>, subject: Option<&str>) -> DirectoryQuery {
+        DirectoryQuery { q: q.map(String::from), subject_id: subject.map(String::from), ..Default::default() }
+    }
+
+    #[test]
+    fn the_directory_lists_active_teachers_by_name_with_their_reachable_subject_count() {
+        let w = world();
+        let p = dir(&w, &w.me, DirectoryQuery::default());
+        // active accounts only (not the pending or the suspended one); a teacher with nothing reachable is still a person
+        assert_eq!(p.total, 5, "{:?}", names(&p));
+        let mut sorted = names(&p);
+        sorted.sort();
+        assert_eq!(names(&p), sorted, "by full_name");
+        assert!(!names(&p).iter().any(|n| n.contains("المعلقة") || n.contains("الموقوفة")));
+        let count = |name: &str| p.items.iter().find(|t| t.full_name == name).map(|t| t.subject_count);
+        assert_eq!((count("أحمد علي"), count("بسام"), count("كارا"), count("دانيال")), (Some(2), Some(0), Some(0), Some(0)), "only approved subjects whose subject AND institution are on");
+        let ali = p.items.iter().find(|t| t.id == w.ali.id).unwrap();
+        assert_eq!((ali.bio.as_deref(), ali.following), (Some("نبذة أحمد علي"), true));
+        // the same people as the older, unpaged list
+        let mut old: Vec<String> = list_teachers(&w.conn, &TeacherQuery { q: None, subject_id: None }).unwrap().into_iter().map(|t| t.id).collect();
+        let mut new: Vec<String> = p.items.iter().map(|t| t.id.clone()).collect();
+        old.sort();
+        new.sort();
+        assert_eq!(new, old);
+    }
+
+    #[test]
+    fn the_following_flag_is_the_viewers_own_and_only_a_students() {
+        let w = world();
+        let flag = |who: &User, id: &str| dir(&w, who, DirectoryQuery::default()).items.into_iter().find(|t| t.id == id).unwrap().following;
+        assert_eq!((flag(&w.me, &w.ali.id), flag(&w.me, &w.bob.id)), (true, true));
+        assert!(!flag(&w.other, &w.ali.id), "another student does not follow them");
+        assert!(!flag(&w.teacher_viewer, &w.ali.id) && !flag(&w.admin, &w.ali.id), "staff never 'follow'");
+        // even when a follow row exists for a non-student viewer's id
+        follow_at(&w.conn, &w.admin, &w.ali, 1);
+        assert!(!flag(&w.admin, &w.ali.id));
+        // unfollowing flips it
+        w.conn.execute("DELETE FROM teacher_follows WHERE student_id = ?1 AND teacher_id = ?2", params![w.me.id, w.ali.id]).unwrap();
+        assert!(!flag(&w.me, &w.ali.id) && flag(&w.me, &w.bob.id));
+    }
+
+    #[test]
+    fn the_search_folds_arabic_and_treats_wildcards_literally() {
+        let w = world();
+        assert_eq!(names(&dir(&w, &w.me, query(Some("احمد"), None))), ["أحمد علي"], "no hamza in the query");
+        assert_eq!(names(&dir(&w, &w.me, query(Some("أحمد"), None))), ["أحمد علي"]);
+        assert_eq!(names(&dir(&w, &w.me, query(Some("ايف"), None))).len(), 0, "a pending account is not listed whatever the query");
+        assert_eq!(dir(&w, &w.me, query(Some("%"), None)).total, 0);
+        assert_eq!(dir(&w, &w.me, query(Some("_"), None)).total, 0);
+        assert_eq!(dir(&w, &w.me, query(Some("  "), None)).total, 5, "blank = no filter");
+        assert_eq!(dir(&w, &w.me, query(Some("لا يوجد"), None)).total, 0);
+        // a very long query is cut instead of refused
+        assert_eq!(dir(&w, &w.me, query(Some(&"ب".repeat(500)), None)).total, 0);
+        // the page and the total agree
+        let p = dir(&w, &w.me, query(Some("ب"), None));
+        assert_eq!(p.total as usize, p.items.len());
+    }
+
+    #[test]
+    fn the_subject_filter_keeps_only_teachers_approved_for_a_subject_students_can_reach() {
+        let w = world();
+        assert_eq!(names(&dir(&w, &w.me, query(None, Some("s1")))), ["أحمد علي"], "cara is only pending; eve and fran are not active teachers");
+        assert_eq!(names(&dir(&w, &w.me, query(None, Some("s2")))), ["أحمد علي"]);
+        for hidden in ["s3", "s4", "nope"] {
+            assert_eq!(dir(&w, &w.me, query(None, Some(hidden))).total, 0, "{hidden}: switched off or unknown");
+        }
+        assert_eq!(dir(&w, &w.me, query(Some("احمد"), Some("s1"))).total, 1);
+        assert_eq!(dir(&w, &w.me, query(Some("بسام"), Some("s1"))).total, 0, "both filters apply");
+        w.conn.execute("UPDATE subjects SET is_active = 0 WHERE id = 's1'", []).unwrap();
+        assert_eq!(dir(&w, &w.me, query(None, Some("s1"))).total, 0);
+        assert_eq!(dir(&w, &w.me, query(None, None)).items.iter().find(|t| t.id == w.ali.id).unwrap().subject_count, 1);
+    }
+
+    #[test]
+    fn paging_is_24_by_default_60_at_most_and_never_repeats_a_teacher() {
+        let w = world();
+        for n in 0..70 {
+            let t = teacher(&w.conn, &format!("m{n}@x.com"), &format!("معلم {n:02}"), "active");
+            approve(&w.conn, &t, "s1", "approved");
+        }
+        let first = dir(&w, &w.me, DirectoryQuery::default());
+        assert_eq!((first.items.len(), first.total), (24, 75));
+        assert_eq!(dir(&w, &w.me, DirectoryQuery { limit: Some(1000), ..Default::default() }).items.len(), 60);
+        assert_eq!(dir(&w, &w.me, DirectoryQuery { limit: Some(0), ..Default::default() }).items.len(), 1);
+        assert_eq!(dir(&w, &w.me, DirectoryQuery { limit: Some(-5), offset: Some(-5), ..Default::default() }).items.len(), 1);
+        let mut seen: Vec<String> = Vec::new();
+        for offset in (0..80).step_by(30) {
+            seen.extend(dir(&w, &w.me, DirectoryQuery { limit: Some(30), offset: Some(offset), ..Default::default() }).items.into_iter().map(|t| t.id));
+        }
+        assert_eq!(seen.len(), 75);
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 75, "no teacher twice across pages");
+        assert!(dir(&w, &w.me, DirectoryQuery { offset: Some(75), ..Default::default() }).items.is_empty());
+        // two teachers with the same name still page deterministically (by id)
+        let twin = teacher(&w.conn, "twin@x.com", "معلم 00", "active");
+        let a = dir(&w, &w.me, DirectoryQuery { q: Some("معلم 00".into()), ..Default::default() });
+        let b = dir(&w, &w.me, DirectoryQuery { q: Some("معلم 00".into()), ..Default::default() });
+        assert_eq!((a.items.iter().map(|t| t.id.clone()).collect::<Vec<_>>(), a.total), (b.items.iter().map(|t| t.id.clone()).collect::<Vec<_>>(), 2));
+        let _ = twin;
+    }
+
+    #[test]
+    fn the_following_list_has_the_students_active_teachers_newest_follow_first() {
+        let w = world();
+        let list = |who: &User| my_following(&w.conn, &who.id).unwrap().items;
+        let items = list(&w.me);
+        assert_eq!(items.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), [w.bob.id.as_str(), w.ali.id.as_str()], "newest follow first");
+        assert_eq!((items[0].followed_at, items[0].subject_count, items[1].followed_at, items[1].subject_count), (200, 0, 100, 2));
+        assert_eq!((items[1].full_name.as_str(), items[1].bio.as_deref()), ("أحمد علي", Some("نبذة أحمد علي")));
+        assert!(list(&w.other).is_empty(), "only the caller's rows");
+        // a teacher who is no longer an active teacher drops out (the row stays)
+        w.conn.execute("UPDATE users SET status = 'suspended' WHERE id = ?1", params![w.bob.id]).unwrap();
+        assert_eq!(list(&w.me).len(), 1);
+        w.conn.execute("UPDATE users SET status = 'active' WHERE id = ?1", params![w.bob.id]).unwrap();
+        assert_eq!(list(&w.me).len(), 2);
+        w.conn.execute("UPDATE users SET role = 'student' WHERE id = ?1", params![w.bob.id]).unwrap();
+        assert_eq!(list(&w.me).len(), 1);
+        // the same time: by id
+        let c = teacher(&w.conn, "c2@x.com", "جديد", "active");
+        follow_at(&w.conn, &w.me, &c, 100);
+        let order: Vec<String> = list(&w.me).into_iter().map(|t| t.id).collect();
+        let mut tie = vec![w.ali.id.clone(), c.id.clone()];
+        tie.sort();
+        assert_eq!(order, tie);
+        // the JSON shape
+        let v = serde_json::to_value(my_following(&w.conn, &w.me.id).unwrap()).unwrap();
+        let mut keys: Vec<&str> = v["items"][0].as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["bio", "followed_at", "full_name", "id", "subject_count"]);
+    }
+
+    #[test]
+    fn the_directory_json_shape_is_the_agreed_one() {
+        let w = world();
+        let v = serde_json::to_value(dir(&w, &w.me, DirectoryQuery::default())).unwrap();
+        let mut top: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        top.sort();
+        assert_eq!(top, ["items", "total"]);
+        let mut keys: Vec<&str> = v["items"][0].as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["bio", "following", "full_name", "id", "subject_count"]);
+    }
+
+    /// `main.rs` registers `/teachers`, then merges the directory, then registers `/teachers/{id}`: building a router in
+    /// that order must not panic (axum refuses overlapping routes at construction, which would be a startup crash).
+    #[test]
+    fn the_routes_can_be_registered_in_the_order_main_uses() {
+        use axum::routing::get;
+        let _router: axum::Router<Arc<AppState>> = axum::Router::new()
+            .route("/api/platform/teachers", get(list_teachers_handler))
+            .merge(directory_routes())
+            .route("/api/platform/teachers/{id}", get(teacher_page_handler))
+            .route("/api/platform/teachers/{id}/follow", axum::routing::post(follow_handler).delete(unfollow_handler))
+            .merge(crate::platform_search::routes())
+            .merge(crate::platform_bookmarks::routes())
+            .merge(crate::platform_student_learning::routes());
     }
 }

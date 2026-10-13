@@ -199,6 +199,29 @@ pub(crate) fn require_assignment(conn: &Connection, teacher_id: &str, subject_id
     }
 }
 
+/// **Who may see the links of a live session (`join_url`) and the video links of a lesson (`video_url`, `embed_url`)**
+/// (phase 4-2). Content is open to browse, but those links are for the people the class is for:
+///
+/// * the owner of the item and any admin,
+/// * a student **enrolled in the subject**,
+/// * a teacher with an **approved** assignment for the subject (a colleague who teaches the same class).
+///
+/// Everybody else (a student who has not enrolled, a teacher of another subject) still sees the item's title, time, section
+/// and description, with `locked: true` and the links emptied. **Every place that serialises a live session or a lesson for
+/// somebody other than its owner goes through this one rule** (`GET /courses/{id}`, the subject / teacher / feed bundles,
+/// `GET /live/{id}`, the schedule and the `.ics`); attachments of posts are deliberately not covered.
+pub(crate) fn can_see_links(conn: &Connection, viewer: &User, owner_id: &str, subject_id: &str) -> Res<bool> {
+    if viewer.id == owner_id {
+        return Ok(true);
+    }
+    match viewer.role.as_str() {
+        "admin" => Ok(true),
+        "student" => crate::platform_exams::is_enrolled(conn, &viewer.id, subject_id),
+        "teacher" => is_approved_for(conn, &viewer.id, subject_id),
+        _ => Ok(false),
+    }
+}
+
 // ───────── why is something hidden from students? (one table, two readers) ─────────
 
 /// Why a teacher's published item is not shown to students. The wire values are the snake_case names.
@@ -402,14 +425,23 @@ pub struct Post {
     updated_at: i64,
 }
 
-const POST_COLS: &str = "p.id, p.teacher_id, u.full_name, p.subject_id, s.name_ar, p.kind, p.title, p.body, p.status,
-        p.file_id, f.original_name, f.size, p.created_at, p.updated_at";
+/// The post columns (`map_post` reads them); `body` is the SQL expression for column 7: the whole text for one post, the
+/// first 200 characters for a list (a list only shows an excerpt, so the 20 000-character bodies are never read for it).
+fn post_cols(body: &str) -> String {
+    format!(
+        "p.id, p.teacher_id, u.full_name, p.subject_id, s.name_ar, p.kind, p.title, {body}, p.status,
+        p.file_id, f.original_name, f.size, p.created_at, p.updated_at"
+    )
+}
+
+const POST_BODY_FULL: &str = "p.body";
+const POST_BODY_EXCERPT: &str = "substr(p.body, 1, 200)";
 const POST_FROM: &str = "FROM posts p JOIN users u ON u.id = p.teacher_id JOIN subjects s ON s.id = p.subject_id
      LEFT JOIN files f ON f.id = p.file_id";
 
-/// The post columns (`map_post` reads them), then `extra` (e.g. `, <hidden-reason expression>`), then the joins.
-fn post_select(extra: &str) -> String {
-    format!("SELECT {POST_COLS}{extra} {POST_FROM}")
+/// The post columns with `body` as column 7 (see [`post_cols`]), then `extra` (e.g. `, <hidden-reason expression>`), then the joins.
+fn post_select(body: &str, extra: &str) -> String {
+    format!("SELECT {}{extra} {POST_FROM}", post_cols(body))
 }
 
 fn map_post(with_body: bool) -> impl Fn(&rusqlite::Row) -> rusqlite::Result<Post> {
@@ -438,7 +470,7 @@ fn map_post(with_body: bool) -> impl Fn(&rusqlite::Row) -> rusqlite::Result<Post
 }
 
 fn list_posts(conn: &Connection, scope: Scope) -> Res<Vec<Post>> {
-    let sql = format!("{} WHERE {} ORDER BY p.updated_at DESC LIMIT 100", post_select(""), scope_clause(scope, "p", "published"));
+    let sql = format!("{} WHERE {} ORDER BY p.updated_at DESC LIMIT 100", post_select(POST_BODY_EXCERPT, ""), scope_clause(scope, "p", "published"));
     conn.prepare(&sql)
         .map_err(db_err)?
         .query_map(params![scope_id(scope)], map_post(false))
@@ -448,7 +480,7 @@ fn list_posts(conn: &Connection, scope: Scope) -> Res<Vec<Post>> {
 }
 
 fn get_post(conn: &Connection, id: &str) -> Res<Post> {
-    conn.query_row(&format!("{} WHERE p.id = ?1", post_select("")), params![id], map_post(true))
+    conn.query_row(&format!("{} WHERE p.id = ?1", post_select(POST_BODY_FULL, "")), params![id], map_post(true))
         .optional()
         .map_err(db_err)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))
@@ -816,6 +848,9 @@ pub struct Lesson {
     video_url: String,
     embed_url: Option<String>,
     video_kind: String,
+    /// Phase 4-2: the viewer may not see this lesson's links ([`can_see_links`]); `video_url` is then `""` and `embed_url`
+    /// `null` (`video_kind` stays, so the page can say what it is). Always `false` for the owner and in teacher responses.
+    locked: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -823,6 +858,10 @@ pub struct CourseDetail {
     #[serde(flatten)]
     course: Course,
     lessons: Vec<Lesson>,
+    /// The viewer is a student enrolled in the course's subject (`false` in owner / admin responses).
+    enrolled: bool,
+    /// At least one lesson's links are withheld from this viewer.
+    links_locked: bool,
 }
 
 const COURSE_COLS: &str = "c.id, c.teacher_id, u.full_name, c.subject_id, s.name_ar, c.title, c.description, c.status,
@@ -882,12 +921,36 @@ fn get_course(conn: &Connection, id: &str) -> Res<CourseDetail> {
                 video_url: r.get(6)?,
                 embed_url: r.get(7)?,
                 video_kind: r.get(8)?,
+                locked: false,
             })
         })
         .map_err(db_err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
-    Ok(CourseDetail { course, lessons })
+    Ok(CourseDetail { course, lessons, enrolled: false, links_locked: false })
+}
+
+/// Withholds a lesson's links: nothing that can be opened or embedded stays in it.
+fn lock_lesson(l: &mut Lesson) {
+    l.locked = true;
+    l.video_url = String::new();
+    l.embed_url = None;
+}
+
+/// A course as `viewer` may read it: `None` when they may not see the course at all (404 for the caller), otherwise the
+/// course with the lessons' links withheld unless [`can_see_links`] allows them, and `enrolled` filled in. The only way a
+/// course reaches a reader other than its owner.
+fn course_for_viewer(conn: &Connection, viewer: &User, id: &str) -> Res<CourseDetail> {
+    let mut c = get_course(conn, id)?;
+    if c.course.teacher_id != viewer.id && viewer.role != "admin" && !visible_to_public(conn, "courses", "c", id, "published")? {
+        return Err(err(StatusCode::NOT_FOUND, "not_found"));
+    }
+    c.enrolled = viewer.role == "student" && crate::platform_exams::is_enrolled(conn, &viewer.id, &c.course.subject_id)?;
+    if !can_see_links(conn, viewer, &c.course.teacher_id, &c.course.subject_id)? {
+        c.lessons.iter_mut().for_each(lock_lesson);
+        c.links_locked = !c.lessons.is_empty();
+    }
+    Ok(c)
 }
 
 #[derive(Deserialize)]
@@ -973,14 +1036,21 @@ fn add_lesson(conn: &Connection, user: &User, course_id: &str, r: &LessonReq) ->
         .query_row("SELECT COALESCE(MAX(position), 0) + 1 FROM lessons WHERE course_id = ?1", params![course_id], |r| r.get(0))
         .map_err(db_err)?;
     let id = new_id();
+    let now = now_ms();
     conn.execute(
         "INSERT INTO lessons(id, course_id, position, section, title, description, video_url, embed_url, video_kind, created_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-        params![id, course_id, pos, section, title, description, url, embed, kind, now_ms()],
+        params![id, course_id, pos, section, title, description, url, embed, kind, now],
     )
     .map_err(db_err)?;
-    conn.execute("UPDATE courses SET updated_at = ?1 WHERE id = ?2", params![now_ms(), course_id]).map_err(db_err)?;
-    Ok(Lesson { id, course_id: course_id.into(), position: pos, section, title, description, video_url: url, embed_url: embed, video_kind: kind.into() })
+    conn.execute("UPDATE courses SET updated_at = ?1 WHERE id = ?2", params![now, course_id]).map_err(db_err)?;
+    // The students of a PUBLISHED course that they can see hear of the new lesson (one notice per course, folded while it
+    // stays unread). A draft, a hidden course, a copy (`duplicate_course` never gets here) or an edit of a lesson say nothing.
+    // The lesson is stored already: a notice that cannot be written must not turn it into an error.
+    if visible_to_public(conn, "courses", "c", course_id, "published")? {
+        let _ = crate::platform_engage::tell_new_lesson(conn, course_id, &title, now);
+    }
+    Ok(Lesson { id, course_id: course_id.into(), position: pos, section, title, description, video_url: url, embed_url: embed, video_kind: kind.into(), locked: false })
 }
 
 fn lesson_course(conn: &Connection, lesson_id: &str) -> Res<String> {
@@ -1063,12 +1133,7 @@ pub async fn create_course_handler(State(state): State<Arc<AppState>>, headers: 
 
 pub async fn get_course_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<String>) -> Res<Json<CourseDetail>> {
     let user = require_active(&state, &headers)?;
-    let conn = lock(&state)?;
-    let c = get_course(&conn, &id)?;
-    if c.course.teacher_id != user.id && user.role != "admin" && !visible_to_public(&conn, "courses", "c", &id, "published")? {
-        return Err(err(StatusCode::NOT_FOUND, "not_found"));
-    }
-    Ok(Json(c))
+    course_for_viewer(&*lock(&state)?, &user, &id).map(Json)
 }
 
 pub async fn update_course_handler(
@@ -1196,6 +1261,15 @@ pub struct Live {
     duration_min: i64,
     join_url: String,
     status: String,
+    /// Phase 4-2: the viewer may not see the join link ([`can_see_links`]); `join_url` is then `""`. Always `false` for the
+    /// owner and in teacher responses.
+    locked: bool,
+}
+
+/// Withholds a live session's join link.
+fn lock_live(l: &mut Live) {
+    l.locked = true;
+    l.join_url = String::new();
 }
 
 const LIVE_COLS: &str = "l.id, l.teacher_id, u.full_name, l.subject_id, s.name_ar, l.title, l.description,
@@ -1220,6 +1294,7 @@ fn map_live(r: &rusqlite::Row) -> rusqlite::Result<Live> {
         duration_min: r.get(8)?,
         join_url: r.get(9)?,
         status: r.get(10)?,
+        locked: false,
     })
 }
 
@@ -1286,7 +1361,7 @@ fn create_live(conn: &Connection, user: &User, r: &LiveReq) -> Res<Live> {
         params![id, user.id, subject_id, title, description, starts_at, duration, url, now_ms()],
     )
     .map_err(db_err)?;
-    announce(conn, user, subject_id, "live_scheduled", &title, &format!("/platform/subjects/{subject_id}"));
+    announce(conn, user, subject_id, "live_scheduled", &title, &format!("/platform/live/{id}"));
     get_live(conn, &id)
 }
 
@@ -1323,6 +1398,10 @@ fn update_live(conn: &Connection, user: &User, id: &str, r: &LiveReq) -> Res<Liv
         params![title, description, starts_at, duration, url, status, id],
     )
     .map_err(db_err)?;
+    // a session that starts at another time reminds its audience again at the new time
+    if starts_at != cur_starts_at {
+        crate::platform_reminders::reset_live(conn, id);
+    }
     if user.id != owner {
         audit(conn, &user.id, id, "live_moderated", &status);
         if status == "cancelled" && cur_status == "scheduled" {
@@ -1330,7 +1409,7 @@ fn update_live(conn: &Connection, user: &User, id: &str, r: &LiveReq) -> Res<Liv
         }
     }
     let teacher = owner_user(&owner, &cur_teacher);
-    let link = format!("/platform/subjects/{cur_subject}");
+    let link = format!("/platform/live/{id}"); // the session's own page (phase 4-2) - for a session that is on, not a cancelled one
     let over = starts_at + duration * 60_000 <= now_ms(); // nothing to tell about a session that is already over
     // The audience is told only about a session they can see (published by a teacher in good standing, subject and
     // institution active): the owner may still edit a hidden session after the approval went away, and that must not
@@ -1339,7 +1418,9 @@ fn update_live(conn: &Connection, user: &User, id: &str, r: &LiveReq) -> Res<Liv
     if !shown {
         // nothing to announce
     } else if status == "cancelled" && cur_status == "scheduled" {
-        announce(conn, &teacher, &cur_subject, "live_cancelled", &title, &link);
+        // a cancelled session has no page of its own any more (`GET /live/{id}` answers 404 for it): the notice goes to the
+        // subject's page, which lists what is still on
+        announce(conn, &teacher, &cur_subject, "live_cancelled", &title, &format!("/platform/subjects/{cur_subject}"));
     } else if status == "scheduled" && cur_status == "cancelled" && !over {
         // back on: told like a new session (it is one again)
         announce(conn, &teacher, &cur_subject, "live_scheduled", &title, &link);
@@ -1406,18 +1487,26 @@ pub struct Bundle {
     live: Vec<Live>,
 }
 
-fn bundle(conn: &Connection, scope: Scope) -> Res<Bundle> {
-    Ok(Bundle { posts: list_posts(conn, scope)?, courses: list_courses(conn, scope)?, live: list_live(conn, scope, now_ms())? })
+/// The posts, courses and live sessions of a scope as `viewer` may read them: a live session's join link is withheld
+/// ([`lock_live`]) unless [`can_see_links`] allows it. (The lessons are not part of a bundle; a course lists a count.)
+fn bundle(conn: &Connection, scope: Scope, viewer: &User) -> Res<Bundle> {
+    let mut live = list_live(conn, scope, now_ms())?;
+    for l in &mut live {
+        if !can_see_links(conn, viewer, &l.teacher_id, &l.subject_id)? {
+            lock_live(l);
+        }
+    }
+    Ok(Bundle { posts: list_posts(conn, scope)?, courses: list_courses(conn, scope)?, live })
 }
 
 pub async fn subject_content_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<String>) -> Res<Json<Bundle>> {
-    require_active(&state, &headers)?;
-    bundle(&*lock(&state)?, Scope::Subject(&id)).map(Json)
+    let viewer = require_active(&state, &headers)?;
+    bundle(&*lock(&state)?, Scope::Subject(&id), &viewer).map(Json)
 }
 
 pub async fn teacher_content_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<String>) -> Res<Json<Bundle>> {
-    require_active(&state, &headers)?;
-    bundle(&*lock(&state)?, Scope::Teacher(&id)).map(Json)
+    let viewer = require_active(&state, &headers)?;
+    bundle(&*lock(&state)?, Scope::Teacher(&id), &viewer).map(Json)
 }
 
 // ───────── the teacher's own content (the "My content" hub, phase 3-2) ─────────
@@ -1591,9 +1680,9 @@ fn my_page<T>(
     use rusqlite::types::Value;
     // alias, column list, joins, ordering, and the index of the reason column (= number of listed columns)
     let (a, cols, from, order, reason_col) = match kind {
-        MyKind::Post => ("p", POST_COLS, POST_FROM, "p.updated_at DESC, p.id", 14),
-        MyKind::Course => ("c", COURSE_COLS, COURSE_FROM, "c.updated_at DESC, c.id", 10),
-        MyKind::Live => ("l", LIVE_COLS, LIVE_FROM, "l.starts_at DESC, l.id", 11),
+        MyKind::Post => ("p", post_cols(POST_BODY_EXCERPT), POST_FROM, "p.updated_at DESC, p.id", 14),
+        MyKind::Course => ("c", COURSE_COLS.to_string(), COURSE_FROM, "c.updated_at DESC, c.id", 10),
+        MyKind::Live => ("l", LIVE_COLS.to_string(), LIVE_FROM, "l.starts_at DESC, l.id", 11),
     };
     let mut args: Vec<Value> = vec![teacher_id.to_string().into()];
     let mut clauses = vec![scope_clause(Scope::Mine(teacher_id), a, "published")]; // `a.teacher_id = ?1`
@@ -1688,15 +1777,30 @@ fn get_my_live(conn: &Connection, user: &User, id: &str, now: i64) -> Res<MyLive
     Ok(my_live(live, reason, now))
 }
 
-pub async fn get_live_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<String>) -> Res<Json<MyLive>> {
+/// `GET /live/{id}`: the owner's (or an admin's) editing shape, or — for an active student — the student's page shape.
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+pub enum LivePage {
+    Owner(MyLive),
+    Student(crate::platform_student_learning::StudentLive),
+}
+
+/// The owner or an admin gets [`MyLive`] (unchanged); a student gets the page of a session that is shown to students and
+/// scheduled, and a 404 for any other (a draft, a cancelled or hidden one is never revealed); any other teacher, 403 as before.
+pub async fn get_live_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<String>) -> Res<Json<LivePage>> {
     let user = require_active(&state, &headers)?;
-    get_my_live(&*lock(&state)?, &user, &id, now_ms()).map(Json)
+    let conn = lock(&state)?;
+    if user.role == "student" {
+        crate::platform_student_learning::student_live(&conn, &user, &id, now_ms()).map(|l| Json(LivePage::Student(l)))
+    } else {
+        get_my_live(&conn, &user, &id, now_ms()).map(|l| Json(LivePage::Owner(l)))
+    }
 }
 
 /// Student home feed: content/live from enrolled subjects and followed teachers.
 pub async fn feed_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res<Json<Bundle>> {
     let user = require_role(&state, &headers, "student")?;
-    let mut b = bundle(&*lock(&state)?, Scope::Feed(&user.id))?;
+    let mut b = bundle(&*lock(&state)?, Scope::Feed(&user.id), &user)?;
     b.posts.truncate(10);
     b.courses.truncate(10);
     Ok(Json(b))
@@ -2631,7 +2735,7 @@ mod tests {
         let (data, link): (String, String) = w.conn.query_row("SELECT data, link FROM notifications WHERE user_id = ?1 AND kind = 'live_updated'", params![w.student.id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         let data: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!((data["title"].as_str(), data["teacher"].as_str(), data["starts_at"].as_i64()), (Some("عنوان آخر"), Some("T"), Some(now + 10_800_000)));
-        assert_eq!(link, "/platform/subjects/s1");
+        assert_eq!(link, format!("/platform/live/{}", l.id), "phase 4-2: a live notice leads to the session's own page, not to the subject");
         // a new link; and both at once is still ONE notice for that save
         update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.join_url = Some("https://meet.example.com/b".into()))).unwrap();
         assert_eq!(all(), (2, 2, 0));
@@ -2761,5 +2865,285 @@ mod tests {
         let p = create_post(&w.conn, &w.teacher, &post_req(&w, "published")).unwrap();
         update_post(&w.conn, &w.admin, &p.id, &status_req("draft")).unwrap();
         assert_eq!((count_kind(&w.conn, &w.teacher.id, "content_unpublished"), count_kind(&w.conn, &w.teacher.id, "content_auto_hidden")), (1, 0));
+    }
+
+    // ───── phase 4-2: new lessons, a live session's own page, link locking, post lists ─────
+
+    fn lesson_req(title: &str) -> LessonReq {
+        LessonReq { title: Some(title.into()), description: None, section: None, video_url: Some("https://youtu.be/dQw4w9WgXcQ".into()) }
+    }
+
+    fn course_req(status: &str) -> CourseReq {
+        CourseReq { subject_id: Some("s1".into()), title: Some("دورة بايثون".into()), description: None, status: Some(status.into()) }
+    }
+
+    /// A published course with one lesson (created as a draft, then published, like the editor does).
+    fn published_course(w: &World) -> String {
+        let c = create_course(&w.conn, &w.teacher, &course_req("draft")).unwrap();
+        add_lesson(&w.conn, &w.teacher, &c.course.id, &lesson_req("الدرس 1")).unwrap();
+        update_course(&w.conn, &w.teacher, &c.course.id, &CourseReq { subject_id: None, title: None, description: None, status: Some("published".into()) }).unwrap();
+        c.course.id
+    }
+
+    fn notices(conn: &Connection, user: &str, kind: &str) -> Vec<(serde_json::Value, Option<String>, Option<i64>)> {
+        conn.prepare("SELECT data, link, read_at FROM notifications WHERE user_id = ?1 AND kind = ?2 ORDER BY created_at, rowid")
+            .unwrap()
+            .query_map(params![user, kind], |r| Ok((serde_json::from_str(&r.get::<_, String>(0)?).unwrap(), r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_lesson_added_to_a_published_course_tells_the_enrolled_students_once_per_course() {
+        let w = world();
+        let late = insert_test_user(&w.conn, "late@x.com", "student", "active");
+        let sus = insert_test_user(&w.conn, "sus@x.com", "student", "suspended");
+        let out = insert_test_user(&w.conn, "out@x.com", "student", "active");
+        let follower = insert_test_user(&w.conn, "f@x.com", "student", "active");
+        for u in [&late, &sus] {
+            w.conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![u.id]).unwrap();
+        }
+        w.conn.execute("INSERT INTO teacher_follows VALUES (?1, ?2, 0)", params![follower.id, w.teacher.id]).unwrap();
+        let everyone = |w: &World| -> Vec<usize> { [&w.student, &late, &sus, &out, &follower, &w.teacher].map(|u| notices(&w.conn, &u.id, "new_lesson").len()).to_vec() };
+        // a draft: nothing, however many lessons
+        let c = create_course(&w.conn, &w.teacher, &course_req("draft")).unwrap();
+        add_lesson(&w.conn, &w.teacher, &c.course.id, &lesson_req("الدرس 1")).unwrap();
+        add_lesson(&w.conn, &w.teacher, &c.course.id, &lesson_req("الدرس 2")).unwrap();
+        assert_eq!(everyone(&w), [0, 0, 0, 0, 0, 0]);
+        update_course(&w.conn, &w.teacher, &c.course.id, &CourseReq { subject_id: None, title: None, description: None, status: Some("published".into()) }).unwrap();
+        assert_eq!(everyone(&w), [0, 0, 0, 0, 0, 0], "publishing is the 'new course' notice, not a 'new lesson' one");
+        // published: the active students enrolled in the subject (not the suspended one, the stranger, a mere follower or the teacher)
+        add_lesson(&w.conn, &w.teacher, &c.course.id, &lesson_req("الدرس 3")).unwrap();
+        assert_eq!(everyone(&w), [1, 1, 0, 0, 0, 0]);
+        let (data, link, read) = notices(&w.conn, &w.student.id, "new_lesson").remove(0);
+        assert_eq!(data, serde_json::json!({ "course": "دورة بايثون", "subject": "برمجة", "title": "الدرس 3", "count": 1 }));
+        assert_eq!((link.as_deref(), read), (Some(format!("/platform/courses/{}", c.course.id).as_str()), None));
+        // more lessons while it stays unread: still ONE notice, the count grows and the title is the latest
+        add_lesson(&w.conn, &w.teacher, &c.course.id, &lesson_req("الدرس 4")).unwrap();
+        add_lesson(&w.conn, &w.teacher, &c.course.id, &lesson_req("الدرس 5")).unwrap();
+        assert_eq!(everyone(&w), [1, 1, 0, 0, 0, 0]);
+        assert_eq!(notices(&w.conn, &w.student.id, "new_lesson")[0].0, serde_json::json!({ "course": "دورة بايثون", "subject": "برمجة", "title": "الدرس 5", "count": 3 }));
+        // read it: the next lesson starts a new notice
+        w.conn.execute("UPDATE notifications SET read_at = 5 WHERE user_id = ?1 AND kind = 'new_lesson'", params![w.student.id]).unwrap();
+        add_lesson(&w.conn, &w.teacher, &c.course.id, &lesson_req("الدرس 6")).unwrap();
+        let mine = notices(&w.conn, &w.student.id, "new_lesson");
+        assert_eq!(mine.len(), 2);
+        assert_eq!((mine[0].2, mine[1].2, mine[1].0["count"].clone(), mine[1].0["title"].clone()), (Some(5), None, serde_json::json!(1), serde_json::json!("الدرس 6")));
+        assert_eq!(notices(&w.conn, &late.id, "new_lesson").len(), 1, "the other student's unread notice just kept counting");
+        // another course is another notice
+        let other = published_course(&w);
+        add_lesson(&w.conn, &w.teacher, &other, &lesson_req("آخر")).unwrap();
+        assert_eq!(notices(&w.conn, &w.student.id, "new_lesson").len(), 3);
+    }
+
+    #[test]
+    fn editing_copying_or_hiding_says_nothing_about_lessons() {
+        let w = world();
+        let id = published_course(&w);
+        let n = |w: &World| notices(&w.conn, &w.student.id, "new_lesson").len();
+        let lesson_id: String = w.conn.query_row("SELECT id FROM lessons WHERE course_id = ?1", params![id], |r| r.get(0)).unwrap();
+        add_lesson(&w.conn, &w.teacher, &id, &lesson_req("ثانٍ")).unwrap();
+        assert_eq!(n(&w), 1);
+        w.conn.execute("DELETE FROM notifications", []).unwrap();
+        update_lesson(&w.conn, &w.teacher, &lesson_id, &lesson_req("عنوان جديد")).unwrap();
+        move_lesson(&w.conn, &w.teacher, &lesson_id, false).unwrap();
+        update_course(&w.conn, &w.teacher, &id, &CourseReq { subject_id: None, title: Some("عنوان".into()), description: Some("وصف".into()), status: None }).unwrap();
+        delete_lesson(&w.conn, &w.teacher, &lesson_id).unwrap();
+        assert_eq!(n(&w), 0, "editing, moving, deleting and renaming are not news");
+        // a copy is a draft with copied lessons: nobody is told
+        let copy = duplicate_course(&w.conn, &w.teacher, &id, &DuplicateReq { title: None }).unwrap();
+        assert_eq!((copy.course.status.as_str(), copy.lessons.len()), ("draft", 1));
+        assert_eq!(n(&w), 0);
+        // a lesson added to the draft copy: nothing
+        add_lesson(&w.conn, &w.teacher, &copy.course.id, &lesson_req("في النسخة")).unwrap();
+        assert_eq!(n(&w), 0);
+        // the owner may still add to a course that students can no longer see; they are told nothing
+        w.conn.execute("UPDATE teacher_subjects SET status = 'rejected'", []).unwrap();
+        add_lesson(&w.conn, &w.teacher, &id, &lesson_req("مخفي")).unwrap();
+        assert_eq!(n(&w), 0);
+        w.conn.execute("UPDATE teacher_subjects SET status = 'approved'", []).unwrap();
+        w.conn.execute("UPDATE subjects SET is_active = 0", []).unwrap();
+        add_lesson(&w.conn, &w.teacher, &id, &lesson_req("مادة معطلة")).unwrap();
+        assert_eq!(n(&w), 0);
+    }
+
+    #[test]
+    fn rescheduling_a_session_clears_its_reminder_markers_and_nothing_else_does() {
+        let w = world();
+        let now = now_ms();
+        let mk = |title: &str| create_live(&w.conn, &w.teacher, &LiveReq { subject_id: Some("s1".into()), title: Some(title.into()), description: None, starts_at: Some(now + 7_200_000), duration_min: Some(60), join_url: Some("https://meet.example.com/a".into()), status: None }).unwrap();
+        let (a, b) = (mk("أ"), mk("ب"));
+        for id in [&a.id, &b.id] {
+            w.conn.execute("INSERT INTO live_reminders(live_id, student_id, sent_at) VALUES (?1, ?2, 1)", params![id, w.student.id]).unwrap();
+        }
+        let markers = |id: &str| -> i64 { w.conn.query_row("SELECT count(*) FROM live_reminders WHERE live_id = ?1", params![id], |r| r.get(0)).unwrap() };
+        update_live(&w.conn, &w.teacher, &a.id, &live_req(|r| r.title = Some("عنوان آخر".into()))).unwrap();
+        update_live(&w.conn, &w.teacher, &a.id, &live_req(|r| r.duration_min = Some(90))).unwrap();
+        update_live(&w.conn, &w.teacher, &a.id, &live_req(|r| r.join_url = Some("https://meet.example.com/b".into()))).unwrap();
+        update_live(&w.conn, &w.teacher, &a.id, &live_req(|r| r.starts_at = Some(now + 7_200_000))).unwrap();
+        assert_eq!((markers(&a.id), markers(&b.id)), (1, 1), "title, length, link and an unchanged time keep the marker");
+        update_live(&w.conn, &w.teacher, &a.id, &live_req(|r| r.starts_at = Some(now + 10_800_000))).unwrap();
+        assert_eq!((markers(&a.id), markers(&b.id)), (0, 1), "a new start time re-arms that session only");
+        // an admin moving it does the same
+        update_live(&w.conn, &w.teacher, &b.id, &live_req(|r| r.starts_at = Some(now + 12_600_000))).unwrap();
+        assert_eq!(markers(&b.id), 0);
+    }
+
+    #[test]
+    fn live_notices_lead_to_the_sessions_own_page() {
+        let w = world();
+        let now = now_ms();
+        let l = create_live(
+            &w.conn,
+            &w.teacher,
+            &LiveReq { subject_id: Some("s1".into()), title: Some("درس".into()), description: None, starts_at: Some(now + 7_200_000), duration_min: Some(60), join_url: Some("https://meet.example.com/a".into()), status: None },
+        )
+        .unwrap();
+        let link = |kind: &str| notices(&w.conn, &w.student.id, kind).last().and_then(|n| n.1.clone());
+        assert_eq!(link("live_scheduled").as_deref(), Some(format!("/platform/live/{}", l.id).as_str()));
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.status = Some("cancelled".into()))).unwrap();
+        assert_eq!(link("live_cancelled").as_deref(), Some("/platform/subjects/s1"), "a cancelled session has no page (404): the notice leads to the subject");
+        // back on: a (re)scheduling
+        update_live(&w.conn, &w.teacher, &l.id, &live_req(|r| r.status = Some("scheduled".into()))).unwrap();
+        assert_eq!(notices(&w.conn, &w.student.id, "live_scheduled").iter().filter_map(|n| n.1.clone()).filter(|l2| *l2 == format!("/platform/live/{}", l.id)).count(), 2);
+        // an admin cancelling a teacher's session: the audience and the owner both keep the subject (the page is gone)
+        update_live(&w.conn, &w.admin, &l.id, &live_req(|r| r.status = Some("cancelled".into()))).unwrap();
+        assert_eq!(link("live_cancelled").as_deref(), Some("/platform/subjects/s1"));
+        assert_eq!(notices(&w.conn, &w.teacher.id, "content_unpublished").last().and_then(|n| n.1.clone()).as_deref(), Some("/platform/subjects/s1"));
+    }
+
+    #[test]
+    fn post_lists_carry_an_excerpt_and_never_the_whole_body() {
+        let w = world();
+        let long: String = "حروف ".repeat(1000);
+        let p = create_post(&w.conn, &w.teacher, &PostReq { subject_id: Some("s1".into()), kind: Some("article".into()), title: Some("طويل".into()), body: Some(long.clone()), status: Some("published".into()) }).unwrap();
+        let short = create_post(&w.conn, &w.teacher, &PostReq { subject_id: Some("s1".into()), kind: Some("article".into()), title: Some("قصير".into()), body: Some("نص قصير".into()), status: Some("published".into()) }).unwrap();
+        // every list: the subject page, the teacher page, the feed, "my content"
+        let lists: Vec<Vec<Post>> = vec![
+            list_posts(&w.conn, Scope::Subject("s1")).unwrap(),
+            list_posts(&w.conn, Scope::Teacher(&w.teacher.id)).unwrap(),
+            list_posts(&w.conn, Scope::Feed(&w.student.id)).unwrap(),
+            list_posts(&w.conn, Scope::Mine(&w.teacher.id)).unwrap(),
+        ];
+        for list in lists {
+            assert_eq!(list.len(), 2);
+            for post in &list {
+                assert!(post.body.is_none(), "{}: a list never carries the body", post.title);
+            }
+            let long_item = list.iter().find(|x| x.id == p.id).unwrap();
+            assert_eq!(long_item.excerpt, long.chars().take(200).collect::<String>(), "the same excerpt as before: the first 200 characters");
+            assert_eq!(list.iter().find(|x| x.id == short.id).unwrap().excerpt, "نص قصير");
+        }
+        let mine = my_content(&w.conn, &w.teacher.id, &MyFilter::parse(&MyQuery::default()).unwrap(), now_ms()).unwrap();
+        assert!(mine.posts.iter().all(|x| x.item.body.is_none()) && mine.posts.len() == 2);
+        // one post still has its whole text
+        assert_eq!(get_post(&w.conn, &p.id).unwrap().body.as_deref(), Some(long.trim()));
+        // the JSON of a bundle does not contain a long body anywhere
+        let json = serde_json::to_string(&bundle(&w.conn, Scope::Subject("s1"), &w.student).unwrap()).unwrap();
+        assert!(json.len() < 2_000, "{} bytes", json.len());
+    }
+
+    #[test]
+    fn who_may_see_links_is_the_owner_an_admin_an_enrolled_student_and_an_approved_colleague() {
+        let w = world();
+        let colleague = insert_test_user(&w.conn, "c@x.com", "teacher", "active");
+        let stranger = insert_test_user(&w.conn, "st@x.com", "teacher", "active");
+        let pending = insert_test_user(&w.conn, "pe@x.com", "teacher", "active");
+        let out = insert_test_user(&w.conn, "out@x.com", "student", "active");
+        w.conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,'s1','approved',0,0), (?2,'s1','pending',0,NULL)", params![colleague.id, pending.id]).unwrap();
+        let sees = |u: &User| can_see_links(&w.conn, u, &w.teacher.id, "s1").unwrap();
+        assert_eq!(
+            [&w.teacher, &w.admin, &w.student, &colleague, &stranger, &pending, &out].map(sees),
+            [true, true, true, true, false, false, false],
+            "owner, admin, enrolled student, approved colleague: yes; a teacher of nothing, a pending teacher, a student who is not enrolled: no"
+        );
+        // approval and enrolment are read live
+        w.conn.execute("UPDATE teacher_subjects SET status = 'rejected' WHERE teacher_id = ?1", params![colleague.id]).unwrap();
+        w.conn.execute("DELETE FROM subject_enrollments WHERE student_id = ?1", params![w.student.id]).unwrap();
+        assert!(!sees(&colleague) && !sees(&w.student));
+        // the owner stays the owner even without an approval
+        w.conn.execute("UPDATE teacher_subjects SET status = 'rejected' WHERE teacher_id = ?1", params![w.teacher.id]).unwrap();
+        assert!(sees(&w.teacher));
+        // another subject's class is not this one's
+        w.conn.execute("INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES ('s2','i1','أخرى',1,0)", []).unwrap();
+        w.conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s2',0)", params![out.id]).unwrap();
+        assert!(!sees(&out), "enrolled elsewhere");
+    }
+
+    #[test]
+    fn a_course_reaches_a_viewer_only_when_it_is_shown_and_with_the_links_the_viewer_may_have() {
+        let w = world();
+        let out = insert_test_user(&w.conn, "out@x.com", "student", "active");
+        let id = published_course(&w);
+        let draft = create_course(&w.conn, &w.teacher, &course_req("draft")).unwrap().course.id;
+        add_lesson(&w.conn, &w.teacher, &draft, &lesson_req("مسودة")).unwrap();
+        let view = |u: &User, id: &str| course_for_viewer(&w.conn, u, id);
+        // enrolled student: all links, `enrolled`
+        let c = view(&w.student, &id).unwrap();
+        assert_eq!((c.enrolled, c.links_locked, c.lessons[0].locked, c.lessons[0].video_url.is_empty()), (true, false, false, false));
+        // a student who has not enrolled: the lessons are listed, the links are not
+        let c = view(&out, &id).unwrap();
+        assert_eq!((c.enrolled, c.links_locked, c.lessons.len()), (false, true, 1));
+        assert!(c.lessons[0].locked && c.lessons[0].video_url.is_empty() && c.lessons[0].embed_url.is_none());
+        assert_eq!((c.lessons[0].title.as_str(), c.lessons[0].video_kind.as_str()), ("الدرس 1", "youtube"));
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("dQw4w9WgXcQ"), "{json}");
+        // a course with no lessons has nothing to lock
+        let empty = create_course(&w.conn, &w.teacher, &course_req("draft")).unwrap();
+        assert!(!view(&w.teacher, &empty.course.id).unwrap().links_locked);
+        // drafts: the owner and an admin see them, nobody else
+        assert!(view(&w.teacher, &draft).is_ok() && view(&w.admin, &draft).is_ok());
+        assert_eq!(view(&w.student, &draft).unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(view(&out, &draft).unwrap_err().0, StatusCode::NOT_FOUND);
+        // the owner's own responses are never locked
+        let added = add_lesson(&w.conn, &w.teacher, &id, &lesson_req("جديد")).unwrap();
+        assert!(!added.locked && !added.video_url.is_empty());
+        assert!(!serde_json::to_string(&get_course(&w.conn, &id).unwrap()).unwrap().contains("\"locked\":true"));
+        // a hidden course is a 404 for a student, but its owner still opens it
+        w.conn.execute("UPDATE teacher_subjects SET status = 'rejected'", []).unwrap();
+        assert_eq!(view(&w.student, &id).unwrap_err().0, StatusCode::NOT_FOUND);
+        assert!(view(&w.teacher, &id).is_ok());
+    }
+
+    /// Phase 4-2 asked for a `(status, updated_at)` index only if the feed / search queries would use it. They do not: the
+    /// scope filter (a subject, a teacher, the student's enrolments and follows) is always more selective than the
+    /// publication state, and the existing indexes serve it, so no index was added.
+    #[test]
+    fn the_post_lists_are_served_by_the_scope_indexes() {
+        let w = world();
+        let plan = |scope: Scope| -> String {
+            let sql = format!("EXPLAIN QUERY PLAN {} WHERE {} ORDER BY p.updated_at DESC LIMIT 100", post_select(POST_BODY_EXCERPT, ""), scope_clause(scope, "p", "published"));
+            w.conn.prepare(&sql).unwrap().query_map(params!["x"], |r| r.get::<_, String>(3)).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>().join("\n")
+        };
+        assert!(plan(Scope::Subject("x")).contains("idx_posts_subject"), "{}", plan(Scope::Subject("x")));
+        assert!(plan(Scope::Teacher("x")).contains("idx_posts_teacher"), "{}", plan(Scope::Teacher("x")));
+        let feed = plan(Scope::Feed("x"));
+        assert!(feed.contains("idx_posts_subject") && feed.contains("idx_posts_teacher"), "{feed}");
+        let has_status_updated: i64 = w.conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'index' AND tbl_name IN ('posts','courses') AND sql LIKE '%updated_at%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(has_status_updated, 0, "no (status, updated_at) index: nothing would use it");
+    }
+
+    #[test]
+    fn deleting_a_post_or_a_course_deletes_the_bookmarks_that_point_at_it() {
+        let w = world();
+        let other = insert_test_user(&w.conn, "o@x.com", "student", "active");
+        w.conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![other.id]).unwrap();
+        let post = create_post(&w.conn, &w.teacher, &post_req(&w, "published")).unwrap();
+        let keep = create_post(&w.conn, &w.teacher, &post_req(&w, "published")).unwrap();
+        let course = published_course(&w);
+        for who in [&w.student, &other] {
+            for (t, id) in [("post", post.id.as_str()), ("post", keep.id.as_str()), ("course", course.as_str())] {
+                crate::platform_bookmarks::add_bookmark(&w.conn, who, &crate::platform_bookmarks::BookmarkReq { target_type: t.into(), target_id: id.into() }, 1).unwrap();
+            }
+        }
+        let stored = |w: &World| -> i64 { w.conn.query_row("SELECT count(*) FROM bookmarks", [], |r| r.get(0)).unwrap() };
+        assert_eq!(stored(&w), 6);
+        delete_post(&w.conn, &w.teacher, &post.id).unwrap();
+        assert_eq!(stored(&w), 4, "both students' bookmarks of the post are gone; the other post's stay");
+        delete_course(&w.conn, &w.teacher, &course).unwrap();
+        assert_eq!(stored(&w), 2);
+        let left: Vec<String> = w.conn.prepare("SELECT target_id FROM bookmarks").unwrap().query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(left, [keep.id.clone(), keep.id.clone()]);
     }
 }

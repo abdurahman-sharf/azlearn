@@ -1,8 +1,7 @@
-//! Operations: content reports (with auto-hide), admin stats, audit viewer, unified search,
-//! and account self-service (change password, delete account).
+//! Operations: content reports (with auto-hide), admin stats, audit viewer and account self-service (change password,
+//! delete account). (The unified search moved to `platform_search`.)
 
 use crate::platform::{audit, bad, db_err, hash_password, lock, new_id, rate_limit, require_active, require_admin, text, verify_password, Res, User};
-use crate::platform_content::visible;
 use crate::relay::{err, now_ms, sha256_hex};
 use axum::{
     extract::{Path, Query, State},
@@ -35,6 +34,54 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_open_unique ON reports(reporter_id
 
 const REPORTS_PER_DAY: i64 = 20;
 const AUTO_HIDE_THRESHOLD: i64 = 3;
+const HOUR_MS: i64 = 3_600_000;
+
+/// How old a reporter's account must be for its report to count towards the automatic hide (phase 4-2).
+///
+/// A burst of brand-new accounts (three registrations in a minute) must not be able to take someone's post, course, live
+/// session or exam down: only reports from accounts at least `min_account_age_hours` old (default 24) are counted towards
+/// [`AUTO_HIDE_THRESHOLD`]. The reports themselves are always stored and an admin sees all of them; only the automatic
+/// consequence waits for reporters who have been around for a day. Read once at start
+/// (`PLATFORM_REPORT_MIN_ACCOUNT_AGE_HOURS`, a whole number `>= 0`, `0` = every account counts, anything else keeps the
+/// default rather than switching the protection off by accident).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReportLimits {
+    pub min_account_age_hours: i64,
+}
+
+impl Default for ReportLimits {
+    fn default() -> Self {
+        ReportLimits { min_account_age_hours: 24 }
+    }
+}
+
+impl ReportLimits {
+    pub fn from_env() -> Self {
+        Self::parse(|k| std::env::var(k).ok())
+    }
+
+    pub fn parse(get: impl Fn(&str) -> Option<String>) -> Self {
+        let d = ReportLimits::default();
+        ReportLimits { min_account_age_hours: get("PLATFORM_REPORT_MIN_ACCOUNT_AGE_HOURS").and_then(|v| v.trim().parse::<u32>().ok()).map_or(d.min_account_age_hours, i64::from) }
+    }
+
+    pub fn describe(&self) -> String {
+        if self.min_account_age_hours == 0 {
+            "reports from every account count towards the automatic hide".to_string()
+        } else {
+            format!("only reports from accounts at least {} h old count towards the automatic hide", self.min_account_age_hours)
+        }
+    }
+
+    /// The newest `users.created_at` a reporter may have for its report to count at `now`.
+    fn newest_counting_account(&self, now: i64) -> i64 {
+        if self.min_account_age_hours == 0 {
+            i64::MAX
+        } else {
+            now.saturating_sub(self.min_account_age_hours.saturating_mul(HOUR_MS))
+        }
+    }
+}
 
 // ───────── reports ─────────
 
@@ -86,7 +133,7 @@ pub struct ReportReq {
     reason: String,
 }
 
-fn create_report(conn: &Connection, reporter: &User, r: &ReportReq) -> Res<()> {
+fn create_report(conn: &Connection, reporter: &User, r: &ReportReq, limits: &ReportLimits, now: i64) -> Res<()> {
     let reason = text(&r.reason, 500, "invalid_reason")?;
     let target = target_info(conn, &r.target_type, &r.target_id)?.ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
     if target.owner_id == reporter.id {
@@ -95,27 +142,91 @@ fn create_report(conn: &Connection, reporter: &User, r: &ReportReq) -> Res<()> {
     rate_limit(conn, &format!("report:{}", reporter.id), 86_400_000, REPORTS_PER_DAY)?;
     conn.execute(
         "INSERT INTO reports(id, reporter_id, target_type, target_id, reason, status, created_at) VALUES (?1,?2,?3,?4,?5,'open',?6)",
-        params![new_id(), reporter.id, r.target_type, r.target_id, reason, now_ms()],
+        params![new_id(), reporter.id, r.target_type, r.target_id, reason, now],
     )
     .map_err(|e| match e {
         rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation => err(StatusCode::CONFLICT, "already_reported"),
         _ => db_err(e),
     })?;
-    auto_hide_if_needed(conn, &r.target_type, &r.target_id, &target)?;
+    auto_hide_if_needed(conn, &r.target_type, &r.target_id, &target, limits, now)?;
     Ok(())
 }
 
-/// ≥ N distinct reporters on open reports hide published content until an admin reviews it.
-fn auto_hide_if_needed(conn: &Connection, ttype: &str, id: &str, target: &Target) -> Res<()> {
+/// How many targets one pass of [`recount_matured_reports`] looks at.
+const MATURED_BATCH: i64 = 200;
+
+/// Counts again the reports that did not count when they came in because their reporter's account was too young
+/// ([`ReportLimits`]) and whose reporter is old enough *now* - a class that registers together and reports an abusive post on
+/// day 1 must not need a fourth, older reporter on day 2. Called by the background loop; returns how many targets it took
+/// down (published content that now has [`AUTO_HIDE_THRESHOLD`] counting reporters).
+///
+/// Only a target with at least one report that was young when it was filed and is old enough now is looked at, and one
+/// that was already taken down by reports since its oldest open report is left alone: content its owner published again
+/// while the reports are still open is hidden again only by a NEW counting report (exactly as before), not by the clock.
+/// Each target is its own transaction. A failure is logged and retried by the next pass.
+pub fn recount_matured_reports(conn: &Connection, limits: &ReportLimits, now: i64) -> usize {
+    if limits.min_account_age_hours == 0 {
+        return 0; // everybody counts at once: nothing can mature
+    }
+    recount_matured(conn, limits, now).unwrap_or_else(|e| {
+        eprintln!("Platform: recounting matured reports failed: {}", e.1);
+        0
+    })
+}
+
+fn recount_matured(conn: &Connection, limits: &ReportLimits, now: i64) -> Res<usize> {
+    let age_ms = limits.min_account_age_hours.saturating_mul(HOUR_MS);
+    let candidates: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT r.target_type, r.target_id
+               FROM reports r JOIN users u ON u.id = r.reporter_id
+              WHERE r.status = 'open' AND r.target_type IN ('post','course','live','assessment')
+                AND u.created_at > r.created_at - ?1   -- too young to count when it reported ...
+                AND u.created_at <= ?2                  -- ... and old enough now
+              GROUP BY r.target_type, r.target_id ORDER BY min(r.created_at) LIMIT ?3",
+        )
+        .map_err(db_err)?
+        .query_map(params![age_ms, limits.newest_counting_account(now), MATURED_BATCH], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    let mut hidden = 0;
+    for (ttype, id) in candidates {
+        let oldest: i64 = conn
+            .query_row("SELECT min(created_at) FROM reports WHERE target_type = ?1 AND target_id = ?2 AND status = 'open'", params![ttype, id], |r| r.get(0))
+            .map_err(db_err)?;
+        let already: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM audit_log WHERE target_id = ?1 AND action = 'auto_hidden_by_reports' AND created_at >= ?2)",
+                params![id, oldest],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if already {
+            continue;
+        }
+        let Some(target) = target_info(conn, &ttype, &id)? else { continue };
+        let tx = conn.unchecked_transaction().map_err(db_err)?;
+        let changed = auto_hide_if_needed(&tx, &ttype, &id, &target, limits, now)?;
+        tx.commit().map_err(db_err)?;
+        hidden += usize::from(changed);
+    }
+    Ok(hidden)
+}
+
+/// ≥ N distinct reporters on open reports hide published content until an admin reviews it. Only reporters whose account is
+/// old enough count ([`ReportLimits`]); the younger ones' reports stay open and visible to the admin.
+fn auto_hide_if_needed(conn: &Connection, ttype: &str, id: &str, target: &Target, limits: &ReportLimits, now: i64) -> Res<bool> {
     let n: i64 = conn
         .query_row(
-            "SELECT count(DISTINCT reporter_id) FROM reports WHERE target_type = ?1 AND target_id = ?2 AND status = 'open'",
-            params![ttype, id],
+            "SELECT count(DISTINCT r.reporter_id) FROM reports r JOIN users u ON u.id = r.reporter_id
+              WHERE r.target_type = ?1 AND r.target_id = ?2 AND r.status = 'open' AND u.created_at <= ?3",
+            params![ttype, id, limits.newest_counting_account(now)],
             |r| r.get(0),
         )
         .map_err(db_err)?;
     if n < AUTO_HIDE_THRESHOLD {
-        return Ok(());
+        return Ok(false);
     }
     let changed = match ttype {
         "post" => conn.execute("UPDATE posts SET status = 'draft' WHERE id = ?1 AND status = 'published'", params![id]),
@@ -155,16 +266,18 @@ fn auto_hide_if_needed(conn: &Connection, ttype: &str, id: &str, target: &Target
                 .optional()
                 .map_err(db_err)?;
             if let Some((subject_id, teacher_name)) = session {
-                crate::platform_engage::notify_audience(conn, &target.owner_id, &subject_id, "live_cancelled", json!({ "title": target.title, "teacher": teacher_name }), &target.link);
+                // a cancelled session has no page of its own (`GET /live/{id}` answers 404 for it): the audience, like the
+                // owner, is sent to the subject's page
+                crate::platform_engage::notify_audience(conn, &target.owner_id, &subject_id, "live_cancelled", json!({ "title": target.title, "teacher": teacher_name }), &format!("/platform/subjects/{subject_id}"));
             }
         }
     }
-    Ok(())
+    Ok(changed > 0)
 }
 
 pub async fn report_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Json(r): Json<ReportReq>) -> Res<StatusCode> {
     let u = require_active(&s, &h)?;
-    create_report(&*lock(&s)?, &u, &r)?;
+    create_report(&*lock(&s)?, &u, &r, &s.platform.report_limits, now_ms())?;
     Ok(StatusCode::CREATED)
 }
 
@@ -365,91 +478,6 @@ pub async fn audit_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Query(q
     list_audit(&*lock(&s)?, q.before).map(Json)
 }
 
-// ───────── search ─────────
-
-#[derive(Serialize, Debug)]
-pub struct Hit {
-    id: String,
-    title: String,
-    subtitle: String,
-    link: String,
-}
-
-#[derive(Serialize, Debug)]
-pub struct SearchResults {
-    subjects: Vec<Hit>,
-    teachers: Vec<Hit>,
-    courses: Vec<Hit>,
-    posts: Vec<Hit>,
-}
-
-fn like(q: &str) -> String {
-    format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_").to_lowercase())
-}
-
-fn hits(conn: &Connection, sql: &str, pat: &str, f: &dyn Fn(&rusqlite::Row) -> rusqlite::Result<Hit>) -> Res<Vec<Hit>> {
-    conn.prepare(sql)
-        .map_err(db_err)?
-        .query_map(params![pat], |r| f(r))
-        .map_err(db_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_err)
-}
-
-fn search(conn: &Connection, q: &str) -> Res<SearchResults> {
-    let q = q.trim();
-    if q.chars().count() < 2 || q.chars().count() > 60 {
-        return Err(bad("invalid_query"));
-    }
-    let pat = like(q);
-    let subjects = hits(
-        conn,
-        "SELECT s.id, s.name_ar, i.name_ar FROM subjects s JOIN institutions i ON i.id = s.institution_id
-         WHERE s.is_active = 1 AND i.is_active = 1 AND (lower(s.name_ar) LIKE ?1 ESCAPE '\\' OR lower(COALESCE(s.name_en,'')) LIKE ?1 ESCAPE '\\')
-         ORDER BY s.name_ar LIMIT 8",
-        &pat,
-        &|r| Ok(Hit { id: r.get(0)?, title: r.get(1)?, subtitle: r.get(2)?, link: format!("/platform/subjects/{}", r.get::<_, String>(0)?) }),
-    )?;
-    let teachers = hits(
-        conn,
-        "SELECT id, full_name, COALESCE(substr(bio, 1, 80), '') FROM users
-         WHERE role = 'teacher' AND status = 'active' AND lower(full_name) LIKE ?1 ESCAPE '\\' ORDER BY full_name LIMIT 8",
-        &pat,
-        &|r| Ok(Hit { id: r.get(0)?, title: r.get(1)?, subtitle: r.get(2)?, link: format!("/platform/teachers/{}", r.get::<_, String>(0)?) }),
-    )?;
-    let courses = hits(
-        conn,
-        &format!(
-            "SELECT c.id, c.title, s.name_ar FROM courses c JOIN users u ON u.id = c.teacher_id JOIN subjects s ON s.id = c.subject_id
-             WHERE {} AND lower(c.title) LIKE ?1 ESCAPE '\\' ORDER BY c.updated_at DESC LIMIT 8",
-            visible("c", "published")
-        ),
-        &pat,
-        &|r| Ok(Hit { id: r.get(0)?, title: r.get(1)?, subtitle: r.get(2)?, link: format!("/platform/courses/{}", r.get::<_, String>(0)?) }),
-    )?;
-    let posts = hits(
-        conn,
-        &format!(
-            "SELECT p.id, p.title, s.name_ar FROM posts p JOIN users u ON u.id = p.teacher_id JOIN subjects s ON s.id = p.subject_id
-             WHERE {} AND lower(p.title) LIKE ?1 ESCAPE '\\' ORDER BY p.updated_at DESC LIMIT 8",
-            visible("p", "published")
-        ),
-        &pat,
-        &|r| Ok(Hit { id: r.get(0)?, title: r.get(1)?, subtitle: r.get(2)?, link: format!("/platform/posts/{}", r.get::<_, String>(0)?) }),
-    )?;
-    Ok(SearchResults { subjects, teachers, courses, posts })
-}
-
-#[derive(Deserialize)]
-pub struct SearchQuery {
-    q: Option<String>,
-}
-
-pub async fn search_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Query(q): Query<SearchQuery>) -> Res<Json<SearchResults>> {
-    require_active(&s, &h)?;
-    search(&*lock(&s)?, q.q.as_deref().unwrap_or("")).map(Json)
-}
-
 // ───────── account self-service ─────────
 
 #[derive(Deserialize)]
@@ -585,6 +613,14 @@ fn purge_dangling_references(conn: &Connection, user_id: &str) -> Res<()> {
         params![user_id],
     )
     .map_err(db_err)?;
+    // Students' saved items (bookmarks) of the posts and courses that are about to be deleted. (The bookmarks the user
+    // saved themself cascade with the account.)
+    conn.execute(
+        "DELETE FROM bookmarks WHERE (target_type = 'post' AND target_id IN (SELECT id FROM posts WHERE teacher_id = ?1))
+            OR (target_type = 'course' AND target_id IN (SELECT id FROM courses WHERE teacher_id = ?1))",
+        params![user_id],
+    )
+    .map_err(db_err)?;
     // Reports about their content and about the teacher themself.
     conn.execute(
         "DELETE FROM reports WHERE (target_type = 'post' AND target_id IN (SELECT id FROM posts WHERE teacher_id = ?1))
@@ -600,7 +636,8 @@ fn purge_dangling_references(conn: &Connection, user_id: &str) -> Res<()> {
 
 /// Removes the reviews and reports that point at ONE piece of content that is being deleted (`post`, `course` or
 /// `live`), for the same reason as [`purge_dangling_references`]: neither table has a foreign key to its target.
-/// A course takes its reviews, the reports about those reviews and the reports about the course itself with it.
+/// A course takes its reviews, the reports about those reviews and the reports about the course itself with it; a post or a
+/// course also takes the students' saved items (`bookmarks`) that point at it (phase 4-2).
 /// The caller runs it in the same transaction as the delete, so it never touches content that survives.
 pub(crate) fn purge_target_references(conn: &Connection, target_type: &str, target_id: &str) -> Res<()> {
     match target_type {
@@ -616,6 +653,9 @@ pub(crate) fn purge_target_references(conn: &Connection, target_type: &str, targ
         }
         "post" | "live" => {}
         _ => return Err(bad("invalid_target")),
+    }
+    if target_type != "live" {
+        conn.execute("DELETE FROM bookmarks WHERE target_type = ?1 AND target_id = ?2", params![target_type, target_id]).map_err(db_err)?;
     }
     conn.execute("DELETE FROM reports WHERE target_type = ?1 AND target_id = ?2", params![target_type, target_id]).map_err(db_err)?;
     Ok(())
@@ -692,6 +732,19 @@ pub async fn delete_account_handler(State(s): State<Arc<AppState>>, h: HeaderMap
 mod tests {
     use super::*;
     use crate::platform::{create_test_db, insert_test_user};
+
+    /// `create_report` with the default limits and the real clock (the fixtures' accounts were created at time 0, so they are
+    /// old enough to count).
+    fn create_report(conn: &Connection, reporter: &User, r: &ReportReq) -> Res<()> {
+        super::create_report(conn, reporter, r, &ReportLimits::default(), now_ms())
+    }
+
+    /// The search as an admin sees it (no exams group; everything else is the same for every role).
+    fn search(conn: &Connection, q: &str) -> Res<crate::platform_search::SearchResults> {
+        let viewer = User { id: "viewer".into(), email: String::new(), full_name: "V".into(), role: "admin".into(), institution_type: None, status: "active".into(), status_reason: None };
+        let query = crate::platform_search::SearchQuery { q: Some(q.into()), ..Default::default() };
+        crate::platform_search::search(conn, &viewer, &query, now_ms())
+    }
 
     struct W {
         conn: Connection,
@@ -1270,6 +1323,9 @@ mod tests {
         assert_eq!(told, 1);
         let d: serde_json::Value = serde_json::from_str(&title).unwrap();
         assert_eq!((d["title"].as_str(), d["teacher"].as_str()), (Some("بث مباشر"), Some("د. خالد البرمجي")));
+        // a cancelled session has no page of its own (`GET /live/{id}` answers 404 for it): the notice leads to the subject
+        let link: String = w.conn.query_row("SELECT link FROM notifications WHERE user_id = ?1 AND kind = 'live_cancelled'", params![w.students[3].id], |r| r.get(0)).unwrap();
+        assert_eq!(link, "/platform/subjects/s1");
         assert_eq!(n(&w.conn, &format!("SELECT count(*) FROM notifications WHERE user_id = '{}' AND kind = 'live_cancelled'", w.teacher.id)), 0);
     }
 
@@ -1385,5 +1441,296 @@ mod tests {
         let conn = state.platform.conn.lock().unwrap();
         assert_eq!(n(&conn, "SELECT count(*) FROM users WHERE email = 's0@x.com'"), 0);
         assert_eq!(n(&conn, "SELECT count(*) FROM attempts WHERE id = 'a1'"), 0);
+    }
+}
+
+/// Phase 4-2: only reports from accounts that have been around for a while count towards the automatic hide.
+#[cfg(test)]
+mod reporter_age_tests {
+    use super::*;
+    use crate::platform::{create_test_db, insert_test_user};
+
+    const NOW: i64 = 1_800_000_000_000;
+    const H: i64 = 3_600_000;
+
+    struct W {
+        conn: Connection,
+    }
+
+    fn world() -> W {
+        let conn = create_test_db();
+        conn.execute_batch(
+            "INSERT INTO institutions(id,type,name_ar,is_active,created_at) VALUES ('i1','university','جامعة',1,0);
+             INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES ('s1','i1','برمجة',1,0);",
+        )
+        .unwrap();
+        let teacher = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        conn.execute("INSERT INTO teacher_subjects(teacher_id,subject_id,status,created_at,decided_at) VALUES (?1,'s1','approved',0,0)", params![teacher.id]).unwrap();
+        conn.execute("INSERT INTO posts(id,teacher_id,subject_id,kind,title,body,status,created_at,updated_at) VALUES ('p1',?1,'s1','article','مقال','نص','published',0,0)", params![teacher.id]).unwrap();
+        W { conn }
+    }
+
+    /// A student whose account is `age` old at `NOW`.
+    fn student(w: &W, n: &str, age: i64) -> User {
+        let u = insert_test_user(&w.conn, &format!("{n}@x.com"), "student", "active");
+        w.conn.execute("UPDATE users SET created_at = ?2 WHERE id = ?1", params![u.id, NOW - age]).unwrap();
+        u
+    }
+
+    fn report(w: &W, who: &User, limits: &ReportLimits) {
+        let r = ReportReq { target_type: "post".into(), target_id: "p1".into(), reason: "مسيء".into() };
+        super::create_report(&w.conn, who, &r, limits, NOW).unwrap();
+    }
+
+    fn status(w: &W) -> String {
+        w.conn.query_row("SELECT status FROM posts WHERE id = 'p1'", [], |r| r.get(0)).unwrap()
+    }
+
+    fn open_reports(w: &W) -> i64 {
+        w.conn.query_row("SELECT count(*) FROM reports WHERE target_id = 'p1' AND status = 'open'", [], |r| r.get(0)).unwrap()
+    }
+
+    fn hours(h: i64) -> ReportLimits {
+        ReportLimits { min_account_age_hours: h }
+    }
+
+    #[test]
+    fn reports_from_young_accounts_are_stored_but_do_not_count_towards_the_hide() {
+        let w = world();
+        let limits = ReportLimits::default();
+        let old = [student(&w, "o1", 30 * H), student(&w, "o2", 25 * H)];
+        let young = [student(&w, "y1", H), student(&w, "y2", 5 * 60_000), student(&w, "y3", 0)];
+        for u in &young {
+            report(&w, u, &limits);
+        }
+        assert_eq!((status(&w), open_reports(&w)), ("published".to_string(), 3), "three brand-new accounts cannot take a post down");
+        report(&w, &old[0], &limits);
+        report(&w, &old[1], &limits);
+        assert_eq!((status(&w), open_reports(&w)), ("published".to_string(), 5), "two old reporters are still short of three, whatever the young ones did");
+        let third = student(&w, "o3", 48 * H);
+        report(&w, &third, &limits);
+        assert_eq!(status(&w), "draft", "the third ESTABLISHED account tips it");
+        assert_eq!(open_reports(&w), 6, "and every report is still there for the admin");
+        let notified: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE kind = 'content_auto_hidden'", [], |r| r.get(0)).unwrap();
+        assert_eq!(notified, 1);
+        // an admin sees all six
+        let all = list_reports(&w.conn, Some("open")).unwrap();
+        assert_eq!(all.len(), 6);
+    }
+
+    #[test]
+    fn the_boundary_is_inclusive_to_the_millisecond() {
+        let limits = ReportLimits::default();
+        for (age, counts) in [(24 * H, true), (24 * H - 1, false), (24 * H + 1, true)] {
+            let w = world();
+            let reporters = [student(&w, "a", 100 * H), student(&w, "b", 100 * H), student(&w, "edge", age)];
+            for u in &reporters {
+                report(&w, u, &limits);
+            }
+            assert_eq!(status(&w) == "draft", counts, "an account {age} ms old");
+        }
+    }
+
+    #[test]
+    fn zero_switches_the_age_rule_off() {
+        let w = world();
+        let off = hours(0);
+        for n in 0..3 {
+            report(&w, &student(&w, &format!("n{n}"), 0), &off);
+        }
+        assert_eq!(status(&w), "draft", "with 0 every account counts, even one created this instant");
+    }
+
+    #[test]
+    fn the_age_is_configurable() {
+        let w = world();
+        let limits = hours(72);
+        let reporters = [student(&w, "a", 80 * H), student(&w, "b", 73 * H), student(&w, "c", 71 * H), student(&w, "d", 30 * H)];
+        for u in &reporters {
+            report(&w, u, &limits);
+        }
+        assert_eq!(status(&w), "published", "two of them are 72 hours old, the others are not");
+        report(&w, &student(&w, "e", 99 * H), &limits);
+        assert_eq!(status(&w), "draft");
+    }
+
+    #[test]
+    fn the_age_rule_applies_to_every_kind_of_target() {
+        // a course is hidden by the same rule as a post
+        let w = world();
+        let teacher_id: String = w.conn.query_row("SELECT id FROM users WHERE role = 'teacher'", [], |r| r.get(0)).unwrap();
+        w.conn.execute("INSERT INTO courses(id,teacher_id,subject_id,title,status,created_at,updated_at) VALUES ('c1',?1,'s1','دورة','published',0,0)", params![teacher_id]).unwrap();
+        let limits = ReportLimits::default();
+        let r = ReportReq { target_type: "course".into(), target_id: "c1".into(), reason: "مسيء".into() };
+        for n in 0..3 {
+            super::create_report(&w.conn, &student(&w, &format!("y{n}"), H), &r, &limits, NOW).unwrap();
+        }
+        let st = |w: &W| -> String { w.conn.query_row("SELECT status FROM courses WHERE id = 'c1'", [], |r| r.get(0)).unwrap() };
+        assert_eq!(st(&w), "published");
+        for n in 0..3 {
+            super::create_report(&w.conn, &student(&w, &format!("o{n}"), 40 * H), &r, &limits, NOW).unwrap();
+        }
+        assert_eq!(st(&w), "draft");
+    }
+
+    // ───────── reporters that come of age (phase 4-2 review) ─────────
+
+    /// Files a report as of `at`; the reporter's account is `age` old at that moment.
+    fn report_at(w: &W, n: &str, age: i64, at: i64, limits: &ReportLimits) -> User {
+        let u = insert_test_user(&w.conn, &format!("{n}@x.com"), "student", "active");
+        w.conn.execute("UPDATE users SET created_at = ?2 WHERE id = ?1", params![u.id, at - age]).unwrap();
+        let r = ReportReq { target_type: "post".into(), target_id: "p1".into(), reason: "مسيء".into() };
+        super::create_report(&w.conn, &u, &r, limits, at).unwrap();
+        u
+    }
+
+    fn auto_hide_notices(w: &W) -> i64 {
+        w.conn.query_row("SELECT count(*) FROM notifications WHERE kind = 'content_auto_hidden'", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn reports_from_young_accounts_count_once_the_accounts_are_old_enough() {
+        let w = world();
+        let limits = ReportLimits::default();
+        let t = now_ms();
+        // a class registered an hour before it reported: three reports, none counts yet
+        for n in 0..3 {
+            report_at(&w, &format!("y{n}"), H, t, &limits);
+        }
+        assert_eq!((status(&w), open_reports(&w)), ("published".to_string(), 3));
+        assert_eq!(recount_matured_reports(&w.conn, &limits, t + H), 0, "still young");
+        assert_eq!(recount_matured_reports(&w.conn, &limits, t + 23 * H - 1), 0, "one millisecond short of 24 hours old");
+        assert_eq!(status(&w), "published");
+        // exactly 24 hours old: all three count, and the post goes down at the next pass
+        assert_eq!(recount_matured_reports(&w.conn, &limits, t + 23 * H), 1);
+        assert_eq!(status(&w), "draft");
+        assert_eq!(auto_hide_notices(&w), 1, "the owner is told once");
+        let audit: i64 = w.conn.query_row("SELECT count(*) FROM audit_log WHERE action = 'auto_hidden_by_reports' AND target_id = 'p1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(audit, 1);
+        // and no later pass repeats it
+        assert_eq!(recount_matured_reports(&w.conn, &limits, t + 30 * H), 0);
+        assert_eq!((auto_hide_notices(&w), open_reports(&w)), (1, 3), "the reports stay open for the admin");
+    }
+
+    #[test]
+    fn a_mix_of_old_and_matured_reporters_reaches_the_threshold_when_the_young_ones_mature() {
+        let w = world();
+        let limits = ReportLimits::default();
+        let t = now_ms();
+        report_at(&w, "o1", 50 * H, t, &limits);
+        report_at(&w, "o2", 50 * H, t, &limits);
+        report_at(&w, "y1", 2 * H, t, &limits);
+        assert_eq!(status(&w), "published", "two established accounts are short of three");
+        assert_eq!(recount_matured_reports(&w.conn, &limits, t + 5 * H), 0);
+        assert_eq!(status(&w), "published");
+        assert_eq!(recount_matured_reports(&w.conn, &limits, t + 22 * H), 1, "the third reporter is 24 hours old");
+        assert_eq!(status(&w), "draft");
+    }
+
+    #[test]
+    fn only_two_matured_reporters_are_still_short_of_three() {
+        let w = world();
+        let limits = ReportLimits::default();
+        let t = now_ms();
+        report_at(&w, "y1", H, t, &limits);
+        report_at(&w, "y2", H, t, &limits);
+        assert_eq!(recount_matured_reports(&w.conn, &limits, t + 40 * H), 0);
+        assert_eq!(status(&w), "published");
+    }
+
+    #[test]
+    fn the_clock_never_hides_content_again_that_its_owner_published_after_a_hide() {
+        let w = world();
+        let limits = ReportLimits::default();
+        let t = now_ms();
+        for n in 0..3 {
+            report_at(&w, &format!("y{n}"), H, t, &limits);
+        }
+        assert_eq!(recount_matured_reports(&w.conn, &limits, t + 23 * H), 1);
+        // the owner publishes it again while the reports are still open: the clock does not take it down a second time
+        w.conn.execute("UPDATE posts SET status = 'published' WHERE id = 'p1'", []).unwrap();
+        assert_eq!(recount_matured_reports(&w.conn, &limits, t + 50 * H), 0);
+        assert_eq!(status(&w), "published");
+        // reports that counted when they were filed are not the clock's business either
+        let w = world();
+        let t = now_ms();
+        for n in 0..3 {
+            report_at(&w, &format!("o{n}"), 40 * H, t, &limits);
+        }
+        assert_eq!(status(&w), "draft", "hidden at the third established report, as before");
+        w.conn.execute("UPDATE posts SET status = 'published' WHERE id = 'p1'", []).unwrap();
+        assert_eq!(recount_matured_reports(&w.conn, &limits, t + 100 * H), 0);
+        assert_eq!(status(&w), "published");
+        // a new established report still hides it again, exactly as it always did
+        report_at(&w, "o9", 40 * H, t, &limits);
+        assert_eq!(status(&w), "draft");
+    }
+
+    #[test]
+    fn reports_that_an_admin_closed_do_not_count_later() {
+        let w = world();
+        let limits = ReportLimits::default();
+        let t = now_ms();
+        for n in 0..3 {
+            report_at(&w, &format!("y{n}"), H, t, &limits);
+        }
+        w.conn.execute("UPDATE reports SET status = 'dismissed'", []).unwrap();
+        assert_eq!(recount_matured_reports(&w.conn, &limits, t + 40 * H), 0);
+        assert_eq!(status(&w), "published");
+    }
+
+    #[test]
+    fn with_the_age_rule_off_there_is_nothing_to_mature() {
+        let w = world();
+        let t = now_ms();
+        for n in 0..2 {
+            report_at(&w, &format!("y{n}"), H, t, &hours(24));
+        }
+        assert_eq!(recount_matured_reports(&w.conn, &hours(0), t + 40 * H), 0);
+        assert_eq!(status(&w), "published");
+    }
+
+    #[test]
+    fn matured_reports_hide_every_kind_of_target() {
+        let w = world();
+        let teacher_id: String = w.conn.query_row("SELECT id FROM users WHERE role = 'teacher'", [], |r| r.get(0)).unwrap();
+        w.conn.execute("INSERT INTO courses(id,teacher_id,subject_id,title,status,created_at,updated_at) VALUES ('c1',?1,'s1','دورة','published',0,0)", params![teacher_id]).unwrap();
+        w.conn
+            .execute("INSERT INTO live_sessions(id,teacher_id,subject_id,title,starts_at,duration_min,join_url,status,created_at) VALUES ('l1',?1,'s1','بث',?2,60,'https://m.example.com/x','scheduled',0)", params![teacher_id, now_ms() + 40 * H])
+            .unwrap();
+        let limits = ReportLimits::default();
+        let t = now_ms();
+        for (kind, id) in [("course", "c1"), ("live", "l1")] {
+            let r = ReportReq { target_type: kind.into(), target_id: id.into(), reason: "مسيء".into() };
+            for n in 0..3 {
+                let u = insert_test_user(&w.conn, &format!("{kind}{n}@x.com"), "student", "active");
+                w.conn.execute("UPDATE users SET created_at = ?2 WHERE id = ?1", params![u.id, t - H]).unwrap();
+                super::create_report(&w.conn, &u, &r, &limits, t).unwrap();
+            }
+        }
+        assert_eq!(recount_matured_reports(&w.conn, &limits, t + 23 * H), 2);
+        let st = |table: &str, id: &str| -> String { w.conn.query_row(&format!("SELECT status FROM {table} WHERE id = ?1"), params![id], |r| r.get(0)).unwrap() };
+        assert_eq!((st("courses", "c1").as_str(), st("live_sessions", "l1").as_str()), ("draft", "cancelled"));
+    }
+
+    #[test]
+    fn the_setting_is_read_once_from_the_environment_and_garbage_keeps_the_default() {
+        let parse = |v: Option<&str>| ReportLimits::parse(|k| {
+            assert_eq!(k, "PLATFORM_REPORT_MIN_ACCOUNT_AGE_HOURS");
+            v.map(String::from)
+        });
+        assert_eq!(parse(None), hours(24));
+        assert_eq!(parse(Some("24")), hours(24));
+        assert_eq!(parse(Some("0")), hours(0));
+        assert_eq!(parse(Some(" 48 ")), hours(48));
+        assert_eq!(parse(Some("1")), hours(1));
+        for garbage in ["", "abc", "-1", "1.5", "12h", "0x10", "99999999999999", "٣"] {
+            assert_eq!(parse(Some(garbage)), hours(24), "{garbage:?} must not switch the protection off by accident");
+        }
+        assert_eq!(ReportLimits::default(), hours(24));
+        assert!(hours(24).describe().contains("24") && hours(0).describe().contains("every account"));
+        // a huge value cannot overflow the arithmetic
+        assert_eq!(hours(u32::MAX as i64).newest_counting_account(NOW) < NOW, true);
+        assert_eq!(hours(0).newest_counting_account(NOW), i64::MAX);
     }
 }

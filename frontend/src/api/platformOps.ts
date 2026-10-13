@@ -11,8 +11,23 @@ export interface Stats {
   content: { posts: number; courses: number; lessons: number; live: number; assessments: number }
 }
 export interface AuditRow { id: number; actor: string | null; target_id: string | null; action: string; detail: string | null; created_at: number }
-export interface Hit { id: string; title: string; subtitle: string; link: string }
-export interface SearchResults { subjects: Hit[]; teachers: Hit[]; courses: Hit[]; posts: Hit[] }
+export interface Hit {
+  id: string; title: string; subtitle: string; link: string
+  /** up to 140 characters around the first match in the text field that matched (null when the title matched) */
+  snippet?: string | null
+  matched?: 'title' | 'text'
+}
+export type SearchGroupKey = 'subjects' | 'teachers' | 'courses' | 'posts' | 'live' | 'exams'
+export type SearchCounts = Record<SearchGroupKey, number>
+/** Without `group` each array holds up to 8 hits; with `group=g` only that array is filled (the others come back empty). */
+export interface SearchResults {
+  subjects: Hit[]; teachers: Hit[]; courses: Hit[]; posts: Hit[]
+  /** live sessions and exams (exams only for students) - absent from an older server */
+  live?: Hit[]; exams?: Hit[]
+  /** the total number of matches per group */
+  counts?: SearchCounts
+}
+export interface SearchOptions { group?: SearchGroupKey; limit?: number; offset?: number }
 
 export const report = (b: { target_type: ReportTarget; target_id: string; reason: string }) =>
   platformFetch<void>('/reports', { body: b })
@@ -21,7 +36,13 @@ export const resolveReport = (id: string, b: { status: 'resolved' | 'dismissed';
   platformFetch<void>(`/admin/reports/${id}`, { method: 'PATCH', body: b })
 export const adminStats = () => platformFetch<Stats>('/admin/stats')
 export const adminAudit = (before?: number) => platformFetch<AuditRow[]>(`/admin/audit${before ? `?before=${before}` : ''}`)
-export const search = (q: string) => platformFetch<SearchResults>(`/search?q=${encodeURIComponent(q)}`)
+export function search(q: string, o: SearchOptions = {}): Promise<SearchResults> {
+  const p = new URLSearchParams({ q })
+  if (o.group) p.set('group', o.group)
+  if (o.limit !== undefined) p.set('limit', String(o.limit))
+  if (o.offset) p.set('offset', String(o.offset))
+  return platformFetch<SearchResults>(`/search?${p.toString()}`)
+}
 export const changePassword = (current: string, next: string) =>
   platformFetch<void>('/me/password', { body: { current, new: next } })
 /** `confirm_email` (the typed account e-mail) is required from a student who has taken exams (409 `confirm_required`). */

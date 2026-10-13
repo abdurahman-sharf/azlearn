@@ -24,7 +24,7 @@ script-src 'self' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net/npm/onnxrunt
 style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
 font-src 'self' data: https://fonts.gstatic.com; \
 img-src 'self' data: blob: https:; \
-media-src 'self' blob: data: mediastream:; \
+media-src 'self' blob: data: mediastream: https:; \
 connect-src 'self' https: http: ws: wss: blob: data:; \
 worker-src 'self' blob:; \
 frame-src https://www.youtube-nocookie.com https://player.vimeo.com; \
@@ -121,6 +121,9 @@ mod tests {
         assert_eq!(get("form-action"), "form-action 'self'");
         assert_eq!(get("frame-ancestors"), "frame-ancestors 'self'");
         assert_eq!(get("frame-src"), "frame-src https://www.youtube-nocookie.com https://player.vimeo.com", "only the two embed hosts the server itself produces");
+        // lesson videos can be a direct https file (`<video src>`): media may load from https hosts (phase 4-2), nothing else new
+        assert_eq!(get("media-src"), "media-src 'self' blob: data: mediastream: https:");
+        assert!(!get("media-src").contains("http:") && !get("media-src").contains('*'), "no plain http, no wildcard");
         assert!(get("default-src").starts_with("default-src 'self'"));
         assert!(HeaderValue::from_str(CSP).is_ok(), "must be a valid header value");
     }

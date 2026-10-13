@@ -5,6 +5,7 @@ import { pendingTeacherMayEnter } from '@/utils/platformGuard'
 import { resetAdminStats } from '@/lib/adminStats'
 import { resetTeacherStats } from '@/lib/teacherStats'
 import { resetStudentStats } from '@/lib/studentStats'
+import { resetBookmarks } from '@/lib/bookmarks'
 import { setTitleKey } from '@/lib/docTitle'
 import { focusStillOurs, shouldMoveFocus, titleKeyOf } from '@/utils/routeTitle'
 
@@ -292,6 +293,25 @@ const router = createRouter({
       meta: { titleKey: 'mysubjTitle', title: 'My subjects', requiresAuth: true, requiresActive: true, roles: ['student'] },
     },
     {
+      // My courses: progress per course and a button that continues where the student stopped.
+      path: '/platform/learning',
+      name: 'platform-student-learning',
+      component: () => import('@/views/platform/LearningView.vue'),
+      meta: { titleKey: 'lrnTitle', title: 'My courses', requiresAuth: true, requiresActive: true, roles: ['student'] },
+    },
+    {
+      path: '/platform/schedule',
+      name: 'platform-student-schedule',
+      component: () => import('@/views/platform/ScheduleView.vue'),
+      meta: { titleKey: 'schTitle', title: 'My schedule', requiresAuth: true, requiresActive: true, roles: ['student'] },
+    },
+    {
+      path: '/platform/following',
+      name: 'platform-student-following',
+      component: () => import('@/views/platform/FollowingView.vue'),
+      meta: { titleKey: 'fllTitle', title: 'Following & saved', requiresAuth: true, requiresActive: true, roles: ['student'] },
+    },
+    {
       path: '/platform',
       name: 'platform-home',
       component: () => import('@/views/platform/PlatformHomeView.vue'),
@@ -388,6 +408,13 @@ const router = createRouter({
       name: 'platform-live-edit',
       component: () => import('@/views/platform/LiveEditorView.vue'),
       meta: { titleKey: 'ttlLiveEdit', title: 'platform-live-edit', requiresAuth: true, requiresActive: true, roles: ['teacher'] },
+    },
+    {
+      // A live lesson as a student sees it (the teacher's own copy of the session is edited at /platform/live/:id/edit).
+      path: '/platform/live/:id',
+      name: 'platform-live',
+      component: () => import('@/views/platform/LiveView.vue'),
+      meta: { titleKey: 'ttlLive', title: 'platform-live', requiresAuth: true, requiresActive: true, roles: ['student'] },
     },
     {
       path: '/platform/notifications',
@@ -577,6 +604,7 @@ setUnauthorizedHandler(() => {
   resetAdminStats()
   resetTeacherStats()
   resetStudentStats()
+  resetBookmarks()
   const here = router.currentRoute.value
   // Public pages (and the very first navigation, whose own guard redirects) stay where they are.
   // `expired` makes the sign-in page say why the person is there (and, on an exam page, that the answers are kept).

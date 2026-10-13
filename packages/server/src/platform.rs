@@ -94,6 +94,8 @@ pub struct PlatformState {
     pub public_stats: crate::platform_stats::StatsCache,
     /// Sign-in / registration limits (phase 4-1).
     pub limits: AuthLimits,
+    /// How old a reporter's account must be for its report to count towards the automatic hide (phase 4-2).
+    pub report_limits: crate::platform_ops::ReportLimits,
 }
 
 impl PlatformState {
@@ -112,6 +114,7 @@ impl PlatformState {
             started_at: 0,
             public_stats: Default::default(),
             limits: AuthLimits::default(),
+            report_limits: Default::default(),
         }
     }
 }
@@ -186,11 +189,16 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 /// Applies the core schema plus every feature module's schema (all idempotent).
 pub fn apply_schema(conn: &Connection) -> Result<(), String> {
+    // Every connection that gets the schema (the production open path and the test databases alike) gets the SQL
+    // functions the queries use.
+    register_sql_functions(conn)?;
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-    for extra in [crate::platform_learning::SCHEMA, crate::platform_content::SCHEMA, crate::platform_engage::SCHEMA, crate::platform_exams::SCHEMA, crate::platform_ops::SCHEMA, crate::platform_settings::SCHEMA, crate::platform_ai::SCHEMA, crate::platform_bank::SCHEMA, crate::platform_reminders::SCHEMA, crate::platform_backup::SCHEMA] {
+    for extra in [crate::platform_learning::SCHEMA, crate::platform_content::SCHEMA, crate::platform_engage::SCHEMA, crate::platform_exams::SCHEMA, crate::platform_ops::SCHEMA, crate::platform_settings::SCHEMA, crate::platform_ai::SCHEMA, crate::platform_bank::SCHEMA, crate::platform_reminders::SCHEMA, crate::platform_backup::SCHEMA, crate::platform_bookmarks::SCHEMA] {
         conn.execute_batch(extra).map_err(|e| e.to_string())?;
     }
     crate::platform_exams::migrate(conn)?;
+    // `exam_reminders` learned a third kind (phase 4-2); an older table is rebuilt with the wider CHECK
+    crate::platform_reminders::migrate(conn)?;
     // when a post / course was first announced (phase 3-4)
     crate::platform_content::migrate(conn)?;
     // Columns added after the first release.
@@ -235,6 +243,7 @@ pub fn init_db(layout: &crate::platform_backup::Layout) -> Result<PlatformState,
         started_at: now_ms(),
         public_stats: Default::default(),
         limits: AuthLimits::from_env(),
+        report_limits: crate::platform_ops::ReportLimits::from_env(),
     })
 }
 
@@ -583,6 +592,36 @@ pub const INSTITUTION_ACTIVE: &str = "EXISTS(SELECT 1 FROM institutions inst WHE
 /// `%…%` pattern for a case-insensitive `LIKE … ESCAPE '\'`: `%`, `_` and `\` in the search text are literal.
 pub fn like_pattern(raw: &str) -> String {
     format!("%{}%", raw.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_").to_lowercase())
+}
+
+/// The `LIKE … ESCAPE '\'` pattern for an Arabic-folded search: the text is folded with [`ar_fold`] (so the pattern and the
+/// column — `ar_fold(col) LIKE ?` — are compared in the same form) and `%`, `_` and `\` in it are literal.
+pub fn fold_like(raw: &str) -> String {
+    format!("%{}%", ar_fold(raw).replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+}
+
+/// **The one Arabic folding for searches** (and the SQL function `ar_fold`): the folding the answer checker and the question
+/// bank already use (`platform_exams::norm_text` — lowercase, no diacritics / tatweel, every alef form to a plain alef, ى to ي)
+/// with runs of whitespace collapsed (`platform_bank::stem_norm`). ة and ه are deliberately NOT unified, as in grading.
+pub fn ar_fold(s: &str) -> String {
+    crate::platform_bank::stem_norm(s)
+}
+
+/// Registers the SQL scalar functions the platform queries use. Idempotent (a second call replaces the first).
+///
+/// * `ar_fold(text)` — [`ar_fold`] in SQL; `NULL` stays `NULL`, a number is folded as its text, a blob is `NULL`.
+pub fn register_sql_functions(conn: &Connection) -> Result<(), String> {
+    use rusqlite::functions::FunctionFlags;
+    use rusqlite::types::ValueRef;
+    conn.create_scalar_function("ar_fold", 1, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+        Ok(match ctx.get_raw(0) {
+            ValueRef::Text(bytes) => Some(ar_fold(&String::from_utf8_lossy(bytes))),
+            ValueRef::Integer(i) => Some(i.to_string()),
+            ValueRef::Real(f) => Some(f.to_string()),
+            ValueRef::Null | ValueRef::Blob(_) => None,
+        })
+    })
+    .map_err(|e| e.to_string())
 }
 
 pub fn audit(conn: &Connection, actor: &str, target: &str, action: &str, detail: &str) {
@@ -991,5 +1030,84 @@ mod http_tests {
         for email in ["c@x.com", "d@x.com"] {
             assert_eq!(send(&app, "/api/platform/register", "1.1.1.1", reg(email)).await.0, StatusCode::CREATED, "0 = off");
         }
+    }
+}
+
+/// Phase 4-2: the Arabic folding that searches use, as a SQL function on every platform connection.
+#[cfg(test)]
+mod ar_fold_tests {
+    use super::*;
+
+    fn fold_in_sql(conn: &Connection, text: &str) -> Option<String> {
+        conn.query_row("SELECT ar_fold(?1)", params![text], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn it_is_the_same_folding_the_answer_checker_and_the_question_bank_use() {
+        for s in ["أَحْمَد", "إسلام", "آمن", "ٱلكتاب", "مصطفى", "مـــد", "  كلمة   في\tسطر\n", "ABC def", "ÀÉ", "", "   ", "١٢٣", "نص مُشَكَّل جِدًّا", "ة ه"] {
+            assert_eq!(ar_fold(s), crate::platform_bank::stem_norm(s), "{s:?}");
+            assert_eq!(ar_fold(s), crate::platform_exams::norm_text(s).split_whitespace().collect::<Vec<_>>().join(" "), "{s:?}");
+        }
+        assert_eq!(ar_fold("أَحْمَد  ـ الإبراهيمي"), "احمد الابراهيمي");
+        assert_eq!(ar_fold("مصطفى"), "مصطفي", "ى = ي");
+        assert_eq!(ar_fold("مدرسة"), "مدرسة", "ة is not folded into ه (as in grading)");
+        assert_ne!(ar_fold("مدرسة"), ar_fold("مدرسه"));
+        assert_eq!(ar_fold("HeLLo"), "hello");
+    }
+
+    #[test]
+    fn it_is_registered_on_a_test_database() {
+        let conn = create_test_db();
+        assert_eq!(fold_in_sql(&conn, "أَحْمَد  ـ الإبراهيمي").as_deref(), Some("احمد الابراهيمي"));
+        // NULL stays NULL, numbers fold as their text, a blob is NULL
+        assert_eq!(fold_in_sql(&conn, "x").as_deref(), Some("x"));
+        let null: Option<String> = conn.query_row("SELECT ar_fold(NULL)", [], |r| r.get(0)).unwrap();
+        assert_eq!(null, None);
+        let n: Option<String> = conn.query_row("SELECT ar_fold(42)", [], |r| r.get(0)).unwrap();
+        assert_eq!(n.as_deref(), Some("42"));
+        let blob: Option<String> = conn.query_row("SELECT ar_fold(x'0102')", [], |r| r.get(0)).unwrap();
+        assert_eq!(blob, None);
+        // it works inside a query over a table, with LIKE and ESCAPE like the searches use it
+        conn.execute_batch("INSERT INTO institutions(id,type,name_ar,is_active,created_at) VALUES ('i1','university','جامعة الإمام',1,0);").unwrap();
+        let found: i64 = conn.query_row("SELECT count(*) FROM institutions WHERE ar_fold(name_ar) LIKE ?1 ESCAPE '\\'", params![fold_like("الامام")], |r| r.get(0)).unwrap();
+        assert_eq!(found, 1);
+    }
+
+    #[test]
+    fn it_is_registered_on_the_production_open_path_too() {
+        let root = std::env::temp_dir().join(format!("exameow-arfold-{}", new_id()));
+        let layout = crate::platform_backup::Layout { db_path: root.join("platform.db"), files_dir: root.join("files"), key_file: root.join("platform.key"), backup_dir: root.join("backups") };
+        std::fs::create_dir_all(&root).unwrap();
+        let state = init_db(&layout).expect("the production open path");
+        {
+            let conn = state.conn.lock().unwrap();
+            assert_eq!(fold_in_sql(&conn, "إحصاء").as_deref(), Some("احصاء"));
+        }
+        // the file works again after a restart (a new connection to the same file registers it again)
+        drop(state);
+        let again = init_db(&layout).unwrap();
+        assert_eq!(fold_in_sql(&again.conn.lock().unwrap(), "آمنة").as_deref(), Some("امنة"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registering_twice_is_harmless_and_a_plain_connection_does_not_have_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(conn.query_row("SELECT ar_fold('x')", [], |r| r.get::<_, String>(0)).is_err(), "a bare connection has no such function: every opener must go through apply_schema");
+        register_sql_functions(&conn).unwrap();
+        register_sql_functions(&conn).unwrap();
+        assert_eq!(fold_in_sql(&conn, "أ").as_deref(), Some("ا"));
+        apply_schema(&conn).unwrap();
+        apply_schema(&conn).unwrap();
+        assert_eq!(fold_in_sql(&conn, "ى").as_deref(), Some("ي"));
+    }
+
+    #[test]
+    fn the_like_pattern_is_folded_and_wildcards_stay_literal() {
+        assert_eq!(fold_like("أَحمد"), "%احمد%");
+        assert_eq!(fold_like("100%"), "%100\\%%");
+        assert_eq!(fold_like("a_b"), "%a\\_b%");
+        assert_eq!(fold_like("a\\b"), "%a\\\\b%");
+        assert_eq!(fold_like("  Two   Words "), "%two words%");
     }
 }

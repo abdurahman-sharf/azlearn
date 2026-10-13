@@ -403,6 +403,10 @@ pub fn update_exam(conn: &Connection, user: &User, id: &str, r: &ExamReq, now: i
     if base.closes_at.map_or(false, |c| c <= now) && cfg.closes_at.map_or(true, |c| c > now) {
         crate::platform_reminders::reset_results(conn, id);
     }
+    // an exam that opens at another time tells its students "it is open" at the new time (phase 4-2)
+    if cfg.opens_at != base.opens_at {
+        crate::platform_reminders::reset_opened(conn, id);
+    }
     audit(conn, &user.id, id, "exam_update", if frozen { "frozen" } else { "" });
     get_exam(conn, user, id, now)
 }
@@ -503,6 +507,8 @@ pub fn act(conn: &Connection, user: &User, id: &str, action: &str, now: i64) -> 
             set(Move::live("published"))?;
             // results are withheld again until the next close, so "results available" will be due again then
             crate::platform_reminders::reset_results(conn, id);
+            // ("it is open" is NOT re-armed here: it is tied to the opening time, which only a change of `opens_at` re-arms -
+            // a close/reopen cycle must not send the same notice again each time)
         }
         "archive" => {
             if cur.status == "published" {

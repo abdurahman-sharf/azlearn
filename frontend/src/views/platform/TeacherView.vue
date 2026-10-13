@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { ref, watch } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorMessage } from '@/i18n/platform'
+import { useRouteParam } from '@/composables/useRouteParam'
 import ReportButton from '@/components/platform/ReportButton.vue'
 import ReviewsPanel from '@/components/platform/ReviewsPanel.vue'
 import ContentLists from '@/components/platform/ContentLists.vue'
@@ -13,32 +13,47 @@ import PageLoading from '@/components/platform/PageLoading.vue'
 
 const pt = usePt()
 const auth = useAuthStore()
-const route = useRoute()
-const id = route.params.id as string
+const id = useRouteParam('id')
 
 const teacher = ref<TeacherPage | null>(null)
 const content = ref<Bundle>({ posts: [], courses: [], live: [] })
 const error = ref('')
 
+// Answers to the latest load only: a slow answer for the teacher we just left must not land on the one we are opening.
+let seq = 0
 async function load() {
+  const mine = ++seq
+  const teacherId = id.value
   try {
-    teacher.value = await getTeacher(id)
-    content.value = await teacherContent(id)
+    const t = await getTeacher(teacherId)
+    const c = await teacherContent(teacherId)
+    if (mine !== seq) return
+    teacher.value = t
+    content.value = c
+    error.value = ''
   } catch (e) {
-    error.value = platformErrorMessage(pt, e)
+    if (mine === seq) error.value = platformErrorMessage(pt, e)
   }
 }
 
 async function toggleFollow() {
   if (!teacher.value) return
   try {
-    await (teacher.value.following ? unfollow(id) : follow(id))
+    await (teacher.value.following ? unfollow(id.value) : follow(id.value))
     await load()
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
   }
 }
-onMounted(load)
+
+// Moving to another teacher (a link, a notification, back/forward) re-uses this page: forget the old one and load the new.
+watch(id, () => {
+  seq++
+  teacher.value = null
+  content.value = { posts: [], courses: [], live: [] }
+  error.value = ''
+  void load()
+}, { immediate: true })
 </script>
 
 <template>
@@ -48,7 +63,7 @@ onMounted(load)
     <p class="text-body-sm mb-3" style="color: rgb(var(--md-on-surface-variant))"><span dir="ltr" class="inline-block">{{ teacher.followers }}</span> {{ pt('followers') }}</p>
     <p v-if="teacher.bio" class="text-body-lg mb-4 whitespace-pre-line" dir="auto" data-testid="teacher-bio">{{ teacher.bio }}</p>
     <p v-if="error" class="text-body-sm mb-3" role="alert" style="color: rgb(var(--md-error))">{{ error }}</p>
-    <button v-if="auth.role === 'student'" :class="teacher.following ? 'btn-outlined' : 'btn-filled'" class="mb-6" @click="toggleFollow">
+    <button v-if="auth.role === 'student'" :class="teacher.following ? 'btn-outlined' : 'btn-filled'" class="mb-6" data-testid="teacher-follow" @click="toggleFollow">
       {{ teacher.following ? pt('unfollow') : pt('follow') }}
     </button>
 

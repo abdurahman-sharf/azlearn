@@ -4,7 +4,7 @@
 export type NotificationData = Record<string, string | number | null>
 
 /** Kinds whose `data.count` folds several events into one notice ("3 students joined"): more than one uses the `_many` wording. */
-const COUNTED = new Set(['new_enrollment', 'new_follower', 'submission_pending'])
+const COUNTED = new Set(['new_enrollment', 'new_follower', 'submission_pending', 'new_lesson'])
 
 const plain = (v: string | number | null | undefined): string => (typeof v === 'string' ? v.trim() : '')
 

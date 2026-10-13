@@ -14,7 +14,10 @@ export type NotificationGroup = 'exams' | 'content' | 'people' | 'account'
 export interface NotificationQuery { limit?: number; cursor?: string; group?: NotificationGroup; unread?: boolean }
 export interface Review { id: string; rating: number; comment: string | null; student_name: string; mine: boolean; created_at: number }
 export interface ReviewSummary { average: number; count: number; can_review: boolean; mine: Review | null; items: Review[] }
-export interface ProgressItem { course_id: string; title: string; subject_name: string; total: number; completed: number }
+export interface ProgressItem {
+  course_id: string; title: string; subject_name: string; total: number; completed: number
+  subject_id?: string; percent?: number; next_lesson_id?: string | null
+}
 
 export const notifications = (q: NotificationQuery = {}) => {
   const p = new URLSearchParams()

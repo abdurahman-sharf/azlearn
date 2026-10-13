@@ -26,12 +26,26 @@ export interface Lesson {
   id: string; course_id: string; position: number; section: string | null; title: string
   description: string | null; video_url: string; embed_url: string | null
   video_kind: 'youtube' | 'vimeo' | 'file' | 'link'
+  /**
+   * The video link is withheld from this viewer (a student who is not enrolled in the subject): `video_url` is "" and
+   * `embed_url` null; the title, description, section and `video_kind` stay. Owners, admins and approved colleagues never see it.
+   */
+  locked?: boolean
 }
-export interface CourseDetail extends Course { lessons: Lesson[] }
+export interface CourseDetail extends Course {
+  lessons: Lesson[]
+  /** the viewer is a student enrolled in the course's subject */
+  enrolled?: boolean
+  /** at least one lesson's link is withheld */
+  links_locked?: boolean
+}
 export interface Live extends OwnerView {
   id: string; teacher_id: string; teacher_name: string; subject_id: string; subject_name: string
   title: string; description: string | null; starts_at: number; duration_min: number
+  /** "" while `locked` */
   join_url: string; status: 'scheduled' | 'cancelled'
+  /** the join link is withheld from this viewer (a student who is not enrolled in the subject) */
+  locked?: boolean
   /** the session's time has passed (only on the owner's lists and `GET /live/{id}`) */
   ended?: boolean
 }

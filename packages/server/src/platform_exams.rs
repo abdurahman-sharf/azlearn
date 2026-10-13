@@ -204,18 +204,24 @@ const OPEN_ENDED_LIMIT_MS: i64 = 24 * 3_600_000;
 
 // ───────── grading ─────────
 
+/// The Arabic folding of ONE character: `None` for a diacritic or a tatweel (dropped), the plain letter for an alef form
+/// (أ إ آ ٱ -> ا) or an alef maqsura (ى -> ي), the character itself otherwise. Lowercasing is separate (it can turn one
+/// character into several). [`norm_text`] is this over a string; snippets use it character by character, so the folding
+/// exists once.
+pub(crate) fn fold_char(c: char) -> Option<char> {
+    if matches!(c as u32, 0x064B..=0x065F | 0x0670 | 0x0640) {
+        return None;
+    }
+    Some(match c {
+        'أ' | 'إ' | 'آ' | 'ٱ' => 'ا',
+        'ى' => 'ي',
+        c => c,
+    })
+}
+
 /// Arabic-aware comparison form: strips diacritics/tatweel, unifies alef/yeh variants, lowercases.
 pub(crate) fn norm_text(s: &str) -> String {
-    s.trim()
-        .chars()
-        .filter(|c| !matches!(*c as u32, 0x064B..=0x065F | 0x0670 | 0x0640))
-        .map(|c| match c {
-            'أ' | 'إ' | 'آ' | 'ٱ' => 'ا',
-            'ى' => 'ي',
-            c => c,
-        })
-        .collect::<String>()
-        .to_lowercase()
+    s.trim().chars().filter_map(fold_char).collect::<String>().to_lowercase()
 }
 
 /// Maps Arabic true/false words onto the relay's A/B convention.
@@ -869,6 +875,9 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
         params![title, description, duration, opens, closes, max_attempts, r.show_answers.unwrap_or(cur.show_answers), status, now_ms(), id],
     )
     .map_err(db_err)?;
+    if opens != cur.opens_at {
+        crate::platform_reminders::reset_opened(conn, id); // the new opening time is announced afresh (phase 4-2)
+    }
     if !is_owner {
         audit(conn, &user.id, id, "assessment_moderated", &status);
         if let Some(owner) = &owner {

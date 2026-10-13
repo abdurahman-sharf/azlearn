@@ -2,7 +2,8 @@
 import { computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
-  AcademicCapIcon, BellIcon, BookOpenIcon, ClipboardDocumentListIcon, Cog6ToothIcon, HomeIcon, MagnifyingGlassIcon, UserCircleIcon, UsersIcon,
+  AcademicCapIcon, BellIcon, BookOpenIcon, BookmarkIcon, CalendarDaysIcon, ClipboardDocumentListIcon, Cog6ToothIcon, HomeIcon, MagnifyingGlassIcon,
+  PlayCircleIcon, UserCircleIcon, UsersIcon,
 } from '@heroicons/vue/24/outline'
 import { useStudentStats } from '@/lib/studentStats'
 import { examsBadge } from '@/utils/studentExams'
@@ -24,10 +25,13 @@ const groups = computed<NavGroup[]>(() => [
   ] },
   { key: 'study', label: 'stuGroupStudy', items: [
     { to: '/platform/my-subjects', label: 'mysubjTitle', icon: BookOpenIcon, testid: 'nav-student-subjects' },
+    { to: '/platform/learning', label: 'lrnTitle', icon: PlayCircleIcon, testid: 'nav-student-learning' },
     { to: '/platform/my-exams', label: 'stexTitle', icon: ClipboardDocumentListIcon, badge: examsBadge(stats.value), testid: 'nav-student-exams' },
+    { to: '/platform/schedule', label: 'schTitle', icon: CalendarDaysIcon, testid: 'nav-student-schedule' },
   ] },
   { key: 'explore', label: 'stuGroupExplore', items: [
     { to: '/platform/teachers', label: 'browseTeachers', icon: UsersIcon, testid: 'nav-student-teachers' },
+    { to: '/platform/following', label: 'fllTitle', icon: BookmarkIcon, testid: 'nav-student-following' },
     { to: '/platform/search', label: 'tchNavSearch', icon: MagnifyingGlassIcon, testid: 'nav-student-search' },
   ] },
   { key: 'me', label: 'tchGroupMe', items: [
