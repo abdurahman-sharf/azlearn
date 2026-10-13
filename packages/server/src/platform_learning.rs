@@ -1,7 +1,7 @@
 //! Teaching assignments (teacher <-> subject, admin-approved), student placement and
 //! enrollment, following teachers, public teacher/subject pages.
 
-use crate::platform::{audit, bad, db_err, lock, opt_text, require_active, require_admin, require_role, Res, User};
+use crate::platform::{audit, authenticate, bad, db_err, fold_like, like_pattern, lock, opt_text, require_active, require_admin, require_role, Res, User, INSTITUTION_ACTIVE, SUBJECT_ACTIVE};
 use crate::relay::{err, now_ms};
 use crate::routes::AppState;
 use axum::{
@@ -46,23 +46,48 @@ CREATE INDEX IF NOT EXISTS idx_follow_teacher ON teacher_follows(teacher_id);
 
 // ───────── profile ─────────
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct ProfilePatch {
     full_name: Option<String>,
     bio: Option<String>,
+    /// `school`, `institute` or `university`; anything else is refused. There is no way to clear it here.
+    institution_type: Option<String>,
 }
 
-fn update_profile(conn: &Connection, user: &User, p: &ProfilePatch) -> Res<()> {
-    if let Some(n) = &p.full_name {
-        let t = n.trim();
-        if t.is_empty() || t.chars().count() > 120 {
-            return Err(bad("invalid_name"));
-        }
-        conn.execute("UPDATE users SET full_name = ?1 WHERE id = ?2", params![t, user.id]).map_err(db_err)?;
+/// The kinds of institution a person can say they belong to (same list as `institutions.type`).
+pub(crate) fn valid_institution_type(raw: &str) -> Res<&str> {
+    match raw {
+        t @ ("school" | "institute" | "university") => Ok(t),
+        _ => Err(bad("invalid_type")),
     }
-    if p.bio.is_some() {
-        let bio = opt_text(&p.bio, 1000, "bio_too_long")?;
-        conn.execute("UPDATE users SET bio = ?1 WHERE id = ?2", params![bio, user.id]).map_err(db_err)?;
+}
+
+/// Edits the caller's own profile row (`user.id` comes from the session). Every field is validated before the
+/// first write, so a bad value never leaves a half-applied change.
+fn update_profile(conn: &Connection, user: &User, p: &ProfilePatch) -> Res<()> {
+    let name = match &p.full_name {
+        Some(n) => {
+            let t = n.trim();
+            if t.is_empty() || t.chars().count() > 120 {
+                return Err(bad("invalid_name"));
+            }
+            Some(t.to_string())
+        }
+        None => None,
+    };
+    let bio = if p.bio.is_some() { Some(opt_text(&p.bio, 1000, "bio_too_long")?) } else { None };
+    let inst = match &p.institution_type {
+        Some(t) => Some(valid_institution_type(t)?),
+        None => None,
+    };
+    if let Some(n) = name {
+        conn.execute("UPDATE users SET full_name = ?1 WHERE id = ?2", params![n, user.id]).map_err(db_err)?;
+    }
+    if let Some(b) = bio {
+        conn.execute("UPDATE users SET bio = ?1 WHERE id = ?2", params![b, user.id]).map_err(db_err)?;
+    }
+    if let Some(t) = inst {
+        conn.execute("UPDATE users SET institution_type = ?1 WHERE id = ?2", params![t, user.id]).map_err(db_err)?;
     }
     Ok(())
 }
@@ -79,6 +104,8 @@ pub async fn update_profile_handler(
 
 // ───────── teaching assignments ─────────
 
+/// An assignment as the PUBLIC pages show it (the teacher page lists the approved ones). It carries no dates, no
+/// admin note and no activity flags: those belong to the teacher and the admin only ([`TeachingExtra`]).
 #[derive(Serialize, Debug)]
 pub struct Teaching {
     teacher_id: String,
@@ -90,11 +117,54 @@ pub struct Teaching {
     status: String,
 }
 
-const TEACHING_SELECT: &str = "SELECT ts.teacher_id, u.full_name, ts.subject_id, s.name_ar, i.id, i.name_ar, ts.status
-     FROM teacher_subjects ts
+/// What only the assignment's teacher and the admins may see: when it was asked for / decided, the admin's note on
+/// the decision, where the subject sits in the institution, and whether the subject and its institution are on.
+/// Deliberately a separate struct (flattened next to [`Teaching`] in the two private DTOs) so it can never leak
+/// into the public teacher page.
+#[derive(Serialize, Debug)]
+pub struct TeachingExtra {
+    created_at: i64,
+    decided_at: Option<i64>,
+    /// The admin's optional note on the decision (rejection reason, why it was withdrawn).
+    reason: Option<String>,
+    /// Unit names from the root down to the subject's own unit; empty when the subject hangs on the institution.
+    unit_path: Vec<String>,
+    subject_active: bool,
+    institution_active: bool,
+}
+
+/// A row of `GET /teaching`: the teacher's own assignments.
+#[derive(Serialize, Debug)]
+pub struct MyTeaching {
+    #[serde(flatten)]
+    base: Teaching,
+    #[serde(flatten)]
+    extra: TeachingExtra,
+}
+
+/// An assignment row as the admin sees it: the standard fields plus the state of the teacher's *account*, so a
+/// request from a teacher who is still waiting for approval is recognisable.
+#[derive(Serialize, Debug)]
+pub struct AdminTeaching {
+    #[serde(flatten)]
+    base: Teaching,
+    #[serde(flatten)]
+    extra: TeachingExtra,
+    teacher_status: String,
+}
+
+const TEACHING_COLS: &str = "ts.teacher_id, u.full_name, ts.subject_id, s.name_ar, i.id, i.name_ar, ts.status";
+const TEACHING_FROM: &str = "FROM teacher_subjects ts
      JOIN users u ON u.id = ts.teacher_id
      JOIN subjects s ON s.id = ts.subject_id
      JOIN institutions i ON i.id = s.institution_id";
+/// Columns 7..=12 of the private DTOs, read by [`read_detail`].
+const DETAIL_COLS: &str = ", ts.created_at, ts.decided_at, ts.reason, s.unit_id, s.is_active, i.is_active";
+
+/// The shared assignment query; `extra` adds columns after the standard seven (e.g. [`DETAIL_COLS`]).
+fn teaching_select(extra: &str) -> String {
+    format!("SELECT {TEACHING_COLS}{extra} {TEACHING_FROM}")
+}
 
 fn map_teaching(r: &rusqlite::Row) -> rusqlite::Result<Teaching> {
     Ok(Teaching {
@@ -108,17 +178,86 @@ fn map_teaching(r: &rusqlite::Row) -> rusqlite::Result<Teaching> {
     })
 }
 
-fn my_teaching(conn: &Connection, teacher_id: &str) -> Res<Vec<Teaching>> {
-    conn.prepare(&format!("{TEACHING_SELECT} WHERE ts.teacher_id = ?1 ORDER BY i.name_ar, s.name_ar"))
-        .map_err(db_err)?
-        .query_map(params![teacher_id], map_teaching)
-        .map_err(db_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_err)
+/// A row read from [`DETAIL_COLS`] whose unit path is still to be looked up.
+struct RawDetail {
+    base: Teaching,
+    created_at: i64,
+    decided_at: Option<i64>,
+    reason: Option<String>,
+    unit_id: Option<String>,
+    subject_active: bool,
+    institution_active: bool,
 }
 
-pub async fn my_teaching_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res<Json<Vec<Teaching>>> {
-    let user = require_role(&state, &headers, "teacher")?;
+fn read_detail(r: &rusqlite::Row) -> rusqlite::Result<RawDetail> {
+    Ok(RawDetail {
+        base: map_teaching(r)?,
+        created_at: r.get(7)?,
+        decided_at: r.get(8)?,
+        reason: r.get(9)?,
+        unit_id: r.get(10)?,
+        subject_active: r.get(11)?,
+        institution_active: r.get(12)?,
+    })
+}
+
+/// Names of the unit chain above (and including) `unit_id`, root first (e.g. department > level > term).
+pub(crate) fn unit_path(conn: &Connection, unit_id: Option<String>) -> Res<Vec<String>> {
+    let mut path = Vec::new();
+    let mut cur = unit_id;
+    while let Some(uid) = cur {
+        let row: Option<(String, Option<String>)> = conn
+            .query_row("SELECT name_ar, parent_id FROM org_units WHERE id = ?1", params![uid], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(db_err)?;
+        let Some((name, parent)) = row else { break };
+        path.push(name);
+        cur = parent;
+        if path.len() > 8 {
+            break;
+        }
+    }
+    path.reverse();
+    Ok(path)
+}
+
+/// Splits the raw rows into the base DTO and its [`TeachingExtra`], looking each distinct unit's path up once.
+fn finish_details(conn: &Connection, raws: Vec<RawDetail>) -> Res<Vec<(Teaching, TeachingExtra)>> {
+    let mut paths: std::collections::HashMap<Option<String>, Vec<String>> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(raws.len());
+    for r in raws {
+        if !paths.contains_key(&r.unit_id) {
+            let p = unit_path(conn, r.unit_id.clone())?;
+            paths.insert(r.unit_id.clone(), p);
+        }
+        out.push((
+            r.base,
+            TeachingExtra {
+                created_at: r.created_at,
+                decided_at: r.decided_at,
+                reason: r.reason,
+                unit_path: paths[&r.unit_id].clone(),
+                subject_active: r.subject_active,
+                institution_active: r.institution_active,
+            },
+        ));
+    }
+    Ok(out)
+}
+
+fn my_teaching(conn: &Connection, teacher_id: &str) -> Res<Vec<MyTeaching>> {
+    let raws = conn
+        .prepare(&format!("{} WHERE ts.teacher_id = ?1 ORDER BY i.name_ar, s.name_ar", teaching_select(DETAIL_COLS)))
+        .map_err(db_err)?
+        .query_map(params![teacher_id], read_detail)
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(finish_details(conn, raws)?.into_iter().map(|(base, extra)| MyTeaching { base, extra }).collect())
+}
+
+pub async fn my_teaching_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res<Json<Vec<MyTeaching>>> {
+    let user = may_request_teaching(authenticate(&state, &headers)?)?;
     my_teaching(&*lock(&state)?, &user.id).map(Json)
 }
 
@@ -127,7 +266,13 @@ pub struct SubjectRef {
     subject_id: String,
 }
 
-/// A teacher asks to teach a subject; it stays `pending` until an admin approves.
+/// How many requests a teacher may have waiting for the admin at once. Accounts are open to self-registration and a
+/// teacher account may ask for subjects while it is itself still unapproved, so without a ceiling one throw-away
+/// account could queue a request for every subject and bury the genuine ones.
+pub(crate) const MAX_OPEN_TEACHING_REQUESTS: i64 = 20;
+
+/// A teacher asks to teach a subject; it stays `pending` until an admin approves. Asking again after a rejection
+/// starts a fresh request: the old decision's date and note are cleared with it.
 fn request_teaching(conn: &Connection, teacher: &User, subject_id: &str) -> Res<()> {
     let active: Option<bool> = conn
         .query_row(
@@ -148,11 +293,19 @@ fn request_teaching(conn: &Connection, teacher: &User, subject_id: &str) -> Res<
         )
         .optional()
         .map_err(db_err)?;
+    if matches!(existing.as_deref(), Some("pending") | Some("approved")) {
+        return Err(err(StatusCode::CONFLICT, "already_requested"));
+    }
+    let open: i64 = conn
+        .query_row("SELECT count(*) FROM teacher_subjects WHERE teacher_id = ?1 AND status = 'pending'", params![teacher.id], |r| r.get(0))
+        .map_err(db_err)?;
+    if open >= MAX_OPEN_TEACHING_REQUESTS {
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "too_many_pending_requests"));
+    }
     match existing.as_deref() {
-        Some("pending") | Some("approved") => return Err(err(StatusCode::CONFLICT, "already_requested")),
         Some(_) => {
             conn.execute(
-                "UPDATE teacher_subjects SET status = 'pending', created_at = ?3, decided_at = NULL WHERE teacher_id = ?1 AND subject_id = ?2",
+                "UPDATE teacher_subjects SET status = 'pending', created_at = ?3, decided_at = NULL, reason = NULL WHERE teacher_id = ?1 AND subject_id = ?2",
                 params![teacher.id, subject_id, now_ms()],
             )
             .map_err(db_err)?;
@@ -173,9 +326,49 @@ pub async fn request_teaching_handler(
     headers: HeaderMap,
     Json(req): Json<SubjectRef>,
 ) -> Res<StatusCode> {
-    let user = require_role(&state, &headers, "teacher")?;
+    let user = may_request_teaching(authenticate(&state, &headers)?)?;
     request_teaching(&*lock(&state)?, &user, &req.subject_id)?;
     Ok(StatusCode::CREATED)
+}
+
+/// Who may use the "ask to teach a subject" flow: a teacher whose account is active **or still waiting for approval**
+/// (so the request can already be in the admin's queue when the account is approved). Rejected and suspended teachers
+/// — and everyone who is not a teacher — are refused. The flow is exactly five routes, so a pending teacher can
+/// actually complete it: `POST /teaching` (ask), `GET /teaching` (see the requests), `GET /teaching/{id}/impact` (what
+/// withdrawing would hide), `DELETE /teaching/{id}` (withdraw one) and — to find a subject id at all — the catalogue
+/// reads, see [`may_browse_catalog`]. That is all a pending account gets: the requested content stays invisible until
+/// the account is active *and* the assignment approved (`visible()`), and every other teacher route still goes
+/// through `require_role`, which demands an active account.
+pub(crate) fn may_request_teaching(user: User) -> Res<User> {
+    if user.role == "teacher" && (user.status == "active" || user.status == "pending") {
+        Ok(user)
+    } else {
+        Err(err(StatusCode::FORBIDDEN, "forbidden"))
+    }
+}
+
+/// Who may read the institution list and an institution's structure (`GET /institutions[/{id}/structure]`): any
+/// active account, plus a teacher still waiting for approval — they need the catalogue to pick the subjects they
+/// ask for ([`may_request_teaching`]). Pending students and rejected/suspended accounts of any role stay out.
+pub(crate) fn may_browse_catalog(user: &User) -> bool {
+    user.status == "active" || (user.role == "teacher" && user.status == "pending")
+}
+
+/// The teacher's own withdrawal of a request or of an approved subject (idempotent: nothing to withdraw is fine).
+/// The content they published there is kept, it just stops being shown. Audited with what the subject was and how
+/// many items it took out of sight.
+fn withdraw_teaching(conn: &Connection, user: &User, subject_id: &str) -> Res<()> {
+    let now = now_ms();
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    let previous: Option<String> = tx
+        .query_row("SELECT status FROM teacher_subjects WHERE teacher_id = ?1 AND subject_id = ?2", params![user.id, subject_id], |r| r.get(0))
+        .optional()
+        .map_err(db_err)?;
+    let Some(previous) = previous else { return Ok(()) };
+    let hidden = if previous == "approved" { teaching_impact(&tx, &user.id, subject_id, now)?.total() } else { 0 };
+    tx.execute("DELETE FROM teacher_subjects WHERE teacher_id = ?1 AND subject_id = ?2", params![user.id, subject_id]).map_err(db_err)?;
+    audit(&tx, &user.id, &user.id, "teaching_withdrawn", &format!("{subject_id} was {previous}, hidden={hidden}"));
+    tx.commit().map_err(db_err)
 }
 
 pub async fn drop_teaching_handler(
@@ -183,69 +376,254 @@ pub async fn drop_teaching_handler(
     headers: HeaderMap,
     Path(subject_id): Path<String>,
 ) -> Res<StatusCode> {
-    let user = require_role(&state, &headers, "teacher")?;
-    lock(&state)?
-        .execute("DELETE FROM teacher_subjects WHERE teacher_id = ?1 AND subject_id = ?2", params![user.id, subject_id])
-        .map_err(db_err)?;
+    let user = may_request_teaching(authenticate(&state, &headers)?)?;
+    withdraw_teaching(&*lock(&state)?, &user, &subject_id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ───────── what losing a subject would hide ─────────
+
+/// How many of a teacher's items on one subject students can see right now (and would stop seeing if the assignment
+/// went away): published posts and courses, scheduled live sessions that have not ended, published exams. Drafts,
+/// cancelled and finished sessions, closed/archived exams and anything already hidden (for whatever reason) are not
+/// counted: they would not change.
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Impact {
+    posts: i64,
+    courses: i64,
+    live: i64,
+    exams: i64,
+}
+
+impl Impact {
+    pub fn total(&self) -> i64 {
+        self.posts + self.courses + self.live + self.exams
+    }
+}
+
+/// The ONE counting helper behind the teacher's and the admin's impact endpoints, the withdrawal audit row and the
+/// "revoked, N items hidden" notification. It counts with the same visibility predicates students are served with
+/// ([`crate::platform_content::visible`], [`crate::platform_content::exam_standing`]), so what it reports is exactly
+/// what would disappear.
+pub(crate) fn teaching_impact(conn: &Connection, teacher_id: &str, subject_id: &str, now: i64) -> Res<Impact> {
+    use crate::platform_content::{exam_standing, visible};
+    let count = |sql: String, with_now: bool| -> Res<i64> {
+        if with_now {
+            conn.query_row(&sql, params![teacher_id, subject_id, now], |r| r.get(0)).map_err(db_err)
+        } else {
+            conn.query_row(&sql, params![teacher_id, subject_id], |r| r.get(0)).map_err(db_err)
+        }
+    };
+    let content = |table: &str, a: &str, status: &str, extra: &str| {
+        format!(
+            "SELECT count(*) FROM {table} {a} JOIN users u ON u.id = {a}.teacher_id JOIN subjects s ON s.id = {a}.subject_id
+             WHERE {a}.teacher_id = ?1 AND {a}.subject_id = ?2 AND {}{extra}",
+            visible(a, status)
+        )
+    };
+    Ok(Impact {
+        posts: count(content("posts", "p", "published", ""), false)?,
+        courses: count(content("courses", "c", "published", ""), false)?,
+        live: count(content("live_sessions", "l", "scheduled", " AND l.starts_at + l.duration_min * 60000 > ?3"), true)?,
+        exams: count(
+            format!(
+                "SELECT count(*) FROM assessments a LEFT JOIN users u ON u.id = a.teacher_id JOIN subjects s ON s.id = a.subject_id
+                 WHERE a.teacher_id = ?1 AND a.subject_id = ?2 AND a.status = 'published' AND {}",
+                exam_standing("a")
+            ),
+            false,
+        )?,
+    })
+}
+
+/// 404 unless the teacher has an assignment row (any status) for the subject.
+fn require_assignment_row(conn: &Connection, teacher_id: &str, subject_id: &str) -> Res<()> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM teacher_subjects WHERE teacher_id = ?1 AND subject_id = ?2)",
+            params![teacher_id, subject_id],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    if exists {
+        Ok(())
+    } else {
+        Err(err(StatusCode::NOT_FOUND, "not_found"))
+    }
+}
+
+/// The impact for one of the CALLER's own assignments (`teacher_id` is the session's, never a parameter).
+fn my_impact(conn: &Connection, teacher: &User, subject_id: &str, now: i64) -> Res<Impact> {
+    require_assignment_row(conn, &teacher.id, subject_id)?;
+    teaching_impact(conn, &teacher.id, subject_id, now)
+}
+
+pub async fn teaching_impact_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(subject_id): Path<String>,
+) -> Res<Json<Impact>> {
+    let user = may_request_teaching(authenticate(&state, &headers)?)?;
+    my_impact(&*lock(&state)?, &user, &subject_id, now_ms()).map(Json)
+}
+
 #[derive(Deserialize)]
-pub struct TeachingFilter {
+pub struct ImpactQuery {
+    teacher_id: String,
+    subject_id: String,
+}
+
+pub async fn admin_teaching_impact_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<ImpactQuery>,
+) -> Res<Json<Impact>> {
+    require_admin(&state, &headers)?;
+    let conn = lock(&state)?;
+    require_assignment_row(&conn, &q.teacher_id, &q.subject_id)?;
+    teaching_impact(&conn, &q.teacher_id, &q.subject_id, now_ms()).map(Json)
+}
+
+// ───────── the admin's queue ─────────
+
+const ADMIN_DEFAULT_LIMIT: i64 = 50;
+const ADMIN_MAX_LIMIT: i64 = 200;
+const ADMIN_MAX_SEARCH_CHARS: usize = 100;
+
+/// `GET /admin/teaching` query. Blank values count as absent.
+#[derive(Deserialize, Default, Debug)]
+pub struct AdminTeachingQuery {
+    /// `pending` | `approved` | `rejected`.
     status: Option<String>,
+    /// Matches the teacher's name or e-mail, or the subject's name (either language).
+    q: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct AdminTeachingList {
+    items: Vec<AdminTeaching>,
+    /// Rows matching the filters, before `limit`/`offset`.
+    total: i64,
 }
 
 pub async fn admin_teaching_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(f): Query<TeachingFilter>,
-) -> Res<Json<Vec<Teaching>>> {
+    Query(q): Query<AdminTeachingQuery>,
+) -> Res<Json<AdminTeachingList>> {
     require_admin(&state, &headers)?;
-    let conn = lock(&state)?;
-    let rows = conn
-        .prepare(&format!("{TEACHING_SELECT} WHERE (?1 IS NULL OR ts.status = ?1) ORDER BY ts.created_at DESC LIMIT 200"))
+    admin_teaching(&*lock(&state)?, &q).map(Json)
+}
+
+/// One page of the assignments for the admin, plus the total. Requests from active accounts come first: those from
+/// accounts still awaiting approval can wait for the account decision and must not push real requests off the page.
+/// Within that, the oldest request comes first (so nothing waits forever behind newer ones).
+fn admin_teaching(conn: &Connection, q: &AdminTeachingQuery) -> Res<AdminTeachingList> {
+    let blank = |o: &Option<String>| o.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let status = match blank(&q.status).as_deref() {
+        None => None,
+        Some(s @ ("pending" | "approved" | "rejected")) => Some(s.to_string()),
+        Some(_) => return Err(bad("invalid_status")),
+    };
+    let search = blank(&q.q);
+    if search.as_deref().map_or(false, |s| s.chars().count() > ADMIN_MAX_SEARCH_CHARS) {
+        return Err(bad("invalid_query"));
+    }
+    let like = search.as_deref().map(like_pattern);
+    let (limit, offset) = (q.limit.unwrap_or(ADMIN_DEFAULT_LIMIT).clamp(1, ADMIN_MAX_LIMIT), q.offset.unwrap_or(0).max(0));
+    let filter = "(?1 IS NULL OR ts.status = ?1)
+        AND (?2 IS NULL OR lower(u.full_name) LIKE ?2 ESCAPE '\\' OR lower(u.email) LIKE ?2 ESCAPE '\\'
+             OR lower(s.name_ar) LIKE ?2 ESCAPE '\\' OR lower(COALESCE(s.name_en, '')) LIKE ?2 ESCAPE '\\')";
+    let total: i64 = conn
+        .query_row(&format!("SELECT count(*) {TEACHING_FROM} WHERE {filter}"), params![status, like], |r| r.get(0))
+        .map_err(db_err)?;
+    let sql = format!(
+        "{} WHERE {filter} ORDER BY (u.status = 'active') DESC, ts.created_at ASC, ts.teacher_id, ts.subject_id LIMIT ?3 OFFSET ?4",
+        teaching_select(&format!("{DETAIL_COLS}, u.status"))
+    );
+    let raws = conn
+        .prepare(&sql)
         .map_err(db_err)?
-        .query_map(params![f.status], map_teaching)
+        .query_map(params![status, like, limit, offset], |r| Ok((read_detail(r)?, r.get::<_, String>(13)?)))
         .map_err(db_err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
-    Ok(Json(rows))
+    let (details, account): (Vec<RawDetail>, Vec<String>) = raws.into_iter().unzip();
+    let items = finish_details(conn, details)?
+        .into_iter()
+        .zip(account)
+        .map(|((base, extra), teacher_status)| AdminTeaching { base, extra, teacher_status })
+        .collect();
+    Ok(AdminTeachingList { items, total })
 }
+
+// ───────── the admin's decision ─────────
+
+/// Longest admin note on a decision.
+const MAX_REASON_CHARS: usize = 300;
 
 #[derive(Deserialize)]
 pub struct TeachingDecision {
     teacher_id: String,
     subject_id: String,
     status: String,
+    /// Optional note (trimmed; empty = none) kept on the row and sent to the teacher with the notification.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
+/// Records the decision and tells the teacher. The wording depends on what the decision undoes: taking away an
+/// assignment the teacher HAD (approved -> rejected/pending) sends `teaching_revoked` with the number of items it
+/// hid, which is not the same message as turning a first request down (`teaching_rejected`). Repeating a decision
+/// that changes nothing (same status, same note) writes and sends nothing.
 fn decide_teaching(conn: &Connection, admin: &User, d: &TeachingDecision) -> Res<()> {
+    let now = now_ms();
     if !["approved", "rejected", "pending"].contains(&d.status.as_str()) {
         return Err(bad("invalid_status"));
     }
-    let n = conn
-        .execute(
-            "UPDATE teacher_subjects SET status = ?3, decided_at = ?4 WHERE teacher_id = ?1 AND subject_id = ?2",
-            params![d.teacher_id, d.subject_id, d.status, now_ms()],
+    let reason = opt_text(&d.reason, MAX_REASON_CHARS, "reason_too_long")?;
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    let (previous, previous_reason): (String, Option<String>) = tx
+        .query_row(
+            "SELECT status, reason FROM teacher_subjects WHERE teacher_id = ?1 AND subject_id = ?2",
+            params![d.teacher_id, d.subject_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .map_err(db_err)?;
-    if n == 0 {
-        return Err(err(StatusCode::NOT_FOUND, "not_found"));
+        .optional()
+        .map_err(db_err)?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
+    if previous == d.status && previous_reason == reason {
+        return Ok(());
     }
-    audit(conn, &admin.id, &d.teacher_id, "teaching_decided", &format!("{} -> {}", d.subject_id, d.status));
-    if d.status != "pending" {
-        let subject: String = conn
-            .query_row("SELECT name_ar FROM subjects WHERE id = ?1", params![d.subject_id], |r| r.get(0))
-            .unwrap_or_default();
-        crate::platform_engage::notify(
-            conn,
-            &d.teacher_id,
-            &format!("teaching_{}", d.status),
-            serde_json::json!({ "subject": subject }),
-            &format!("/platform/subjects/{}", d.subject_id),
-        );
+    // counted BEFORE the change: afterwards nothing of it is visible any more
+    let hidden = if previous == "approved" && d.status != "approved" { teaching_impact(&tx, &d.teacher_id, &d.subject_id, now)?.total() } else { 0 };
+    // a request that is waiting again has no decision (and no note) yet
+    let decided_at = (d.status != "pending").then_some(now);
+    tx.execute(
+        "UPDATE teacher_subjects SET status = ?3, decided_at = ?4, reason = ?5 WHERE teacher_id = ?1 AND subject_id = ?2",
+        params![d.teacher_id, d.subject_id, d.status, decided_at, reason],
+    )
+    .map_err(db_err)?;
+    audit(&tx, &admin.id, &d.teacher_id, "teaching_decided", &format!("{} -> {}", d.subject_id, d.status));
+    let subject: String = tx
+        .query_row("SELECT name_ar FROM subjects WHERE id = ?1", params![d.subject_id], |r| r.get(0))
+        .unwrap_or_default();
+    let mut data = serde_json::json!({ "subject": subject });
+    if let Some(note) = &reason {
+        data["reason"] = serde_json::Value::String(note.clone());
     }
-    Ok(())
+    match (previous.as_str(), d.status.as_str()) {
+        ("approved", "rejected" | "pending") => {
+            data["hidden"] = hidden.into();
+            crate::platform_engage::notify(&tx, &d.teacher_id, "teaching_revoked", data, "/platform/teaching");
+        }
+        (_, "approved") => crate::platform_engage::notify(&tx, &d.teacher_id, "teaching_approved", data, &format!("/platform/subjects/{}", d.subject_id)),
+        (_, "rejected") => crate::platform_engage::notify(&tx, &d.teacher_id, "teaching_rejected", data, "/platform/teaching"),
+        _ => {} // back to pending from rejected: the request is simply waiting again
+    }
+    tx.commit().map_err(db_err)
 }
 
 pub async fn admin_decide_teaching_handler(
@@ -323,17 +701,20 @@ pub struct EnrolledSubject {
     subject_name: String,
     institution_id: String,
     institution_name: String,
+    /// The subject AND its institution are switched on. A switched-off one keeps its row, so the student can still
+    /// unenrol, but its page and content are gone for now.
+    active: bool,
 }
 
 fn my_enrollments(conn: &Connection, student_id: &str) -> Res<Vec<EnrolledSubject>> {
     conn.prepare(
-        "SELECT s.id, s.name_ar, i.id, i.name_ar FROM subject_enrollments e
+        "SELECT s.id, s.name_ar, i.id, i.name_ar, (s.is_active = 1 AND i.is_active = 1) FROM subject_enrollments e
          JOIN subjects s ON s.id = e.subject_id JOIN institutions i ON i.id = s.institution_id
          WHERE e.student_id = ?1 ORDER BY e.created_at DESC",
     )
     .map_err(db_err)?
     .query_map(params![student_id], |r| {
-        Ok(EnrolledSubject { subject_id: r.get(0)?, subject_name: r.get(1)?, institution_id: r.get(2)?, institution_name: r.get(3)? })
+        Ok(EnrolledSubject { subject_id: r.get(0)?, subject_name: r.get(1)?, institution_id: r.get(2)?, institution_name: r.get(3)?, active: r.get(4)? })
     })
     .map_err(db_err)?
     .collect::<Result<Vec<_>, _>>()
@@ -346,6 +727,12 @@ pub async fn my_enrollments_handler(State(state): State<Arc<AppState>>, headers:
 }
 
 fn enroll(conn: &Connection, student: &User, subject_id: &str) -> Res<()> {
+    enroll_one(conn, student, subject_id, now_ms()).map(|_| ())
+}
+
+/// **The single-enrolment rules**, shared by `POST /enrollments` and the bulk enrolment: the subject and its institution
+/// must be active (404 otherwise). Returns whether the enrolment is NEW (`false`: it already existed, nothing changed).
+fn enroll_one(conn: &Connection, student: &User, subject_id: &str, now: i64) -> Res<bool> {
     let active: Option<bool> = conn
         .query_row(
             "SELECT s.is_active AND i.is_active FROM subjects s JOIN institutions i ON i.id = s.institution_id WHERE s.id = ?1",
@@ -357,12 +744,174 @@ fn enroll(conn: &Connection, student: &User, subject_id: &str) -> Res<()> {
     if active != Some(true) {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
-    conn.execute(
-        "INSERT OR IGNORE INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1, ?2, ?3)",
-        params![student.id, subject_id, now_ms()],
-    )
-    .map_err(db_err)?;
-    Ok(())
+    let added = conn
+        .execute(
+            "INSERT OR IGNORE INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1, ?2, ?3)",
+            params![student.id, subject_id, now],
+        )
+        .map_err(db_err)?;
+    // Only a NEW enrolment is news for the subject's teachers (enrolling again changes nothing). The enrolment is
+    // already stored: a notice that cannot be written must not turn it into an error.
+    if added == 1 {
+        let _ = crate::platform_engage::tell_new_enrollment(conn, subject_id, now);
+    }
+    Ok(added == 1)
+}
+
+/// At most this many subjects in one bulk enrolment (`POST /enrollments/bulk`).
+pub(crate) const MAX_BULK_ENROLL: usize = 30;
+
+#[derive(Deserialize, Debug)]
+pub struct BulkEnrollReq {
+    subject_ids: Vec<String>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct BulkEnrollRes {
+    /// New enrolments.
+    enrolled: i64,
+    /// Ids that failed a rule of the single enrolment (unknown, switched-off subject or institution) or were already
+    /// enrolled. Never an error for the batch.
+    skipped: i64,
+}
+
+/// Enrols the student in several subjects at once ("enrol me in my level's subjects"): every id goes through exactly
+/// [`enroll_one`]; one that fails a rule or is already enrolled is counted as skipped. One transaction: a database
+/// failure leaves no half-done batch. The teachers' `new_enrollment` notice is the usual coalesced one, per subject.
+fn bulk_enroll(conn: &Connection, student: &User, ids: &[String], now: i64) -> Res<BulkEnrollRes> {
+    if ids.is_empty() || ids.len() > MAX_BULK_ENROLL {
+        return Err(bad("invalid_selection"));
+    }
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    let (mut enrolled, mut skipped) = (0, 0);
+    for id in ids {
+        match enroll_one(&tx, student, id, now) {
+            Ok(true) => enrolled += 1,
+            Ok(false) => skipped += 1,
+            Err(e) if e.0 == StatusCode::NOT_FOUND => skipped += 1,
+            Err(e) => return Err(e),
+        }
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(BulkEnrollRes { enrolled, skipped })
+}
+
+pub async fn bulk_enroll_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<BulkEnrollReq>) -> Res<Json<BulkEnrollRes>> {
+    let user = require_role(&state, &headers, "student")?;
+    bulk_enroll(&*lock(&state)?, &user, &req.subject_ids, now_ms()).map(Json)
+}
+
+// ───────── suggested subjects from the placement ─────────
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct SuggestedPlacement {
+    institution_id: String,
+    institution_name: String,
+    unit_id: Option<String>,
+    /// Unit names from the institution's root down to the placement unit (empty without a unit).
+    unit_path: Vec<String>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct SuggestedSubject {
+    id: String,
+    name_ar: String,
+    name_en: Option<String>,
+    /// Unit names from the institution's root down to the subject's unit.
+    unit_path: Vec<String>,
+    enrolled: bool,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct Suggestions {
+    placement: Option<SuggestedPlacement>,
+    subjects: Vec<SuggestedSubject>,
+}
+
+/// At most this many suggestions (an institution's level rarely has more than a few dozen subjects).
+const MAX_SUGGESTIONS: usize = 200;
+
+/// The unit and every unit above it are switched on (and it belongs to the institution).
+fn unit_chain_active(conn: &Connection, institution_id: &str, unit_id: &str) -> Res<bool> {
+    let mut cur = Some(unit_id.to_string());
+    let mut hops = 0;
+    while let Some(uid) = cur {
+        let row: Option<(bool, Option<String>)> = conn
+            .query_row("SELECT is_active = 1, parent_id FROM org_units WHERE id = ?1 AND institution_id = ?2", params![uid, institution_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(db_err)?;
+        let Some((active, parent)) = row else { return Ok(false) };
+        if !active {
+            return Ok(false);
+        }
+        cur = parent;
+        hops += 1;
+        if hops > 16 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// What the student's placement suggests: the ACTIVE subjects of the placement institution that hang on the placement
+/// unit or below it (that unit and its descendants, through active units only), sorted by unit path, then name. Nothing
+/// without a placement, when the institution or a unit on the way is switched off, and **nothing when the placement names
+/// no unit**: the level the student chose was deleted (`student_placement.unit_id` is `ON DELETE SET NULL`) or never
+/// chosen, and guessing "every level of the institution" would let one click enrol them in unrelated levels. The
+/// placement is still reported (with `unit_id: null`) so the screen can ask them to choose a level again.
+fn suggested_subjects(conn: &Connection, student_id: &str) -> Res<Suggestions> {
+    let placement: Option<(String, String, bool, Option<String>)> = conn
+        .query_row(
+            "SELECT p.institution_id, i.name_ar, i.is_active = 1, p.unit_id FROM student_placement p JOIN institutions i ON i.id = p.institution_id
+             WHERE p.student_id = ?1",
+            params![student_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let Some((institution_id, institution_name, institution_on, unit_id)) = placement else {
+        return Ok(Suggestions { placement: None, subjects: vec![] });
+    };
+    let head = SuggestedPlacement { unit_path: unit_path(conn, unit_id.clone())?, institution_id: institution_id.clone(), institution_name, unit_id: unit_id.clone() };
+    let Some(unit_id) = unit_id else {
+        return Ok(Suggestions { placement: Some(head), subjects: vec![] });
+    };
+    if !institution_on || !unit_chain_active(conn, &institution_id, &unit_id)? {
+        return Ok(Suggestions { placement: Some(head), subjects: vec![] });
+    }
+    // the placement unit and the units below it, active ones only: an inactive unit cuts its subtree
+    let sql = "WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM org_units WHERE institution_id = ?1 AND is_active = 1 AND id = ?2
+                 UNION SELECT o.id FROM org_units o JOIN tree t ON o.parent_id = t.id WHERE o.is_active = 1
+               )
+               SELECT s.id, s.name_ar, s.name_en, s.unit_id,
+                      EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?3 AND e.subject_id = s.id)
+               FROM subjects s
+               WHERE s.institution_id = ?1 AND s.is_active = 1 AND s.unit_id IN (SELECT id FROM tree)";
+    let rows: Vec<(String, String, Option<String>, Option<String>, bool)> = conn
+        .prepare(sql)
+        .map_err(db_err)?
+        .query_map(params![institution_id, unit_id, student_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    let mut paths: std::collections::HashMap<Option<String>, Vec<String>> = std::collections::HashMap::new();
+    let mut subjects = Vec::with_capacity(rows.len());
+    for (id, name_ar, name_en, unit, enrolled) in rows {
+        if !paths.contains_key(&unit) {
+            let p = unit_path(conn, unit.clone())?;
+            paths.insert(unit.clone(), p);
+        }
+        subjects.push(SuggestedSubject { id, name_ar, name_en, unit_path: paths[&unit].clone(), enrolled });
+    }
+    subjects.sort_by(|a, b| a.unit_path.cmp(&b.unit_path).then_with(|| a.name_ar.cmp(&b.name_ar)).then_with(|| a.id.cmp(&b.id)));
+    subjects.truncate(MAX_SUGGESTIONS);
+    Ok(Suggestions { placement: Some(head), subjects })
+}
+
+pub async fn suggested_subjects_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res<Json<Suggestions>> {
+    let user = require_role(&state, &headers, "student")?;
+    suggested_subjects(&*lock(&state)?, &user.id).map(Json)
 }
 
 pub async fn enroll_handler(
@@ -400,11 +949,16 @@ fn follow(conn: &Connection, student: &User, teacher_id: &str) -> Res<()> {
     if !is_teacher {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
-    conn.execute(
-        "INSERT OR IGNORE INTO teacher_follows(student_id, teacher_id, created_at) VALUES (?1, ?2, ?3)",
-        params![student.id, teacher_id, now_ms()],
-    )
-    .map_err(db_err)?;
+    let now = now_ms();
+    let added = conn
+        .execute(
+            "INSERT OR IGNORE INTO teacher_follows(student_id, teacher_id, created_at) VALUES (?1, ?2, ?3)",
+            params![student.id, teacher_id, now],
+        )
+        .map_err(db_err)?;
+    if added == 1 {
+        let _ = crate::platform_engage::tell_new_follower(conn, teacher_id, now);
+    }
     Ok(())
 }
 
@@ -438,19 +992,34 @@ pub struct TeacherQuery {
     subject_id: Option<String>,
 }
 
-fn list_teachers(conn: &Connection, q: &TeacherQuery) -> Res<Vec<TeacherCard>> {
-    let like = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| {
-        format!("%{}%", s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_").to_lowercase())
-    });
-    conn.prepare(
+/// `AND <the subject and its institution are switched on>` for a query over `teacher_subjects t JOIN subjects s`: the
+/// subjects students can reach. **The one definition of "reachable"** for the teacher lists, the directory and the
+/// following list; empty for an admin looking at everything.
+fn reachable_clause(only_active: bool) -> String {
+    if only_active {
+        format!("AND {SUBJECT_ACTIVE} AND {INSTITUTION_ACTIVE}")
+    } else {
+        String::new()
+    }
+}
+
+/// Teachers for the public directory. `only_active`: count and match only the approved subjects students can reach
+/// (the subject AND its institution switched on); an admin looking at a hidden subject passes `false` to see who is
+/// attached to it.
+fn list_teachers_in(conn: &Connection, q: &TeacherQuery, only_active: bool) -> Res<Vec<TeacherCard>> {
+    let like = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(like_pattern);
+    let reachable = reachable_clause(only_active);
+    conn.prepare(&format!(
         "SELECT u.id, u.full_name, u.bio,
-                (SELECT count(*) FROM teacher_subjects t WHERE t.teacher_id = u.id AND t.status = 'approved')
+                (SELECT count(*) FROM teacher_subjects t JOIN subjects s ON s.id = t.subject_id
+                  WHERE t.teacher_id = u.id AND t.status = 'approved' {reachable})
          FROM users u
          WHERE u.role = 'teacher' AND u.status = 'active'
            AND (?1 IS NULL OR lower(u.full_name) LIKE ?1 ESCAPE '\\')
-           AND (?2 IS NULL OR EXISTS(SELECT 1 FROM teacher_subjects t WHERE t.teacher_id = u.id AND t.subject_id = ?2 AND t.status = 'approved'))
-         ORDER BY u.full_name LIMIT 100",
-    )
+           AND (?2 IS NULL OR EXISTS(SELECT 1 FROM teacher_subjects t JOIN subjects s ON s.id = t.subject_id
+                                      WHERE t.teacher_id = u.id AND t.subject_id = ?2 AND t.status = 'approved' {reachable}))
+         ORDER BY u.full_name LIMIT 100"
+    ))
     .map_err(db_err)?
     .query_map(params![like, q.subject_id], |r| {
         Ok(TeacherCard { id: r.get(0)?, full_name: r.get(1)?, bio: r.get(2)?, subject_count: r.get(3)? })
@@ -458,6 +1027,10 @@ fn list_teachers(conn: &Connection, q: &TeacherQuery) -> Res<Vec<TeacherCard>> {
     .map_err(db_err)?
     .collect::<Result<Vec<_>, _>>()
     .map_err(db_err)
+}
+
+fn list_teachers(conn: &Connection, q: &TeacherQuery) -> Res<Vec<TeacherCard>> {
+    list_teachers_in(conn, q, true)
 }
 
 pub async fn list_teachers_handler(
@@ -469,7 +1042,138 @@ pub async fn list_teachers_handler(
     list_teachers(&*lock(&state)?, &q).map(Json)
 }
 
-#[derive(Serialize)]
+// ───────── the teachers directory, and the teachers a student follows (phase 4-2) ─────────
+
+/// A teacher of the paged directory (`GET /teachers/directory`).
+#[derive(Serialize, Debug, PartialEq)]
+pub struct DirectoryTeacher {
+    id: String,
+    full_name: String,
+    bio: Option<String>,
+    /// Approved subjects students can reach (subject AND institution on), like [`TeacherCard`].
+    subject_count: i64,
+    /// Only ever `true` for a student who follows the teacher; `false` for everyone else.
+    following: bool,
+}
+
+#[derive(Serialize, Debug)]
+pub struct DirectoryPage {
+    items: Vec<DirectoryTeacher>,
+    total: i64,
+}
+
+/// `GET /teachers/directory` query. Blank values count as absent.
+#[derive(Deserialize, Default, Debug)]
+pub struct DirectoryQuery {
+    /// Name search (Arabic-folded, case-insensitive; `%`, `_` and `\` are literal).
+    pub q: Option<String>,
+    pub subject_id: Option<String>,
+    /// Default 24, at most 60.
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+const DIRECTORY_DEFAULT_LIMIT: i64 = 24;
+const DIRECTORY_MAX_LIMIT: i64 = 60;
+const DIRECTORY_MAX_SEARCH_CHARS: usize = 100;
+
+/// The teachers a viewer can browse, by name then id, paged. Same reachability as [`list_teachers_in`] (active teacher
+/// accounts; the subject count and the subject filter see only subjects students can reach). `following` reads the VIEWER's
+/// follows and only for a student.
+pub(crate) fn teachers_directory(conn: &Connection, viewer: &User, q: &DirectoryQuery) -> Res<DirectoryPage> {
+    let clean = |o: &Option<String>| o.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let like = clean(&q.q).map(|s| fold_like(&s.chars().take(DIRECTORY_MAX_SEARCH_CHARS).collect::<String>()));
+    let subject = clean(&q.subject_id);
+    let student: Option<&str> = (viewer.role == "student").then_some(viewer.id.as_str());
+    let reachable = reachable_clause(true);
+    let filter = format!(
+        "u.role = 'teacher' AND u.status = 'active'
+           AND (?1 IS NULL OR ar_fold(u.full_name) LIKE ?1 ESCAPE '\\')
+           AND (?2 IS NULL OR EXISTS(SELECT 1 FROM teacher_subjects t JOIN subjects s ON s.id = t.subject_id
+                                      WHERE t.teacher_id = u.id AND t.subject_id = ?2 AND t.status = 'approved' {reachable}))"
+    );
+    let total: i64 = conn.query_row(&format!("SELECT count(*) FROM users u WHERE {filter}"), params![like, subject], |r| r.get(0)).map_err(db_err)?;
+    let limit = q.limit.unwrap_or(DIRECTORY_DEFAULT_LIMIT).clamp(1, DIRECTORY_MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let items = conn
+        .prepare(&format!(
+            "SELECT u.id, u.full_name, u.bio,
+                    (SELECT count(*) FROM teacher_subjects t JOIN subjects s ON s.id = t.subject_id
+                      WHERE t.teacher_id = u.id AND t.status = 'approved' {reachable}),
+                    (?3 IS NOT NULL AND EXISTS(SELECT 1 FROM teacher_follows f WHERE f.teacher_id = u.id AND f.student_id = ?3))
+             FROM users u WHERE {filter}
+             ORDER BY u.full_name, u.id LIMIT ?4 OFFSET ?5"
+        ))
+        .map_err(db_err)?
+        .query_map(params![like, subject, student, limit, offset], |r| {
+            Ok(DirectoryTeacher { id: r.get(0)?, full_name: r.get(1)?, bio: r.get(2)?, subject_count: r.get(3)?, following: r.get(4)? })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(DirectoryPage { items, total })
+}
+
+pub async fn teachers_directory_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<DirectoryQuery>) -> Res<Json<DirectoryPage>> {
+    let viewer = require_active(&state, &headers)?;
+    teachers_directory(&*lock(&state)?, &viewer, &q).map(Json)
+}
+
+/// A teacher the student follows.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct FollowedTeacher {
+    id: String,
+    full_name: String,
+    bio: Option<String>,
+    subject_count: i64,
+    followed_at: i64,
+}
+
+#[derive(Serialize, Debug)]
+pub struct FollowingList {
+    items: Vec<FollowedTeacher>,
+}
+
+/// At most this many followed teachers are listed (a student follows a handful).
+const FOLLOWING_LIMIT: i64 = 500;
+
+/// The teachers `student_id` follows, newest follow first - only those who are still active teachers. Only the caller's rows.
+pub(crate) fn my_following(conn: &Connection, student_id: &str) -> Res<FollowingList> {
+    let reachable = reachable_clause(true);
+    let items = conn
+        .prepare(&format!(
+            "SELECT u.id, u.full_name, u.bio,
+                    (SELECT count(*) FROM teacher_subjects t JOIN subjects s ON s.id = t.subject_id
+                      WHERE t.teacher_id = u.id AND t.status = 'approved' {reachable}),
+                    f.created_at
+             FROM teacher_follows f JOIN users u ON u.id = f.teacher_id
+             WHERE f.student_id = ?1 AND u.role = 'teacher' AND u.status = 'active'
+             ORDER BY f.created_at DESC, u.id LIMIT ?2"
+        ))
+        .map_err(db_err)?
+        .query_map(params![student_id, FOLLOWING_LIMIT], |r| {
+            Ok(FollowedTeacher { id: r.get(0)?, full_name: r.get(1)?, bio: r.get(2)?, subject_count: r.get(3)?, followed_at: r.get(4)? })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(FollowingList { items })
+}
+
+pub async fn my_following_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res<Json<FollowingList>> {
+    let student = require_role(&state, &headers, "student")?;
+    my_following(&*lock(&state)?, &student.id).map(Json)
+}
+
+/// The directory and the following list (merged into the app in `main.rs`). `/teachers/directory` is a static segment next
+/// to `/teachers/{id}`: the static one wins, so "directory" is never taken for a teacher id.
+pub fn directory_routes() -> axum::Router<Arc<AppState>> {
+    axum::Router::new()
+        .route("/api/platform/teachers/directory", axum::routing::get(teachers_directory_handler))
+        .route("/api/platform/my/following", axum::routing::get(my_following_handler))
+}
+
+#[derive(Serialize, Debug)]
 pub struct TeacherPage {
     id: String,
     full_name: String,
@@ -479,13 +1183,21 @@ pub struct TeacherPage {
     subjects: Vec<Teaching>,
 }
 
-pub async fn teacher_page_handler(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Res<Json<TeacherPage>> {
-    let viewer = require_active(&state, &headers)?;
-    let conn = lock(&state)?;
+/// The subjects a teacher is approved for AND students can reach (subject and institution on), as the public teacher
+/// page lists them: the plain [`Teaching`] fields only.
+fn public_subjects(conn: &Connection, teacher_id: &str) -> Res<Vec<Teaching>> {
+    conn.prepare(&format!(
+        "{} WHERE ts.teacher_id = ?1 AND ts.status = 'approved' AND {SUBJECT_ACTIVE} AND {INSTITUTION_ACTIVE} ORDER BY i.name_ar, s.name_ar",
+        teaching_select("")
+    ))
+    .map_err(db_err)?
+    .query_map(params![teacher_id], map_teaching)
+    .map_err(db_err)?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(db_err)
+}
+
+fn teacher_page(conn: &Connection, viewer: &User, id: &str) -> Res<TeacherPage> {
     let (full_name, bio): (String, Option<String>) = conn
         .query_row(
             "SELECT full_name, bio FROM users WHERE id = ?1 AND role = 'teacher' AND status = 'active'",
@@ -505,8 +1217,17 @@ pub async fn teacher_page_handler(
             |r| r.get(0),
         )
         .map_err(db_err)?;
-    let subjects = my_teaching(&conn, &id)?.into_iter().filter(|t| t.status == "approved").collect();
-    Ok(Json(TeacherPage { id, full_name, bio, followers, following, subjects }))
+    let subjects = public_subjects(conn, id)?;
+    Ok(TeacherPage { id: id.to_string(), full_name, bio, followers, following, subjects })
+}
+
+pub async fn teacher_page_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Res<Json<TeacherPage>> {
+    let viewer = require_active(&state, &headers)?;
+    teacher_page(&*lock(&state)?, &viewer, &id).map(Json)
 }
 
 #[derive(Serialize)]
@@ -543,26 +1264,14 @@ pub async fn subject_page_handler(
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
     // Names of the unit chain, root first (e.g. department > level > term).
-    let mut path = Vec::new();
-    let mut cur = unit_id;
-    while let Some(uid) = cur {
-        let (n, parent): (String, Option<String>) = conn
-            .query_row("SELECT name_ar, parent_id FROM org_units WHERE id = ?1", params![uid], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(db_err)?;
-        path.push(n);
-        cur = parent;
-        if path.len() > 8 {
-            break;
-        }
-    }
-    path.reverse();
+    let path = unit_path(&conn, unit_id)?;
     let enrolled: bool = conn
         .query_row("SELECT EXISTS(SELECT 1 FROM subject_enrollments WHERE student_id = ?1 AND subject_id = ?2)", params![viewer.id, id], |r| r.get(0))
         .map_err(db_err)?;
     let enrolled_count: i64 = conn
         .query_row("SELECT count(*) FROM subject_enrollments WHERE subject_id = ?1", params![id], |r| r.get(0))
         .map_err(db_err)?;
-    let teachers = list_teachers(&conn, &TeacherQuery { q: None, subject_id: Some(id.clone()) })?;
+    let teachers = list_teachers_in(&conn, &TeacherQuery { q: None, subject_id: Some(id.clone()) }, viewer.role != "admin")?;
     Ok(Json(SubjectPage { id, name_ar, name_en, institution_id, institution_name, path, enrolled, enrolled_count, teachers }))
 }
 
@@ -580,6 +1289,11 @@ mod tests {
         ("s1".into(), "s2".into())
     }
 
+    /// The admin queue filtered by one assignment status.
+    fn queue(status: &str) -> AdminTeachingQuery {
+        AdminTeachingQuery { status: Some(status.into()), ..Default::default() }
+    }
+
     #[test]
     fn teaching_requires_approval_and_flows() {
         let conn = create_test_db();
@@ -593,15 +1307,15 @@ mod tests {
         // pending teachers do not show up for the subject
         let q = TeacherQuery { q: None, subject_id: Some(s1.clone()) };
         assert_eq!(list_teachers(&conn, &q).unwrap().len(), 0);
-        decide_teaching(&conn, &admin, &TeachingDecision { teacher_id: t.id.clone(), subject_id: s1.clone(), status: "approved".into() }).unwrap();
+        decide_teaching(&conn, &admin, &TeachingDecision { teacher_id: t.id.clone(), subject_id: s1.clone(), status: "approved".into(), reason: None }).unwrap();
         assert_eq!(list_teachers(&conn, &q).unwrap().len(), 1);
-        decide_teaching(&conn, &admin, &TeachingDecision { teacher_id: t.id.clone(), subject_id: s1.clone(), status: "rejected".into() }).unwrap();
+        decide_teaching(&conn, &admin, &TeachingDecision { teacher_id: t.id.clone(), subject_id: s1.clone(), status: "rejected".into(), reason: None }).unwrap();
         assert_eq!(list_teachers(&conn, &q).unwrap().len(), 0);
         request_teaching(&conn, &t, &s1).unwrap(); // re-request after rejection
-        assert_eq!(my_teaching(&conn, &t.id).unwrap()[0].status, "pending");
-        let bad_status = TeachingDecision { teacher_id: t.id.clone(), subject_id: s1.clone(), status: "x".into() };
+        assert_eq!(my_teaching(&conn, &t.id).unwrap()[0].base.status, "pending");
+        let bad_status = TeachingDecision { teacher_id: t.id.clone(), subject_id: s1.clone(), status: "x".into(), reason: None };
         assert_eq!(decide_teaching(&conn, &admin, &bad_status).unwrap_err().0, StatusCode::BAD_REQUEST);
-        let missing = TeachingDecision { teacher_id: "no".into(), subject_id: s1, status: "approved".into() };
+        let missing = TeachingDecision { teacher_id: "no".into(), subject_id: s1, status: "approved".into(), reason: None };
         assert_eq!(decide_teaching(&conn, &admin, &missing).unwrap_err().0, StatusCode::NOT_FOUND);
     }
 
@@ -639,11 +1353,275 @@ mod tests {
     fn profile_update_validates() {
         let conn = create_test_db();
         let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
-        update_profile(&conn, &t, &ProfilePatch { full_name: Some(" د. أحمد ".into()), bio: Some("خبير".into()) }).unwrap();
+        update_profile(&conn, &t, &ProfilePatch { full_name: Some(" د. أحمد ".into()), bio: Some("خبير".into()), ..Default::default() }).unwrap();
         let card = &list_teachers(&conn, &TeacherQuery { q: Some("أحمد".into()), subject_id: None }).unwrap()[0];
         assert_eq!((card.full_name.as_str(), card.bio.as_deref()), ("د. أحمد", Some("خبير")));
-        assert_eq!(update_profile(&conn, &t, &ProfilePatch { full_name: Some("  ".into()), bio: None }).unwrap_err().0, StatusCode::BAD_REQUEST);
-        assert_eq!(update_profile(&conn, &t, &ProfilePatch { full_name: None, bio: Some("x".repeat(1001)) }).unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(update_profile(&conn, &t, &ProfilePatch { full_name: Some("  ".into()), ..Default::default() }).unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert_eq!(update_profile(&conn, &t, &ProfilePatch { bio: Some("x".repeat(1001)), ..Default::default() }).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    // ───── phase 3-1: kind of institution in the profile ─────
+
+    fn inst_of(conn: &Connection, u: &User) -> Option<String> {
+        conn.query_row("SELECT institution_type FROM users WHERE id = ?1", params![u.id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn the_profile_accepts_only_known_institution_types_and_only_changes_the_callers_row() {
+        let conn = create_test_db();
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        let bystander = insert_test_user(&conn, "b@x.com", "teacher", "active");
+        let set = |v: &str| ProfilePatch { institution_type: Some(v.into()), ..Default::default() };
+        for ok in ["school", "institute", "university"] {
+            update_profile(&conn, &t, &set(ok)).unwrap();
+            assert_eq!(inst_of(&conn, &t).as_deref(), Some(ok));
+        }
+        for bad_value in ["college", "", " school", "SCHOOL", "university ", "<script>"] {
+            let e = update_profile(&conn, &t, &set(bad_value)).unwrap_err();
+            assert_eq!((e.0, e.1.contains("invalid_type")), (StatusCode::BAD_REQUEST, true), "{bad_value:?}");
+        }
+        assert_eq!(inst_of(&conn, &t).as_deref(), Some("university"), "refused values change nothing");
+        assert_eq!(inst_of(&conn, &bystander), None, "another user's row is never touched");
+        // omitted / null leaves it alone
+        update_profile(&conn, &t, &ProfilePatch { bio: Some("نبذة".into()), ..Default::default() }).unwrap();
+        assert_eq!(inst_of(&conn, &t).as_deref(), Some("university"));
+        let from_json: ProfilePatch = serde_json::from_value(serde_json::json!({"institution_type": null})).unwrap();
+        update_profile(&conn, &t, &from_json).unwrap();
+        assert_eq!(inst_of(&conn, &t).as_deref(), Some("university"));
+        let from_json: ProfilePatch = serde_json::from_value(serde_json::json!({"institution_type": "school"})).unwrap();
+        update_profile(&conn, &t, &from_json).unwrap();
+        assert_eq!(inst_of(&conn, &t).as_deref(), Some("school"));
+    }
+
+    #[test]
+    fn a_bad_field_leaves_the_whole_profile_patch_unapplied() {
+        let conn = create_test_db();
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        update_profile(&conn, &t, &ProfilePatch { bio: Some("قديمة".into()), institution_type: Some("school".into()), ..Default::default() }).unwrap();
+        let name = |c: &Connection| -> String { c.query_row("SELECT full_name FROM users WHERE id = ?1", params![t.id], |r| r.get(0)).unwrap() };
+        let bio = |c: &Connection| -> Option<String> { c.query_row("SELECT bio FROM users WHERE id = ?1", params![t.id], |r| r.get(0)).unwrap() };
+        for patch in [
+            ProfilePatch { full_name: Some("اسم جديد".into()), institution_type: Some("bogus".into()), ..Default::default() },
+            ProfilePatch { full_name: Some("اسم جديد".into()), bio: Some("x".repeat(1001)), ..Default::default() },
+            ProfilePatch { bio: Some("جديدة".into()), institution_type: Some("bogus".into()), ..Default::default() },
+        ] {
+            assert!(update_profile(&conn, &t, &patch).is_err());
+            assert_eq!((name(&conn).as_str(), bio(&conn).as_deref(), inst_of(&conn, &t).as_deref()), ("T", Some("قديمة"), Some("school")), "nothing half-applied");
+        }
+    }
+
+    // ───── phase 3-1: a teacher waiting for approval can already ask for subjects ─────
+
+    fn reload(conn: &Connection, u: &User) -> User {
+        let status: String = conn.query_row("SELECT status FROM users WHERE id = ?1", params![u.id], |r| r.get(0)).unwrap();
+        User { status, ..u.clone() }
+    }
+
+    fn visible_posts(conn: &Connection) -> i64 {
+        conn.query_row(
+            &format!(
+                "SELECT count(*) FROM posts p JOIN users u ON u.id = p.teacher_id JOIN subjects s ON s.id = p.subject_id WHERE {}",
+                crate::platform_content::visible("p", "published")
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn only_active_and_pending_teachers_may_request_a_subject() {
+        let conn = create_test_db();
+        let who = |role: &str, status: &str| insert_test_user(&conn, &format!("{role}-{status}@x.com"), role, status);
+        for (role, status, allowed) in [
+            ("teacher", "active", true),
+            ("teacher", "pending", true),
+            ("teacher", "rejected", false),
+            ("teacher", "suspended", false),
+            ("student", "active", false),
+            ("student", "pending", false),
+            ("admin", "active", false),
+        ] {
+            let r = may_request_teaching(who(role, status));
+            assert_eq!(r.is_ok(), allowed, "{role}/{status}");
+            if !allowed {
+                assert_eq!(r.unwrap_err().0, StatusCode::FORBIDDEN);
+            }
+        }
+    }
+
+    #[test]
+    fn a_pending_teacher_can_browse_the_catalogue_and_manage_requests_and_nobody_else_gains_anything() {
+        let conn = create_test_db();
+        let who = |role: &str, status: &str| insert_test_user(&conn, &format!("{role}-{status}@x.com"), role, status);
+        // (role, status, may browse institutions/structure, may ask for / list / withdraw subject requests)
+        let matrix = [
+            ("admin", "active", true, false),
+            ("student", "active", true, false),
+            ("teacher", "active", true, true),
+            ("teacher", "pending", true, true), // the point of the phase: a pending teacher can find a subject and ask for it
+            ("student", "pending", false, false),
+            ("teacher", "rejected", false, false),
+            ("teacher", "suspended", false, false),
+            ("student", "suspended", false, false),
+        ];
+        for (role, status, browse, teach) in matrix {
+            let u = who(role, status);
+            assert_eq!(may_browse_catalog(&u), browse, "browse {role}/{status}");
+            assert_eq!(may_request_teaching(u).is_ok(), teach, "teaching flow {role}/{status}");
+        }
+        // everything else a pending teacher might try still needs an ACTIVE account
+        let pending = insert_test_user(&conn, "the-pending-one@x.com", "teacher", "pending");
+        for denied in [
+            crate::platform::ensure_role(pending.clone(), "teacher").map(|_| ()),
+            crate::platform::ensure_active(pending.clone()).map(|_| ()),
+            crate::platform::ensure_role(pending.clone(), "admin").map(|_| ()),
+        ] {
+            assert_eq!(denied.unwrap_err().0, StatusCode::FORBIDDEN);
+        }
+        // and the flow itself works end to end on the data layer: ask, see it, withdraw it
+        let (s1, _) = seed(&conn);
+        request_teaching(&conn, &pending, &s1).unwrap();
+        assert_eq!(my_teaching(&conn, &pending.id).unwrap().len(), 1);
+        conn.execute("DELETE FROM teacher_subjects WHERE teacher_id = ?1 AND subject_id = ?2", params![pending.id, s1]).unwrap();
+        assert!(my_teaching(&conn, &pending.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pending_teacher_can_request_a_subject_but_gets_nothing_else_until_approved() {
+        let conn = create_test_db();
+        let (s1, _) = seed(&conn);
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        let pending = insert_test_user(&conn, "p@x.com", "teacher", "pending");
+        let student = insert_test_user(&conn, "s@x.com", "student", "active");
+        enroll(&conn, &student, &s1).unwrap();
+
+        // the request goes through and lands in the admin's queue
+        let me = may_request_teaching(pending.clone()).unwrap();
+        request_teaching(&conn, &me, &s1).unwrap();
+        assert_eq!(request_teaching(&conn, &me, &s1).unwrap_err().0, StatusCode::CONFLICT, "still one request per subject");
+
+        // …but everything else a teacher does keeps demanding an active account (the handlers' `require_role` guard)
+        assert_eq!(crate::platform::ensure_role(pending.clone(), "teacher").unwrap_err().0, StatusCode::FORBIDDEN, "create posts/courses/live/exams, read my teaching, …");
+        assert_eq!(crate::platform::ensure_active(pending.clone()).unwrap_err().0, StatusCode::FORBIDDEN);
+
+        // approving the ASSIGNMENT does not activate the ACCOUNT
+        decide_teaching(&conn, &admin, &TeachingDecision { teacher_id: pending.id.clone(), subject_id: s1.clone(), status: "approved".into(), reason: None }).unwrap();
+        let after = reload(&conn, &pending);
+        assert_eq!(after.status, "pending", "the account is still waiting");
+        assert_eq!(crate::platform::ensure_role(after, "teacher").unwrap_err().0, StatusCode::FORBIDDEN);
+
+        // content of a pending teacher stays invisible even with an approved assignment: posts and exams alike
+        conn.execute("INSERT INTO posts VALUES ('p1', ?1, 's1', 'article', 'منشور', 'نص', 'published', NULL, 0, 0, NULL)", params![pending.id]).unwrap();
+        conn.execute(
+            "INSERT INTO assessments(id,teacher_id,subject_id,title,questions,question_count,total_points,status,created_at,updated_at) VALUES ('e1',?1,'s1','امتحان','[]',1,1,'published',0,0)",
+            params![pending.id],
+        )
+        .unwrap();
+        let available = |c: &Connection| crate::platform_exams::list_available(c, &student.id).unwrap().len();
+        assert_eq!((visible_posts(&conn), available(&conn)), (0, 0), "account pending, assignment approved: invisible");
+
+        // active account but assignment not (or no longer) approved: invisible
+        conn.execute("UPDATE users SET status = 'active' WHERE id = ?1", params![pending.id]).unwrap();
+        assert_eq!((visible_posts(&conn), available(&conn)), (1, 1), "both conditions hold: visible");
+        for assignment in ["pending", "rejected"] {
+            conn.execute("UPDATE teacher_subjects SET status = ?1 WHERE teacher_id = ?2", params![assignment, pending.id]).unwrap();
+            assert_eq!((visible_posts(&conn), available(&conn)), (0, 0), "assignment {assignment}: invisible");
+        }
+        conn.execute("UPDATE teacher_subjects SET status = 'approved' WHERE teacher_id = ?1", params![pending.id]).unwrap();
+        conn.execute("UPDATE users SET status = 'suspended' WHERE id = ?1", params![pending.id]).unwrap();
+        assert_eq!((visible_posts(&conn), available(&conn)), (0, 0), "suspended account: invisible again");
+    }
+
+    #[test]
+    fn the_admin_queue_shows_the_state_of_the_teachers_account_next_to_each_request() {
+        let conn = create_test_db();
+        let (s1, _) = seed(&conn);
+        let pending = insert_test_user(&conn, "p@x.com", "teacher", "pending");
+        let active = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        request_teaching(&conn, &pending, &s1).unwrap();
+        request_teaching(&conn, &active, &s1).unwrap();
+        let rows = admin_teaching(&conn, &AdminTeachingQuery::default()).unwrap().items;
+        assert_eq!(rows.len(), 2);
+        let status_of = |id: &str| rows.iter().find(|r| r.base.teacher_id == id).map(|r| r.teacher_status.clone()).unwrap();
+        assert_eq!((status_of(&pending.id).as_str(), status_of(&active.id).as_str()), ("pending", "active"));
+        // the JSON keeps every field the page already used and adds teacher_status
+        let json = serde_json::to_value(rows.iter().find(|r| r.base.teacher_id == pending.id).unwrap()).unwrap();
+        for key in ["teacher_id", "teacher_name", "subject_id", "subject_name", "institution_id", "institution_name", "status", "teacher_status"] {
+            assert!(json.get(key).is_some(), "{key} in {json}");
+        }
+        assert_eq!((json["status"].as_str(), json["teacher_status"].as_str()), (Some("pending"), Some("pending")), "assignment status and account status are different fields");
+        // the status filter still filters assignments
+        conn.execute("UPDATE teacher_subjects SET status = 'approved' WHERE teacher_id = ?1", params![active.id]).unwrap();
+        assert_eq!(admin_teaching(&conn, &queue("approved")).unwrap().items.len(), 1);
+        assert_eq!(admin_teaching(&conn, &queue("pending")).unwrap().items.len(), 1);
+        // an account the admin later rejects keeps showing its (rejected) account state
+        conn.execute("UPDATE users SET status = 'rejected' WHERE id = ?1", params![pending.id]).unwrap();
+        assert_eq!(admin_teaching(&conn, &queue("pending")).unwrap().items[0].teacher_status, "rejected");
+    }
+
+    fn extra_subjects(conn: &Connection, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let id = format!("x{i}");
+                conn.execute("INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES (?1,'i1','مادة',1,0)", params![id]).unwrap();
+                id
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_teacher_can_only_have_a_limited_number_of_requests_waiting() {
+        let conn = create_test_db();
+        seed(&conn);
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        let pending = insert_test_user(&conn, "p@x.com", "teacher", "pending");
+        let other = insert_test_user(&conn, "o@x.com", "teacher", "active");
+        let subjects = extra_subjects(&conn, MAX_OPEN_TEACHING_REQUESTS as usize + 2);
+        let (first_batch, rest) = subjects.split_at(MAX_OPEN_TEACHING_REQUESTS as usize);
+        for s in first_batch {
+            request_teaching(&conn, &pending, s).unwrap();
+        }
+        let waiting = |c: &Connection, t: &User| -> i64 { c.query_row("SELECT count(*) FROM teacher_subjects WHERE teacher_id = ?1 AND status = 'pending'", params![t.id], |r| r.get(0)).unwrap() };
+        assert_eq!(waiting(&conn, &pending), MAX_OPEN_TEACHING_REQUESTS);
+
+        // the next one is refused with 429 and nothing is written
+        let e = request_teaching(&conn, &pending, &rest[0]).unwrap_err();
+        assert_eq!((e.0, e.1.contains("too_many_pending_requests")), (StatusCode::TOO_MANY_REQUESTS, true));
+        assert_eq!(waiting(&conn, &pending), MAX_OPEN_TEACHING_REQUESTS);
+        // asking again for one that is already waiting is still reported as that, not as the cap
+        assert_eq!(request_teaching(&conn, &pending, &first_batch[0]).unwrap_err().0, StatusCode::CONFLICT);
+        // the cap belongs to the teacher, not to the platform
+        request_teaching(&conn, &other, &rest[0]).unwrap();
+
+        // a rejected request that is retried would be a new waiting one, so it is capped too
+        decide_teaching(&conn, &admin, &TeachingDecision { teacher_id: pending.id.clone(), subject_id: first_batch[0].clone(), status: "rejected".into(), reason: None }).unwrap();
+        assert_eq!(waiting(&conn, &pending), MAX_OPEN_TEACHING_REQUESTS - 1);
+        request_teaching(&conn, &pending, &rest[0]).unwrap(); // a slot was freed by the decision
+        assert_eq!(request_teaching(&conn, &pending, &first_batch[0]).unwrap_err().0, StatusCode::TOO_MANY_REQUESTS, "retrying the rejected one needs a free slot");
+        // approving frees a slot as well (an approved assignment is not "waiting")
+        decide_teaching(&conn, &admin, &TeachingDecision { teacher_id: pending.id.clone(), subject_id: first_batch[1].clone(), status: "approved".into(), reason: None }).unwrap();
+        request_teaching(&conn, &pending, &first_batch[0]).unwrap();
+        assert_eq!(waiting(&conn, &pending), MAX_OPEN_TEACHING_REQUESTS);
+    }
+
+    #[test]
+    fn the_admin_queue_lists_requests_of_active_accounts_before_those_of_unapproved_ones() {
+        let conn = create_test_db();
+        let (s1, _) = seed(&conn);
+        let others = extra_subjects(&conn, 1);
+        let pending = insert_test_user(&conn, "p@x.com", "teacher", "pending");
+        let active = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        request_teaching(&conn, &active, &s1).unwrap();
+        request_teaching(&conn, &pending, &s1).unwrap();
+        request_teaching(&conn, &pending, &others[0]).unwrap();
+        // the unapproved account's requests are the newest ones…
+        conn.execute("UPDATE teacher_subjects SET created_at = 1 WHERE teacher_id = ?1", params![active.id]).unwrap();
+        conn.execute("UPDATE teacher_subjects SET created_at = 9000000000000 WHERE teacher_id = ?1", params![pending.id]).unwrap();
+        let rows = admin_teaching(&conn, &queue("pending")).unwrap().items;
+        let order: Vec<&str> = rows.iter().map(|r| r.teacher_status.as_str()).collect();
+        // …and still come last, so they can never push a real teacher's request off the page
+        assert_eq!(order, ["active", "pending", "pending"]);
     }
 
     #[test]
@@ -657,5 +1635,1087 @@ mod tests {
         conn.execute("DELETE FROM institutions WHERE id = 'i1'", []).unwrap();
         let n: i64 = conn.query_row("SELECT (SELECT count(*) FROM teacher_subjects)+(SELECT count(*) FROM subject_enrollments)", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ───── phase 3-2: the teacher's own view of an assignment, the admin's note, what losing one hides ─────
+
+    /// i1 (active) with a department > level chain holding subject s1, a second subject s2 directly under the
+    /// institution, and a second institution i2 with s3.
+    fn campus() -> Connection {
+        let conn = create_test_db();
+        conn.execute_batch(
+            "INSERT INTO institutions(id,type,name_ar,is_active,created_at) VALUES ('i1','university','جامعة',1,0), ('i2','school','مدرسة',1,0);
+             INSERT INTO org_units(id,institution_id,parent_id,kind,name_ar,created_at) VALUES ('d1','i1',NULL,'department','كلية الحاسوب',0);
+             INSERT INTO org_units(id,institution_id,parent_id,kind,name_ar,created_at) VALUES ('l1','i1','d1','level','المستوى الأول',0);
+             INSERT INTO subjects(id,institution_id,unit_id,name_ar,name_en,is_active,created_at) VALUES ('s1','i1','l1','برمجة','Programming',1,0);
+             INSERT INTO subjects(id,institution_id,unit_id,name_ar,is_active,created_at) VALUES ('s2','i1',NULL,'ثقافة',1,0);
+             INSERT INTO subjects(id,institution_id,unit_id,name_ar,is_active,created_at) VALUES ('s3','i2',NULL,'رياضيات',1,0);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn decide(conn: &Connection, admin: &User, teacher: &User, subject: &str, status: &str, reason: Option<&str>) -> Res<()> {
+        decide_teaching(conn, admin, &TeachingDecision { teacher_id: teacher.id.clone(), subject_id: subject.into(), status: status.into(), reason: reason.map(Into::into) })
+    }
+
+    fn notifications(conn: &Connection, user: &User) -> Vec<(String, serde_json::Value, Option<String>)> {
+        conn.prepare("SELECT kind, data, link FROM notifications WHERE user_id = ?1 ORDER BY rowid")
+            .unwrap()
+            .query_map(params![user.id], |r| Ok((r.get(0)?, serde_json::from_str(&r.get::<_, String>(1)?).unwrap(), r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn keys(v: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        v.as_object().unwrap().keys().cloned().collect()
+    }
+
+    fn raw_item(conn: &Connection, sql: &str, args: &[&dyn rusqlite::ToSql]) {
+        conn.execute(sql, args).unwrap();
+    }
+
+    fn put_post(conn: &Connection, id: &str, teacher: &User, subject: &str, status: &str) {
+        raw_item(conn, "INSERT INTO posts VALUES (?1, ?2, ?3, 'article', 'منشور', 'نص', ?4, NULL, 0, 0, NULL)", &[&id, &teacher.id, &subject, &status]);
+    }
+
+    fn put_course(conn: &Connection, id: &str, teacher: &User, subject: &str, status: &str) {
+        raw_item(conn, "INSERT INTO courses(id,teacher_id,subject_id,title,description,status,created_at,updated_at) VALUES (?1,?2,?3,'دورة',NULL,?4,0,0)", &[&id, &teacher.id, &subject, &status]);
+    }
+
+    fn put_live(conn: &Connection, id: &str, teacher: &User, subject: &str, status: &str, starts_at: i64, duration: i64) {
+        raw_item(
+            conn,
+            "INSERT INTO live_sessions(id,teacher_id,subject_id,title,description,starts_at,duration_min,join_url,status,created_at) VALUES (?1,?2,?3,'بث',NULL,?4,?5,'https://m.example.com/x',?6,0)",
+            &[&id, &teacher.id, &subject, &starts_at, &duration, &status],
+        );
+    }
+
+    fn put_exam(conn: &Connection, id: &str, teacher: &User, subject: &str, status: &str) {
+        raw_item(
+            conn,
+            "INSERT INTO assessments(id,teacher_id,subject_id,title,questions,question_count,total_points,status,created_at,updated_at) VALUES (?1,?2,?3,'امتحان','[]',1,1,?4,0,0)",
+            &[&id, &teacher.id, &subject, &status],
+        );
+    }
+
+    #[test]
+    fn the_teachers_own_rows_carry_dates_note_unit_path_and_flags_but_the_public_page_never_does() {
+        let conn = campus();
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        let other = insert_test_user(&conn, "o@x.com", "teacher", "active");
+        let student = insert_test_user(&conn, "s@x.com", "student", "active");
+        request_teaching(&conn, &t, "s1").unwrap();
+        request_teaching(&conn, &t, "s2").unwrap();
+        request_teaching(&conn, &other, "s3").unwrap();
+        let before = now_ms();
+
+        let rows = my_teaching(&conn, &t.id).unwrap();
+        assert_eq!(rows.len(), 2, "another teacher's request is not mine");
+        let json: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
+        // the ordering is by institution, then subject name; both are in i1
+        let s1 = json.iter().find(|r| r["subject_id"] == "s1").unwrap();
+        let s2 = json.iter().find(|r| r["subject_id"] == "s2").unwrap();
+        let expected: std::collections::BTreeSet<String> = [
+            "teacher_id", "teacher_name", "subject_id", "subject_name", "institution_id", "institution_name", "status", // everything the page already used
+            "created_at", "decided_at", "reason", "unit_path", "subject_active", "institution_active",
+        ]
+        .iter()
+        .map(|k| k.to_string())
+        .collect();
+        assert_eq!(keys(s1), expected);
+        assert_eq!(s1["unit_path"], serde_json::json!(["كلية الحاسوب", "المستوى الأول"]), "root first, leaf last");
+        assert_eq!(s2["unit_path"], serde_json::json!([]), "a subject on the institution itself has no path");
+        assert!(s1["created_at"].as_i64().unwrap() <= before && s1["created_at"].as_i64().unwrap() > 0);
+        assert!(s1["decided_at"].is_null() && s1["reason"].is_null());
+        assert_eq!((&s1["subject_active"], &s1["institution_active"], &s1["status"]), (&serde_json::json!(true), &serde_json::json!(true), &serde_json::json!("pending")));
+
+        decide(&conn, &admin, &t, "s1", "approved", Some("  أهلاً بك  ")).unwrap();
+        let s1 = serde_json::to_value(&my_teaching(&conn, &t.id).unwrap().into_iter().find(|r| r.base.subject_id == "s1").unwrap()).unwrap();
+        assert_eq!((s1["status"].as_str(), s1["reason"].as_str()), (Some("approved"), Some("أهلاً بك")));
+        assert!(s1["decided_at"].as_i64().unwrap() >= before);
+
+        // the flags follow the subject and the institution
+        conn.execute("UPDATE subjects SET is_active = 0 WHERE id = 's2'", []).unwrap();
+        conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        let flags: Vec<(String, bool, bool)> = my_teaching(&conn, &t.id).unwrap().into_iter().map(|r| (r.base.subject_id, r.extra.subject_active, r.extra.institution_active)).collect();
+        assert!(flags.contains(&("s1".into(), true, false)) && flags.contains(&("s2".into(), false, false)), "{flags:?}");
+        conn.execute_batch("UPDATE subjects SET is_active = 1; UPDATE institutions SET is_active = 1").unwrap();
+
+        // the PUBLIC page lists only the plain fields: no dates, no note, no path, no flags
+        let page = teacher_page(&conn, &student, &t.id).unwrap();
+        let page_json = serde_json::to_value(&page).unwrap();
+        assert_eq!(page.subjects.len(), 1, "only the approved one");
+        let public_keys = keys(&page_json["subjects"][0]);
+        assert_eq!(public_keys, ["teacher_id", "teacher_name", "subject_id", "subject_name", "institution_id", "institution_name", "status"].iter().map(|k| k.to_string()).collect());
+        for private in ["created_at", "decided_at", "reason", "unit_path", "subject_active", "institution_active"] {
+            assert!(!public_keys.contains(private), "{private} must stay private");
+        }
+        assert!(!page_json.to_string().contains("أهلاً بك"), "the admin's note is not on the public page: {page_json}");
+    }
+
+    #[test]
+    fn the_admin_note_is_trimmed_bounded_kept_with_the_decision_and_cleared_by_a_new_request() {
+        let conn = campus();
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        request_teaching(&conn, &t, "s1").unwrap();
+        let row = |c: &Connection| -> (String, Option<i64>, Option<String>) {
+            c.query_row("SELECT status, decided_at, reason FROM teacher_subjects WHERE teacher_id = ?1 AND subject_id = 's1'", params![t.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap()
+        };
+        let json: TeachingDecision = serde_json::from_value(serde_json::json!({"teacher_id": t.id, "subject_id": "s1", "status": "rejected"})).unwrap();
+        assert!(json.reason.is_none(), "the field is optional on the wire");
+        decide_teaching(&conn, &admin, &json).unwrap();
+        assert_eq!(row(&conn).2, None);
+
+        decide(&conn, &admin, &t, "s1", "rejected", Some("  المحتوى غير مكتمل  ")).unwrap();
+        let (status, decided, reason) = row(&conn);
+        assert_eq!((status.as_str(), reason.as_deref()), ("rejected", Some("المحتوى غير مكتمل")));
+        assert!(decided.is_some());
+        let sent = notifications(&conn, &t);
+        assert_eq!(sent.last().unwrap().0, "teaching_rejected");
+        assert_eq!(sent.last().unwrap().1["reason"], "المحتوى غير مكتمل", "the note travels with the notification");
+        assert_eq!(sent.last().unwrap().1["subject"], "برمجة");
+
+        // empty means none; exactly 300 characters is fine, 301 is refused and changes nothing
+        decide(&conn, &admin, &t, "s1", "rejected", Some("   ")).unwrap();
+        assert_eq!(row(&conn).2, None);
+        decide(&conn, &admin, &t, "s1", "rejected", Some(&"ع".repeat(300))).unwrap();
+        assert_eq!(row(&conn).2.unwrap().chars().count(), 300);
+        let e = decide(&conn, &admin, &t, "s1", "approved", Some(&"ع".repeat(301))).unwrap_err();
+        assert_eq!((e.0, e.1.contains("reason_too_long")), (StatusCode::BAD_REQUEST, true));
+        assert_eq!(row(&conn).0, "rejected", "a refused decision changes nothing");
+
+        // a note belongs to a decision: a request that is waiting again has none, and neither has the retry
+        decide(&conn, &admin, &t, "s1", "rejected", Some("سبب")).unwrap();
+        decide(&conn, &admin, &t, "s1", "pending", Some("لا يجب أن يبقى")).unwrap();
+        let (status, decided, reason) = row(&conn);
+        assert_eq!((status.as_str(), decided), ("pending", None), "waiting again: undecided");
+        assert_eq!(reason.as_deref(), Some("لا يجب أن يبقى"), "an explicit note given with the decision is stored as given");
+        decide(&conn, &admin, &t, "s1", "rejected", Some("سبب جديد")).unwrap();
+        request_teaching(&conn, &t, "s1").unwrap();
+        assert_eq!(row(&conn), ("pending".into(), None, None), "asking again starts a fresh request");
+        // the note never reaches a student
+        let student = insert_test_user(&conn, "s@x.com", "student", "active");
+        assert!(notifications(&conn, &student).is_empty());
+    }
+
+    #[test]
+    fn taking_away_an_approved_subject_is_told_apart_from_turning_a_request_down() {
+        let conn = campus();
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        let kinds = |c: &Connection| notifications(c, &t).into_iter().map(|n| n.0).collect::<Vec<_>>();
+
+        // a first request that is turned down: "rejected"
+        request_teaching(&conn, &t, "s1").unwrap();
+        decide(&conn, &admin, &t, "s1", "rejected", Some("غير مناسب")).unwrap();
+        assert_eq!(kinds(&conn), ["teaching_rejected"]);
+        let first = &notifications(&conn, &t)[0];
+        assert!(first.1.get("hidden").is_none(), "nothing was hidden by a first rejection");
+        assert_eq!(first.2.as_deref(), Some("/platform/teaching"));
+
+        // an approved subject with content
+        request_teaching(&conn, &t, "s1").unwrap();
+        decide(&conn, &admin, &t, "s1", "approved", None).unwrap();
+        assert_eq!(kinds(&conn).last().map(String::as_str), Some("teaching_approved"));
+        let now = now_ms();
+        put_post(&conn, "p1", &t, "s1", "published");
+        put_post(&conn, "p2", &t, "s1", "published");
+        put_post(&conn, "p3", &t, "s1", "draft");
+        put_course(&conn, "c1", &t, "s1", "published");
+        put_live(&conn, "l1", &t, "s1", "scheduled", now + 3_600_000, 60);
+        put_live(&conn, "l2", &t, "s1", "scheduled", now - 5 * 3_600_000, 60);
+        put_exam(&conn, "e1", &t, "s1", "published");
+        put_exam(&conn, "e2", &t, "s1", "draft");
+        assert_eq!(teaching_impact(&conn, &t.id, "s1", now).unwrap(), Impact { posts: 2, courses: 1, live: 1, exams: 1 });
+
+        decide(&conn, &admin, &t, "s1", "rejected", Some("انتهى التعاقد")).unwrap();
+        let sent = notifications(&conn, &t);
+        let last = sent.last().unwrap();
+        assert_eq!(last.0, "teaching_revoked", "approved -> rejected takes something away");
+        assert_eq!((last.1["subject"].as_str(), last.1["hidden"].as_i64(), last.1["reason"].as_str()), (Some("برمجة"), Some(5), Some("انتهى التعاقد")));
+        assert_eq!(teaching_impact(&conn, &t.id, "s1", now).unwrap().total(), 0, "and now it really is hidden");
+
+        // approved -> pending is a revocation too; rejected -> pending is only a request waiting again
+        decide(&conn, &admin, &t, "s1", "approved", None).unwrap();
+        decide(&conn, &admin, &t, "s1", "pending", None).unwrap();
+        assert_eq!(kinds(&conn).iter().filter(|k| *k == "teaching_revoked").count(), 2);
+        let revoked = notifications(&conn, &t).into_iter().rev().find(|n| n.0 == "teaching_revoked").unwrap();
+        assert_eq!(revoked.1["hidden"], 5, "the same five items are hidden again");
+        assert!(revoked.1.get("reason").is_none(), "no note, no key");
+        decide(&conn, &admin, &t, "s1", "rejected", None).unwrap();
+        let total = kinds(&conn).len();
+        decide(&conn, &admin, &t, "s1", "pending", None).unwrap();
+        assert_eq!(kinds(&conn).len(), total, "rejected -> pending sends nothing");
+
+        // repeating a decision that changes nothing writes and sends nothing
+        decide(&conn, &admin, &t, "s1", "approved", Some("x")).unwrap();
+        let (n, audits) = (kinds(&conn).len(), conn.query_row("SELECT count(*) FROM audit_log WHERE action = 'teaching_decided'", [], |r| r.get::<_, i64>(0)).unwrap());
+        decide(&conn, &admin, &t, "s1", "approved", Some("x")).unwrap();
+        assert_eq!(kinds(&conn).len(), n);
+        assert_eq!(conn.query_row("SELECT count(*) FROM audit_log WHERE action = 'teaching_decided'", [], |r| r.get::<_, i64>(0)).unwrap(), audits);
+        // a missing row is still a 404, an unknown status a 400
+        assert_eq!(decide(&conn, &admin, &t, "s2", "approved", None).unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(decide(&conn, &admin, &t, "s1", "revoked", None).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_teachers_own_withdrawal_is_audited_with_what_it_hid_and_is_idempotent() {
+        let conn = campus();
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        let other = insert_test_user(&conn, "o@x.com", "teacher", "active");
+        request_teaching(&conn, &t, "s1").unwrap();
+        request_teaching(&conn, &t, "s2").unwrap();
+        request_teaching(&conn, &other, "s1").unwrap();
+        decide(&conn, &admin, &t, "s1", "approved", None).unwrap();
+        put_post(&conn, "p1", &t, "s1", "published");
+        put_course(&conn, "c1", &t, "s1", "published");
+        put_post(&conn, "p2", &t, "s1", "draft");
+        let audit_rows = |c: &Connection| -> Vec<(Option<String>, Option<String>, String)> {
+            c.prepare("SELECT actor_id, target_id, detail FROM audit_log WHERE action = 'teaching_withdrawn' ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        withdraw_teaching(&conn, &t, "s1").unwrap();
+        let rows = audit_rows(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].0.as_deref(), rows[0].1.as_deref()), (Some(t.id.as_str()), Some(t.id.as_str())));
+        assert!(rows[0].2.contains("s1") && rows[0].2.contains("approved") && rows[0].2.contains("hidden=2"), "{}", rows[0].2);
+        assert_eq!(my_teaching(&conn, &t.id).unwrap().len(), 1, "s2 is still asked for");
+        let content: i64 = conn.query_row("SELECT (SELECT count(*) FROM posts) + (SELECT count(*) FROM courses)", [], |r| r.get(0)).unwrap();
+        assert_eq!(content, 3, "withdrawing hides the content, it does not delete it");
+        withdraw_teaching(&conn, &t, "s1").unwrap(); // nothing left to withdraw
+        assert_eq!(audit_rows(&conn).len(), 1, "no second audit row");
+        withdraw_teaching(&conn, &t, "s2").unwrap(); // a pending request
+        let rows = audit_rows(&conn);
+        assert!(rows[1].2.contains("pending") && rows[1].2.contains("hidden=0"), "{}", rows[1].2);
+        // only the caller's own row is ever touched
+        assert_eq!(my_teaching(&conn, &other.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_impact_counts_only_what_students_see_now_and_only_the_callers_items_on_that_subject() {
+        let conn = campus();
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        let other = insert_test_user(&conn, "o@x.com", "teacher", "active");
+        for who in [&t, &other] {
+            request_teaching(&conn, who, "s1").unwrap();
+            decide(&conn, &admin, who, "s1", "approved", None).unwrap();
+        }
+        request_teaching(&conn, &t, "s2").unwrap();
+        decide(&conn, &admin, &t, "s2", "approved", None).unwrap();
+        let now = 1_000_000_000_000i64;
+        // visible: 1 post, 1 course, 2 live (one running, one future), 1 exam
+        put_post(&conn, "p1", &t, "s1", "published");
+        put_course(&conn, "c1", &t, "s1", "published");
+        put_live(&conn, "l-running", &t, "s1", "scheduled", now - 30 * 60_000, 60);
+        put_live(&conn, "l-future", &t, "s1", "scheduled", now + 60_000, 30);
+        put_exam(&conn, "e1", &t, "s1", "published");
+        // not counted: drafts, cancelled, over, closed/archived exams, other subject, other teacher
+        put_post(&conn, "p-draft", &t, "s1", "draft");
+        put_course(&conn, "c-draft", &t, "s1", "draft");
+        put_live(&conn, "l-over", &t, "s1", "scheduled", now - 61 * 60_000, 60);
+        put_live(&conn, "l-edge", &t, "s1", "scheduled", now - 60 * 60_000, 60); // ends exactly now: over
+        put_live(&conn, "l-cancelled", &t, "s1", "cancelled", now + 3_600_000, 60);
+        put_exam(&conn, "e-draft", &t, "s1", "draft");
+        put_exam(&conn, "e-closed", &t, "s1", "closed");
+        put_exam(&conn, "e-archived", &t, "s1", "archived");
+        put_post(&conn, "p-s2", &t, "s2", "published");
+        put_post(&conn, "p-other", &other, "s1", "published");
+        put_exam(&conn, "e-other", &other, "s1", "published");
+
+        let want = Impact { posts: 1, courses: 1, live: 2, exams: 1 };
+        assert_eq!(teaching_impact(&conn, &t.id, "s1", now).unwrap(), want);
+        assert_eq!(want.total(), 5);
+        assert_eq!(teaching_impact(&conn, &t.id, "s2", now).unwrap(), Impact { posts: 1, ..Default::default() });
+        assert_eq!(teaching_impact(&conn, &other.id, "s1", now).unwrap(), Impact { posts: 1, exams: 1, ..Default::default() }, "the other teacher's own items");
+        let json = serde_json::to_value(want).unwrap();
+        assert_eq!(keys(&json), ["posts", "courses", "live", "exams"].iter().map(|k| k.to_string()).collect());
+        assert_eq!(json["live"], 2);
+
+        // the teacher endpoint reads the caller's id from the session and 404s on a row that is not theirs
+        assert_eq!(my_impact(&conn, &t, "s1", now).unwrap(), want);
+        let stranger = insert_test_user(&conn, "x@x.com", "teacher", "active");
+        assert_eq!(my_impact(&conn, &stranger, "s1", now).unwrap_err().0, StatusCode::NOT_FOUND, "no row of their own: nothing is revealed about others");
+        assert_eq!(my_impact(&conn, &t, "s3", now).unwrap_err().0, StatusCode::NOT_FOUND);
+        assert!(require_assignment_row(&conn, &t.id, "s1").is_ok() && require_assignment_row(&conn, &t.id, "s3").is_err(), "the admin twin shares the same row check");
+
+        // what is hidden already does not count: it would not change
+        conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        assert_eq!(teaching_impact(&conn, &t.id, "s1", now).unwrap().total(), 0, "institution off");
+        conn.execute_batch("UPDATE institutions SET is_active = 1; UPDATE subjects SET is_active = 0 WHERE id = 's1'").unwrap();
+        assert_eq!(teaching_impact(&conn, &t.id, "s1", now).unwrap().total(), 0, "subject off");
+        conn.execute("UPDATE subjects SET is_active = 1", []).unwrap();
+        conn.execute("UPDATE teacher_subjects SET status = 'pending' WHERE teacher_id = ?1 AND subject_id = 's1'", params![t.id]).unwrap();
+        assert_eq!(teaching_impact(&conn, &t.id, "s1", now).unwrap().total(), 0, "not approved");
+        conn.execute("UPDATE teacher_subjects SET status = 'approved'", []).unwrap();
+        conn.execute("UPDATE users SET status = 'suspended' WHERE id = ?1", params![t.id]).unwrap();
+        assert_eq!(teaching_impact(&conn, &t.id, "s1", now).unwrap().total(), 0, "account off");
+    }
+
+    #[test]
+    fn a_hidden_institution_leaves_the_teacher_page_and_directory_and_refuses_new_requests() {
+        let conn = campus();
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        let late = insert_test_user(&conn, "l@x.com", "teacher", "active");
+        let student = insert_test_user(&conn, "s@x.com", "student", "active");
+        request_teaching(&conn, &t, "s1").unwrap();
+        request_teaching(&conn, &t, "s3").unwrap();
+        decide(&conn, &admin, &t, "s1", "approved", None).unwrap();
+        decide(&conn, &admin, &t, "s3", "approved", None).unwrap();
+        let in_subject = |only_active: bool| list_teachers_in(&conn, &TeacherQuery { q: None, subject_id: Some("s1".into()) }, only_active).unwrap();
+        let count_of = |c: &Connection| list_teachers(c, &TeacherQuery { q: None, subject_id: None }).unwrap().iter().find(|x| x.id == t.id).map(|x| x.subject_count);
+        assert_eq!((teacher_page(&conn, &student, &t.id).unwrap().subjects.len(), in_subject(true).len(), count_of(&conn)), (2, 1, Some(2)));
+
+        conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        let page = teacher_page(&conn, &student, &t.id).unwrap();
+        assert_eq!(page.subjects.iter().map(|s| s.subject_id.as_str()).collect::<Vec<_>>(), ["s3"], "the subject of the hidden institution is gone from the page");
+        assert!(in_subject(true).is_empty(), "nobody teaches a hidden subject as far as students can tell");
+        assert_eq!(in_subject(false).len(), 1, "an admin looking at it still sees who is attached");
+        assert_eq!(count_of(&conn), Some(1), "the card counts what students can reach");
+        assert_eq!(request_teaching(&conn, &late, "s1").unwrap_err().0, StatusCode::NOT_FOUND, "no new requests into a hidden institution");
+        assert_eq!(enroll(&conn, &student, "s1").unwrap_err().0, StatusCode::NOT_FOUND);
+
+        conn.execute("UPDATE institutions SET is_active = 1 WHERE id = 'i1'", []).unwrap();
+        conn.execute("UPDATE subjects SET is_active = 0 WHERE id = 's3'", []).unwrap();
+        assert_eq!(teacher_page(&conn, &student, &t.id).unwrap().subjects.len(), 1, "a hidden subject is left out as before");
+        conn.execute("UPDATE subjects SET is_active = 1", []).unwrap();
+        assert_eq!(teacher_page(&conn, &student, &t.id).unwrap().subjects.len(), 2);
+    }
+
+    /// Four teachers asking for subjects; creation times are set explicitly.
+    fn queue_fixture() -> (Connection, Vec<User>) {
+        let conn = campus();
+        let names = [("نور الهدى", "noor@school.edu"), ("Sami Ali", "sami@x.com"), ("100% Teacher", "pct@x.com"), ("منى", "mona@x.com")];
+        let mut users = vec![];
+        for (i, (name, email)) in names.iter().enumerate() {
+            let u = insert_test_user(&conn, email, "teacher", if i == 3 { "pending" } else { "active" });
+            conn.execute("UPDATE users SET full_name = ?1 WHERE id = ?2", params![name, u.id]).unwrap();
+            users.push(u);
+        }
+        // (teacher, subject, status, created_at)
+        for (t, subject, status, at) in [(0, "s1", "pending", 400), (1, "s1", "pending", 100), (2, "s2", "pending", 300), (3, "s1", "pending", 50), (0, "s2", "approved", 200), (1, "s3", "rejected", 150)] {
+            conn.execute(
+                "INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at, reason) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![users[t].id, subject, status, at, if status == "pending" { None } else { Some(at + 1) }, if status == "rejected" { Some("سبب") } else { None }],
+            )
+            .unwrap();
+        }
+        (conn, users)
+    }
+
+    fn list(conn: &Connection, f: impl FnOnce(&mut AdminTeachingQuery)) -> AdminTeachingList {
+        let mut q = AdminTeachingQuery::default();
+        f(&mut q);
+        admin_teaching(conn, &q).unwrap()
+    }
+
+    fn who(l: &AdminTeachingList) -> Vec<(String, String)> {
+        l.items.iter().map(|i| (i.base.teacher_name.clone(), i.base.subject_id.clone())).collect()
+    }
+
+    #[test]
+    fn the_admin_queue_has_tabs_search_paging_a_total_and_shows_the_oldest_request_first() {
+        let (conn, users) = queue_fixture();
+        let all = list(&conn, |_| {});
+        assert_eq!(all.total, 6);
+        // active accounts first (oldest first among them), the unapproved account's request last
+        assert_eq!(all.items.last().unwrap().teacher_status, "pending");
+        let created: Vec<i64> = all.items.iter().map(|i| i.extra.created_at).collect();
+        assert_eq!(created, [100, 150, 200, 300, 400, 50]);
+
+        // tabs
+        let pending = list(&conn, |q| q.status = Some("pending".into()));
+        assert_eq!((pending.total, pending.items.len()), (4, 4));
+        assert_eq!(pending.items.iter().map(|i| i.extra.created_at).collect::<Vec<_>>(), [100, 300, 400, 50]);
+        let approved = list(&conn, |q| q.status = Some("approved".into()));
+        assert_eq!(who(&approved), [("نور الهدى".to_string(), "s2".to_string())]);
+        let rejected = list(&conn, |q| q.status = Some("rejected".into()));
+        assert_eq!((rejected.total, rejected.items[0].extra.reason.as_deref()), (1, Some("سبب")));
+        assert_eq!(list(&conn, |q| q.status = Some("  ".into())).total, 6, "blank = every status");
+        let e = admin_teaching(&conn, &AdminTeachingQuery { status: Some("archived".into()), ..Default::default() }).unwrap_err();
+        assert_eq!((e.0, e.1.contains("invalid_status")), (StatusCode::BAD_REQUEST, true));
+
+        // search: teacher name (any case), e-mail, subject name in either language
+        assert_eq!(list(&conn, |q| q.q = Some("SAMI".into())).total, 2);
+        assert_eq!(who(&list(&conn, |q| q.q = Some("noor@school".into())))[0].0, "نور الهدى");
+        assert_eq!(list(&conn, |q| q.q = Some("برمج".into())).total, 3, "subject name, Arabic");
+        assert_eq!(list(&conn, |q| q.q = Some("programming".into())).total, 3, "subject name, English");
+        assert_eq!(who(&list(&conn, |q| q.q = Some("ثقافة".into()))).len(), 2);
+        assert_eq!(list(&conn, |q| q.q = Some("zzz".into())).total, 0);
+        // wildcards in the search text are literal
+        assert_eq!(who(&list(&conn, |q| q.q = Some("100%".into()))), [("100% Teacher".to_string(), "s2".to_string())]);
+        assert_eq!(list(&conn, |q| q.q = Some("%".into())).total, 1, "a lone % matches only the name that contains one");
+        assert_eq!(list(&conn, |q| q.q = Some("_".into())).total, 0);
+        // search and tab combine
+        assert_eq!(list(&conn, |q| {
+            q.q = Some("sami".into());
+            q.status = Some("rejected".into());
+        })
+        .total, 1);
+        let e = admin_teaching(&conn, &AdminTeachingQuery { q: Some("x".repeat(101)), ..Default::default() }).unwrap_err();
+        assert_eq!((e.0, e.1.contains("invalid_query")), (StatusCode::BAD_REQUEST, true));
+
+        // paging: the total ignores limit/offset; the order is stable across pages
+        let first = list(&conn, |q| q.limit = Some(2));
+        let second = list(&conn, |q| {
+            q.limit = Some(2);
+            q.offset = Some(2);
+        });
+        assert_eq!((first.items.len(), first.total, second.items.len(), second.total), (2, 6, 2, 6));
+        assert_eq!(first.items.iter().chain(second.items.iter()).map(|i| i.extra.created_at).collect::<Vec<_>>(), [100, 150, 200, 300]);
+        let past = list(&conn, |q| q.offset = Some(99));
+        assert_eq!((past.items.len(), past.total), (0, 6));
+        assert_eq!(list(&conn, |q| q.limit = Some(0)).items.len(), 1, "limit is at least 1");
+        assert_eq!(list(&conn, |q| q.offset = Some(-3)).items.len(), 6, "a negative offset is 0");
+
+        // the row: everything the page already used, plus the new fields and the account state
+        let item = serde_json::to_value(&approved.items[0]).unwrap();
+        let expected: std::collections::BTreeSet<String> = [
+            "teacher_id", "teacher_name", "subject_id", "subject_name", "institution_id", "institution_name", "status", "teacher_status",
+            "created_at", "decided_at", "reason", "unit_path", "subject_active", "institution_active",
+        ]
+        .iter()
+        .map(|k| k.to_string())
+        .collect();
+        assert_eq!(keys(&item), expected);
+        assert_eq!(item["teacher_id"], users[0].id.as_str());
+        let with_path = list(&conn, |q| q.q = Some("programming".into())).items.into_iter().find(|i| i.base.subject_id == "s1").unwrap();
+        assert_eq!(with_path.extra.unit_path, ["كلية الحاسوب", "المستوى الأول"]);
+        let json = serde_json::to_value(&all).unwrap();
+        assert!(json["items"].is_array() && json["total"] == 6, "the response is {{items,total}}");
+
+        // the default page size is 50, the maximum 200
+        for i in 0..70 {
+            conn.execute("INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES (?1,'i1','مادة',1,0)", params![format!("x{i}")]).unwrap();
+            conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at) VALUES (?1,?2,'pending',?3)", params![users[0].id, format!("x{i}"), 1000 + i]).unwrap();
+        }
+        let big = list(&conn, |_| {});
+        assert_eq!((big.items.len(), big.total), (50, 76));
+        assert_eq!(list(&conn, |q| q.limit = Some(1000)).items.len(), 76, "capped at 200, which is more than there is");
+    }
+
+    #[test]
+    fn unit_paths_are_read_root_first_and_a_missing_unit_is_an_empty_path() {
+        let conn = campus();
+        assert_eq!(unit_path(&conn, Some("l1".into())).unwrap(), ["كلية الحاسوب", "المستوى الأول"]);
+        assert_eq!(unit_path(&conn, Some("d1".into())).unwrap(), ["كلية الحاسوب"]);
+        assert!(unit_path(&conn, None).unwrap().is_empty());
+        assert!(unit_path(&conn, Some("gone".into())).unwrap().is_empty());
+    }
+
+    // ───── phase 3-4: teachers hear about new students and followers (coalesced, anonymous) ─────
+
+    /// (data, link, read, created_at) of `kind` notices of `user`, oldest first.
+    fn notices(conn: &Connection, user: &User, kind: &str) -> Vec<(serde_json::Value, String, bool, i64)> {
+        conn.prepare("SELECT data, link, read_at, created_at FROM notifications WHERE user_id = ?1 AND kind = ?2 ORDER BY rowid")
+            .unwrap()
+            .query_map(params![user.id, kind], |r| Ok((serde_json::from_str(&r.get::<_, String>(0)?).unwrap(), r.get(1)?, r.get::<_, Option<i64>>(2)?.is_some(), r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn approve_for(conn: &Connection, t: &User, subject: &str, status: &str) {
+        conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,?2,?3,0,0)", params![t.id, subject, status]).unwrap();
+    }
+
+    #[test]
+    fn a_new_enrolment_tells_the_approved_active_teachers_once_per_subject_without_naming_the_student() {
+        let conn = create_test_db();
+        let (s1, s2) = seed(&conn);
+        conn.execute("INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES ('s3','i1','شبكات',1,0)", []).unwrap();
+        let t1 = insert_test_user(&conn, "t1@x.com", "teacher", "active");
+        let t2 = insert_test_user(&conn, "t2@x.com", "teacher", "active");
+        let (pending, rejected, suspended, elsewhere) = (
+            insert_test_user(&conn, "t3@x.com", "teacher", "active"),
+            insert_test_user(&conn, "t4@x.com", "teacher", "active"),
+            insert_test_user(&conn, "t5@x.com", "teacher", "suspended"),
+            insert_test_user(&conn, "t6@x.com", "teacher", "active"),
+        );
+        approve_for(&conn, &t1, &s1, "approved");
+        approve_for(&conn, &t2, &s1, "approved");
+        approve_for(&conn, &pending, &s1, "pending");
+        approve_for(&conn, &rejected, &s1, "rejected");
+        approve_for(&conn, &suspended, &s1, "approved");
+        approve_for(&conn, &elsewhere, "s3", "approved");
+        approve_for(&conn, &t1, "s3", "approved");
+        let (a, b, c) = (insert_test_user(&conn, "sara.private@x.com", "student", "active"), insert_test_user(&conn, "b@x.com", "student", "active"), insert_test_user(&conn, "c@x.com", "student", "active"));
+        conn.execute("UPDATE users SET full_name = 'سارة الشريف' WHERE id = ?1", params![a.id]).unwrap();
+        let unread = |t: &User| notices(&conn, t, "new_enrollment");
+        // `since` is the moment the notice began (the count is derived from it); the rest of the data is the contract
+        let no_since = |v: &serde_json::Value| {
+            let mut v = v.clone();
+            assert!(v["since"].is_i64(), "{v}");
+            v.as_object_mut().unwrap().remove("since");
+            v
+        };
+
+        enroll(&conn, &a, &s1).unwrap();
+        for t in [&t1, &t2] {
+            let n = unread(t);
+            assert_eq!(n.len(), 1, "{}", t.email);
+            assert_eq!((no_since(&n[0].0), n[0].1.as_str(), n[0].2), (serde_json::json!({"subject": "برمجة", "count": 1}), "/platform/subjects/s1", false));
+        }
+        for t in [&pending, &rejected, &suspended, &elsewhere, &a] {
+            assert!(unread(t).is_empty(), "{} must not be told", t.email);
+        }
+        // the second student folds into the SAME unread notice: count 2, moved to the top
+        conn.execute("UPDATE notifications SET created_at = 5", []).unwrap();
+        enroll(&conn, &b, &s1).unwrap();
+        let n = unread(&t1);
+        assert_eq!((n.len(), n[0].0["count"].as_i64()), (1, Some(2)));
+        assert!(n[0].3 > 5, "moved to the top (created_at updated in place)");
+        // enrolling again changes nothing: no new notice, no count
+        enroll(&conn, &a, &s1).unwrap();
+        assert_eq!(unread(&t1)[0].0["count"].as_i64(), Some(2), "INSERT OR IGNORE did nothing, so nobody is told");
+        // privacy: nothing about who it was is stored anywhere in the notifications
+        let all: String = conn.query_row("SELECT group_concat(data || link, ' ') FROM notifications", [], |r| r.get(0)).unwrap();
+        for secret in ["سارة", "الشريف", "sara.private", "@x.com", a.id.as_str(), b.id.as_str()] {
+            assert!(!all.contains(secret), "{secret:?} leaked into {all}");
+        }
+        assert_eq!(unread(&t1)[0].0.as_object().unwrap().keys().collect::<Vec<_>>(), ["count", "since", "subject"]);
+        // once read, the next enrolment starts a fresh notice; the unread one of the other teacher keeps counting
+        conn.execute("UPDATE notifications SET read_at = 9 WHERE user_id = ?1", params![t1.id]).unwrap();
+        enroll(&conn, &c, &s1).unwrap();
+        let n = unread(&t1);
+        assert_eq!((n.len(), n[0].2, n[1].2, n[1].0["count"].as_i64()), (2, true, false, Some(1)), "the read one is history");
+        assert_eq!(unread(&t2).len(), 1);
+        assert_eq!(unread(&t2)[0].0["count"].as_i64(), Some(3));
+        // another subject is another notice; a closed subject is a 404 and tells nobody
+        enroll(&conn, &a, "s3").unwrap();
+        assert_eq!((unread(&t1).len(), unread(&elsewhere).len()), (3, 1));
+        assert_eq!(enroll(&conn, &a, &s2).unwrap_err().0, StatusCode::NOT_FOUND);
+        // leaving and coming back is the same student: the count follows who is enrolled, not how often they pressed the button
+        let (before, at) = (unread(&t2)[0].0.clone(), unread(&t2)[0].3);
+        conn.execute("DELETE FROM subject_enrollments WHERE student_id = ?1 AND subject_id = ?2", params![b.id, s1]).unwrap();
+        enroll(&conn, &b, &s1).unwrap();
+        let n = unread(&t2);
+        assert_eq!((n.len(), n[0].0.clone(), n[0].3), (1, before, at), "still 3, and not moved up either: nothing new happened");
+    }
+
+    #[test]
+    fn a_student_who_leaves_and_joins_again_does_not_inflate_the_count() {
+        let conn = create_test_db();
+        let (s1, _) = seed(&conn);
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        approve_for(&conn, &t, &s1, "approved");
+        let (a, b) = (insert_test_user(&conn, "a@x.com", "student", "active"), insert_test_user(&conn, "b@x.com", "student", "active"));
+        let count = |t: &User| notices(&conn, t, "new_enrollment").last().map(|n| n.0["count"].as_i64().unwrap());
+        // the same student toggling twenty times is one student
+        for _ in 0..20 {
+            enroll(&conn, &a, &s1).unwrap();
+            conn.execute("DELETE FROM subject_enrollments WHERE student_id = ?1", params![a.id]).unwrap();
+        }
+        enroll(&conn, &a, &s1).unwrap();
+        assert_eq!(count(&t), Some(1));
+        // another student joins: 2 - and then toggling again changes nothing
+        enroll(&conn, &b, &s1).unwrap();
+        assert_eq!(count(&t), Some(2));
+        for _ in 0..5 {
+            conn.execute("DELETE FROM subject_enrollments WHERE student_id = ?1", params![b.id]).unwrap();
+            enroll(&conn, &b, &s1).unwrap();
+        }
+        assert_eq!((count(&t), notices(&conn, &t, "new_enrollment").len()), (Some(2), 1));
+        // somebody who left before the next one joined is not counted any more
+        let c = insert_test_user(&conn, "c@x.com", "student", "active");
+        conn.execute("DELETE FROM subject_enrollments WHERE student_id = ?1", params![a.id]).unwrap();
+        enroll(&conn, &c, &s1).unwrap();
+        assert_eq!(count(&t), Some(2), "b and c are enrolled; a left");
+        // enrolments from before the notice began are not part of it (they are made old explicitly: a test runs inside
+        // one millisecond, and the notice's start is inclusive)
+        conn.execute("UPDATE subject_enrollments SET created_at = 1", []).unwrap();
+        conn.execute("UPDATE notifications SET read_at = 9", []).unwrap();
+        let d = insert_test_user(&conn, "d@x.com", "student", "active");
+        enroll(&conn, &d, &s1).unwrap();
+        assert_eq!((count(&t), notices(&conn, &t, "new_enrollment").len()), (Some(1), 2), "a new notice starts from this student, not from the whole class");
+        // a notice written before `since` existed keeps counting events and starts remembering from now
+        conn.execute("UPDATE notifications SET data = '{\"subject\":\"برمجة\",\"count\":4}' WHERE read_at IS NULL", []).unwrap();
+        let e = insert_test_user(&conn, "e@x.com", "student", "active");
+        enroll(&conn, &e, &s1).unwrap();
+        let last = notices(&conn, &t, "new_enrollment").pop().unwrap().0;
+        assert_eq!((last["count"].as_i64(), last["since"].is_i64()), (Some(5), true));
+    }
+
+    #[test]
+    fn a_new_follower_tells_the_teacher_once_anonymously_and_only_for_a_real_new_follow() {
+        let conn = create_test_db();
+        seed(&conn);
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        let pending_t = insert_test_user(&conn, "p@x.com", "teacher", "pending");
+        let (a, b) = (insert_test_user(&conn, "follower.a@x.com", "student", "active"), insert_test_user(&conn, "b@x.com", "student", "active"));
+        conn.execute("UPDATE users SET full_name = 'خالد المتابع' WHERE id = ?1", params![a.id]).unwrap();
+        let unread = |u: &User| notices(&conn, u, "new_follower");
+        follow(&conn, &a, &t.id).unwrap();
+        let n = unread(&t);
+        assert_eq!((n.len(), n[0].0["count"].as_i64(), n[0].0["since"].is_i64(), n[0].1.as_str(), n[0].2), (1, Some(1), true, format!("/platform/teachers/{}", t.id).as_str(), false));
+        assert_eq!(n[0].0.as_object().unwrap().keys().collect::<Vec<_>>(), ["count", "since"], "no name, no id");
+        follow(&conn, &a, &t.id).unwrap(); // again: nothing happened
+        assert_eq!(unread(&t)[0].0["count"].as_i64(), Some(1), "no notice for a follow that was already there");
+        conn.execute("UPDATE notifications SET created_at = 5", []).unwrap();
+        follow(&conn, &b, &t.id).unwrap();
+        let n = unread(&t);
+        assert_eq!((n.len(), n[0].0["count"].as_i64()), (1, Some(2)));
+        assert!(n[0].3 > 5);
+        let all: String = conn.query_row("SELECT group_concat(data || link, ' ') FROM notifications", [], |r| r.get(0)).unwrap();
+        for secret in ["خالد", "المتابع", "follower.a", "@x.com", a.id.as_str(), b.id.as_str()] {
+            assert!(!all.contains(secret), "{secret:?} leaked into {all}");
+        }
+        // read -> the next follow starts over; unfollow + follow is a new follow
+        conn.execute("UPDATE notifications SET read_at = 9", []).unwrap();
+        conn.execute("DELETE FROM teacher_follows WHERE student_id = ?1", params![a.id]).unwrap();
+        follow(&conn, &a, &t.id).unwrap();
+        let n = unread(&t);
+        assert_eq!((n.len(), n[1].0["count"].as_i64(), n[1].2), (2, Some(1), false));
+        // a teacher who cannot be followed is told nothing
+        assert_eq!(follow(&conn, &a, &pending_t.id).unwrap_err().0, StatusCode::NOT_FOUND);
+        assert!(unread(&pending_t).is_empty() && unread(&a).is_empty());
+        // following, unfollowing and following again is one follower, however often it is done (b's follow is made old
+        // explicitly: a test runs inside one millisecond, and the notice's start is inclusive)
+        conn.execute("UPDATE teacher_follows SET created_at = 1 WHERE student_id = ?1", params![b.id]).unwrap();
+        let before = unread(&t)[1].clone();
+        for _ in 0..5 {
+            conn.execute("DELETE FROM teacher_follows WHERE student_id = ?1", params![a.id]).unwrap();
+            follow(&conn, &a, &t.id).unwrap();
+        }
+        let n = unread(&t);
+        assert_eq!((n.len(), n[1].0.clone(), n[1].3), (2, before.0, before.3), "count 1 and not moved");
+        let c = insert_test_user(&conn, "c@x.com", "student", "active");
+        follow(&conn, &c, &t.id).unwrap();
+        let n = unread(&t);
+        assert_eq!(n[1].0["count"].as_i64(), Some(2), "a second person is counted");
+    }
+
+    // ───────── phase 4-1: enrolment flags, suggestions from the placement, bulk enrolment ─────────
+
+    /// i1 (school-like tree): dept D > levels L1 (active) / L2 (switched off) > terms; plus a second institution.
+    ///   D ─ L1 ─ T1          subjects: sD (on D), sL1 (on L1), sT1 (on T1), sT1off (on T1, switched off)
+    ///     │    └ T2(off)     sT2 (on T2, below a switched-off unit)
+    ///     └ L2(off) ─ T3     sT3 (below L2)
+    ///   (no unit)            sRoot (directly on the institution)
+    ///   i2                   sOther
+    fn tree(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO institutions(id,type,name_ar,is_active,created_at) VALUES ('i1','university','جامعة',1,0), ('i2','university','أخرى',1,0);
+             INSERT INTO org_units(id,institution_id,parent_id,kind,name_ar,is_active,created_at) VALUES
+               ('D','i1',NULL,'department','قسم',1,0),
+               ('L1','i1','D','level','المستوى الأول',1,0),
+               ('L2','i1','D','level','المستوى الثاني',0,0),
+               ('T1','i1','L1','term','الفصل الأول',1,0),
+               ('T2','i1','L1','term','الفصل الثاني',0,0),
+               ('T3','i1','L2','term','فصل',1,0);
+             INSERT INTO subjects(id,institution_id,unit_id,name_ar,name_en,is_active,created_at) VALUES
+               ('sD','i1','D','عامة','General',1,0),
+               ('sL1','i1','L1','برمجة','Programming',1,0),
+               ('sL1b','i1','L1','أ-رياضيات',NULL,1,0),
+               ('sT1','i1','T1','شبكات',NULL,1,0),
+               ('sT1off','i1','T1','مطفأة',NULL,0,0),
+               ('sT2','i1','T2','تحت مطفأ',NULL,1,0),
+               ('sT3','i1','T3','تحت مستوى مطفأ',NULL,1,0),
+               ('sRoot','i1',NULL,'جذر',NULL,1,0),
+               ('sOther','i2',NULL,'غيرها',NULL,1,0);",
+        )
+        .unwrap();
+    }
+
+    fn place(conn: &Connection, s: &User, inst: &str, unit: Option<&str>) {
+        conn.execute(
+            "INSERT INTO student_placement(student_id,institution_id,unit_id) VALUES (?1,?2,?3)
+             ON CONFLICT(student_id) DO UPDATE SET institution_id = excluded.institution_id, unit_id = excluded.unit_id",
+            params![s.id, inst, unit],
+        )
+        .unwrap();
+    }
+
+    fn suggested_ids(conn: &Connection, s: &User) -> Vec<String> {
+        suggested_subjects(conn, &s.id).unwrap().subjects.into_iter().map(|x| x.id).collect()
+    }
+
+    #[test]
+    fn enrolments_flag_switched_off_subjects_and_institutions_and_keep_them_listed() {
+        let conn = create_test_db();
+        tree(&conn);
+        let s = insert_test_user(&conn, "s@x.com", "student", "active");
+        for id in ["sL1", "sT1", "sOther"] {
+            enroll(&conn, &s, id).unwrap();
+        }
+        let flags = |conn: &Connection| -> Vec<(String, bool)> {
+            let mut v: Vec<(String, bool)> = my_enrollments(conn, &s.id).unwrap().into_iter().map(|e| (e.subject_id, e.active)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(flags(&conn), vec![("sL1".into(), true), ("sOther".into(), true), ("sT1".into(), true)]);
+        conn.execute("UPDATE subjects SET is_active = 0 WHERE id = 'sT1'", []).unwrap();
+        conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i2'", []).unwrap();
+        assert_eq!(flags(&conn), vec![("sL1".into(), true), ("sOther".into(), false), ("sT1".into(), false)], "still listed, so the student can unenrol");
+        let v = serde_json::to_value(&my_enrollments(&conn, &s.id).unwrap()[0]).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["active", "institution_id", "institution_name", "subject_id", "subject_name"]);
+    }
+
+    #[test]
+    fn suggestions_are_the_active_subjects_on_the_placement_unit_and_below_it() {
+        let conn = create_test_db();
+        tree(&conn);
+        let s = insert_test_user(&conn, "s@x.com", "student", "active");
+        let other = insert_test_user(&conn, "o@x.com", "student", "active");
+        assert_eq!(suggested_subjects(&conn, &s.id).unwrap(), Suggestions { placement: None, subjects: vec![] }, "no placement: nothing");
+        // on L1: L1 and T1 (T2 is switched off and cuts its subtree); nothing above L1, nothing of the other institution
+        place(&conn, &s, "i1", Some("L1"));
+        let r = suggested_subjects(&conn, &s.id).unwrap();
+        assert_eq!(
+            r.placement,
+            Some(SuggestedPlacement { institution_id: "i1".into(), institution_name: "جامعة".into(), unit_id: Some("L1".into()), unit_path: vec!["قسم".into(), "المستوى الأول".into()] })
+        );
+        let got: Vec<(&str, Vec<String>)> = r.subjects.iter().map(|x| (x.id.as_str(), x.unit_path.clone())).collect();
+        let l1 = vec!["قسم".to_string(), "المستوى الأول".to_string()];
+        let t1 = vec!["قسم".to_string(), "المستوى الأول".to_string(), "الفصل الأول".to_string()];
+        assert_eq!(got, vec![("sL1b", l1.clone()), ("sL1", l1), ("sT1", t1)], "sorted by unit path, then name");
+        assert_eq!(r.subjects[1].name_en.as_deref(), Some("Programming"));
+        // the enrolled flag is mine
+        enroll(&conn, &s, "sT1").unwrap();
+        enroll(&conn, &other, "sL1").unwrap();
+        let flags: Vec<(String, bool)> = suggested_subjects(&conn, &s.id).unwrap().subjects.into_iter().map(|x| (x.id, x.enrolled)).collect();
+        assert_eq!(flags, vec![("sL1b".into(), false), ("sL1".into(), false), ("sT1".into(), true)]);
+        // on the department: everything below it through active units (not L2's subtree, not T2's)
+        place(&conn, &s, "i1", Some("D"));
+        let mut ids = suggested_ids(&conn, &s);
+        ids.sort();
+        assert_eq!(ids, vec!["sD", "sL1", "sL1b", "sT1"]);
+        // on a switched-off unit, or below one: nothing (the placement is still reported)
+        place(&conn, &s, "i1", Some("T3"));
+        let r = suggested_subjects(&conn, &s.id).unwrap();
+        assert!(r.subjects.is_empty() && r.placement.is_some(), "T3 hangs below the switched-off L2");
+        place(&conn, &s, "i1", Some("T2"));
+        assert!(suggested_ids(&conn, &s).is_empty());
+        // no unit (never chosen, or the admin deleted the level: the column is SET NULL): NOTHING is suggested - not "the
+        // whole institution", whose bulk enrolment would reach unrelated levels - but the placement is still reported so the
+        // screen can ask for a level again
+        place(&conn, &s, "i1", None);
+        let r = suggested_subjects(&conn, &s.id).unwrap();
+        assert!(r.subjects.is_empty(), "no unit: no suggestions");
+        let head = r.placement.expect("the placement is still reported");
+        assert_eq!((head.institution_id.as_str(), head.unit_id, head.unit_path), ("i1", None, Vec::<String>::new()));
+        // the same through a real deletion of the placement unit
+        place(&conn, &s, "i1", Some("L1"));
+        assert!(!suggested_ids(&conn, &s).is_empty());
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        conn.execute("DELETE FROM org_units WHERE id IN ('T1','L1')", []).unwrap();
+        let r = suggested_subjects(&conn, &s.id).unwrap();
+        assert_eq!((r.placement.map(|p| p.unit_id), r.subjects.len()), (Some(None), 0), "the deleted level leaves no suggestions behind");
+        // the institution switched off: nothing
+        conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        assert!(suggested_ids(&conn, &s).is_empty());
+        // and the other student's placement is theirs
+        assert_eq!(suggested_subjects(&conn, &other.id).unwrap().placement, None);
+    }
+
+    fn enrolments(conn: &Connection, s: &User) -> Vec<String> {
+        let mut v: Vec<String> = my_enrollments(conn, &s.id).unwrap().into_iter().map(|e| e.subject_id).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn bulk_enrolment_follows_the_single_rules_and_counts_skips() {
+        let conn = create_test_db();
+        tree(&conn);
+        let s = insert_test_user(&conn, "s@x.com", "student", "active");
+        enroll(&conn, &s, "sD").unwrap();
+        let ids = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let r = bulk_enroll(&conn, &s, &ids(&["sL1", "sD", "sT1off", "nope", "sT1", "sL1"]), 5).unwrap();
+        assert_eq!(r, BulkEnrollRes { enrolled: 2, skipped: 4 }, "already enrolled, switched off, unknown and a repeat are skipped");
+        assert_eq!(enrolments(&conn, &s), vec!["sD", "sL1", "sT1"]);
+        // a switched-off institution: the same rule as one enrolment
+        conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i2'", []).unwrap();
+        assert_eq!(bulk_enroll(&conn, &s, &ids(&["sOther"]), 6).unwrap(), BulkEnrollRes { enrolled: 0, skipped: 1 });
+        assert_eq!(enroll(&conn, &s, "sOther").unwrap_err().0, StatusCode::NOT_FOUND, "and the single enrolment agrees");
+        // 1..=30 ids
+        for n in [0usize, 31] {
+            let many: Vec<String> = (0..n).map(|i| format!("x{i}")).collect();
+            let e = bulk_enroll(&conn, &s, &many, 7).unwrap_err();
+            assert_eq!((e.0, e.1.contains("invalid_selection")), (StatusCode::BAD_REQUEST, true), "{n} ids");
+        }
+        let thirty: Vec<String> = (0..30).map(|i| format!("x{i}")).collect();
+        assert_eq!(bulk_enroll(&conn, &s, &thirty, 8).unwrap(), BulkEnrollRes { enrolled: 0, skipped: 30 });
+    }
+
+    #[test]
+    fn bulk_enrolment_tells_each_subjects_teachers_once_coalesced() {
+        let conn = create_test_db();
+        tree(&conn);
+        let t = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        for subject in ["sL1", "sT1"] {
+            conn.execute("INSERT INTO teacher_subjects(teacher_id,subject_id,status,created_at) VALUES (?1,?2,'approved',0)", params![t.id, subject]).unwrap();
+        }
+        let a = insert_test_user(&conn, "a@x.com", "student", "active");
+        let b = insert_test_user(&conn, "b@x.com", "student", "active");
+        bulk_enroll(&conn, &a, &["sL1".into(), "sT1".into(), "sD".into()], 100).unwrap();
+        bulk_enroll(&conn, &b, &["sL1".into()], 200).unwrap();
+        let notices: Vec<(String, String)> = conn
+            .prepare("SELECT link, data FROM notifications WHERE user_id = ?1 AND kind = 'new_enrollment' ORDER BY link")
+            .unwrap()
+            .query_map(params![t.id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(notices.len(), 2, "one notice per subject the teacher is approved for (none for sD)");
+        let l1: serde_json::Value = serde_json::from_str(&notices.iter().find(|(l, _)| l.ends_with("/sL1")).unwrap().1).unwrap();
+        assert_eq!((l1["count"].as_i64(), l1["subject"].as_str()), (Some(2), Some("برمجة")), "coalesced: two students");
+    }
+
+    #[test]
+    fn bulk_enrolment_is_one_transaction() {
+        let conn = create_test_db();
+        tree(&conn);
+        let s = insert_test_user(&conn, "s@x.com", "student", "active");
+        // the database fails on the third subject: nothing of the batch may stay
+        conn.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON subject_enrollments WHEN NEW.subject_id = 'sT1' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        )
+        .unwrap();
+        let e = bulk_enroll(&conn, &s, &["sL1".into(), "sD".into(), "sT1".into()], 5).unwrap_err();
+        assert_eq!(e.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(enrolments(&conn, &s).is_empty(), "rolled back");
+        conn.execute_batch("DROP TRIGGER boom;").unwrap();
+        assert_eq!(bulk_enroll(&conn, &s, &["sL1".into(), "sD".into(), "sT1".into()], 6).unwrap(), BulkEnrollRes { enrolled: 3, skipped: 0 });
+    }
+}
+
+/// Phase 4-2: the paged teachers directory and the list of the teachers a student follows.
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+    use crate::platform::{create_test_db, insert_test_user};
+
+    struct W {
+        conn: Connection,
+        me: User,
+        other: User,
+        teacher_viewer: User,
+        admin: User,
+        ali: User,
+        bob: User,
+    }
+
+    fn teacher(conn: &Connection, email: &str, name: &str, status: &str) -> User {
+        let u = insert_test_user(conn, email, "teacher", status);
+        conn.execute("UPDATE users SET full_name = ?2, bio = ?3 WHERE id = ?1", params![u.id, name, format!("نبذة {name}")]).unwrap();
+        User { full_name: name.into(), ..u }
+    }
+
+    fn approve(conn: &Connection, t: &User, subject: &str, status: &str) {
+        conn.execute("INSERT INTO teacher_subjects(teacher_id,subject_id,status,created_at,decided_at) VALUES (?1,?2,?3,0,0)", params![t.id, subject, status]).unwrap();
+    }
+
+    fn follow_at(conn: &Connection, s: &User, t: &User, at: i64) {
+        conn.execute("INSERT INTO teacher_follows(student_id,teacher_id,created_at) VALUES (?1,?2,?3)", params![s.id, t.id, at]).unwrap();
+    }
+
+    fn world() -> W {
+        let conn = create_test_db();
+        conn.execute_batch(
+            "INSERT INTO institutions(id,type,name_ar,is_active,created_at) VALUES ('i1','university','جامعة',1,0), ('i2','school','مدرسة مغلقة',0,0);
+             INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES ('s1','i1','برمجة',1,0), ('s2','i1','رياضيات',1,0), ('s3','i1','مغلقة',0,0), ('s4','i2','في مؤسسة مغلقة',1,0);",
+        )
+        .unwrap();
+        let me = insert_test_user(&conn, "me@x.com", "student", "active");
+        let other = insert_test_user(&conn, "o@x.com", "student", "active");
+        let teacher_viewer = teacher(&conn, "tv@x.com", "ياسر المشاهد", "active");
+        let admin = insert_test_user(&conn, "adm@x.com", "admin", "active");
+        let ali = teacher(&conn, "ali@x.com", "أحمد علي", "active");
+        let bob = teacher(&conn, "bob@x.com", "بسام", "active");
+        approve(&conn, &ali, "s1", "approved");
+        approve(&conn, &ali, "s2", "approved");
+        approve(&conn, &bob, "s3", "approved"); // a subject that is switched off: reachable by nobody
+        let cara = teacher(&conn, "cara@x.com", "كارا", "active");
+        approve(&conn, &cara, "s1", "pending");
+        let dan = teacher(&conn, "dan@x.com", "دانيال", "active");
+        approve(&conn, &dan, "s4", "approved");
+        let eve = teacher(&conn, "eve@x.com", "إيف المعلقة", "pending");
+        approve(&conn, &eve, "s1", "approved");
+        let fran = teacher(&conn, "fran@x.com", "فران الموقوفة", "suspended");
+        approve(&conn, &fran, "s1", "approved");
+        follow_at(&conn, &me, &ali, 100);
+        follow_at(&conn, &me, &bob, 200);
+        W { conn, me, other, teacher_viewer, admin, ali, bob }
+    }
+
+    fn dir(w: &W, who: &User, q: DirectoryQuery) -> DirectoryPage {
+        teachers_directory(&w.conn, who, &q).unwrap()
+    }
+
+    fn names(p: &DirectoryPage) -> Vec<&str> {
+        p.items.iter().map(|t| t.full_name.as_str()).collect()
+    }
+
+    fn query(q: Option<&str>, subject: Option<&str>) -> DirectoryQuery {
+        DirectoryQuery { q: q.map(String::from), subject_id: subject.map(String::from), ..Default::default() }
+    }
+
+    #[test]
+    fn the_directory_lists_active_teachers_by_name_with_their_reachable_subject_count() {
+        let w = world();
+        let p = dir(&w, &w.me, DirectoryQuery::default());
+        // active accounts only (not the pending or the suspended one); a teacher with nothing reachable is still a person
+        assert_eq!(p.total, 5, "{:?}", names(&p));
+        let mut sorted = names(&p);
+        sorted.sort();
+        assert_eq!(names(&p), sorted, "by full_name");
+        assert!(!names(&p).iter().any(|n| n.contains("المعلقة") || n.contains("الموقوفة")));
+        let count = |name: &str| p.items.iter().find(|t| t.full_name == name).map(|t| t.subject_count);
+        assert_eq!((count("أحمد علي"), count("بسام"), count("كارا"), count("دانيال")), (Some(2), Some(0), Some(0), Some(0)), "only approved subjects whose subject AND institution are on");
+        let ali = p.items.iter().find(|t| t.id == w.ali.id).unwrap();
+        assert_eq!((ali.bio.as_deref(), ali.following), (Some("نبذة أحمد علي"), true));
+        // the same people as the older, unpaged list
+        let mut old: Vec<String> = list_teachers(&w.conn, &TeacherQuery { q: None, subject_id: None }).unwrap().into_iter().map(|t| t.id).collect();
+        let mut new: Vec<String> = p.items.iter().map(|t| t.id.clone()).collect();
+        old.sort();
+        new.sort();
+        assert_eq!(new, old);
+    }
+
+    #[test]
+    fn the_following_flag_is_the_viewers_own_and_only_a_students() {
+        let w = world();
+        let flag = |who: &User, id: &str| dir(&w, who, DirectoryQuery::default()).items.into_iter().find(|t| t.id == id).unwrap().following;
+        assert_eq!((flag(&w.me, &w.ali.id), flag(&w.me, &w.bob.id)), (true, true));
+        assert!(!flag(&w.other, &w.ali.id), "another student does not follow them");
+        assert!(!flag(&w.teacher_viewer, &w.ali.id) && !flag(&w.admin, &w.ali.id), "staff never 'follow'");
+        // even when a follow row exists for a non-student viewer's id
+        follow_at(&w.conn, &w.admin, &w.ali, 1);
+        assert!(!flag(&w.admin, &w.ali.id));
+        // unfollowing flips it
+        w.conn.execute("DELETE FROM teacher_follows WHERE student_id = ?1 AND teacher_id = ?2", params![w.me.id, w.ali.id]).unwrap();
+        assert!(!flag(&w.me, &w.ali.id) && flag(&w.me, &w.bob.id));
+    }
+
+    #[test]
+    fn the_search_folds_arabic_and_treats_wildcards_literally() {
+        let w = world();
+        assert_eq!(names(&dir(&w, &w.me, query(Some("احمد"), None))), ["أحمد علي"], "no hamza in the query");
+        assert_eq!(names(&dir(&w, &w.me, query(Some("أحمد"), None))), ["أحمد علي"]);
+        assert_eq!(names(&dir(&w, &w.me, query(Some("ايف"), None))).len(), 0, "a pending account is not listed whatever the query");
+        assert_eq!(dir(&w, &w.me, query(Some("%"), None)).total, 0);
+        assert_eq!(dir(&w, &w.me, query(Some("_"), None)).total, 0);
+        assert_eq!(dir(&w, &w.me, query(Some("  "), None)).total, 5, "blank = no filter");
+        assert_eq!(dir(&w, &w.me, query(Some("لا يوجد"), None)).total, 0);
+        // a very long query is cut instead of refused
+        assert_eq!(dir(&w, &w.me, query(Some(&"ب".repeat(500)), None)).total, 0);
+        // the page and the total agree
+        let p = dir(&w, &w.me, query(Some("ب"), None));
+        assert_eq!(p.total as usize, p.items.len());
+    }
+
+    #[test]
+    fn the_subject_filter_keeps_only_teachers_approved_for_a_subject_students_can_reach() {
+        let w = world();
+        assert_eq!(names(&dir(&w, &w.me, query(None, Some("s1")))), ["أحمد علي"], "cara is only pending; eve and fran are not active teachers");
+        assert_eq!(names(&dir(&w, &w.me, query(None, Some("s2")))), ["أحمد علي"]);
+        for hidden in ["s3", "s4", "nope"] {
+            assert_eq!(dir(&w, &w.me, query(None, Some(hidden))).total, 0, "{hidden}: switched off or unknown");
+        }
+        assert_eq!(dir(&w, &w.me, query(Some("احمد"), Some("s1"))).total, 1);
+        assert_eq!(dir(&w, &w.me, query(Some("بسام"), Some("s1"))).total, 0, "both filters apply");
+        w.conn.execute("UPDATE subjects SET is_active = 0 WHERE id = 's1'", []).unwrap();
+        assert_eq!(dir(&w, &w.me, query(None, Some("s1"))).total, 0);
+        assert_eq!(dir(&w, &w.me, query(None, None)).items.iter().find(|t| t.id == w.ali.id).unwrap().subject_count, 1);
+    }
+
+    #[test]
+    fn paging_is_24_by_default_60_at_most_and_never_repeats_a_teacher() {
+        let w = world();
+        for n in 0..70 {
+            let t = teacher(&w.conn, &format!("m{n}@x.com"), &format!("معلم {n:02}"), "active");
+            approve(&w.conn, &t, "s1", "approved");
+        }
+        let first = dir(&w, &w.me, DirectoryQuery::default());
+        assert_eq!((first.items.len(), first.total), (24, 75));
+        assert_eq!(dir(&w, &w.me, DirectoryQuery { limit: Some(1000), ..Default::default() }).items.len(), 60);
+        assert_eq!(dir(&w, &w.me, DirectoryQuery { limit: Some(0), ..Default::default() }).items.len(), 1);
+        assert_eq!(dir(&w, &w.me, DirectoryQuery { limit: Some(-5), offset: Some(-5), ..Default::default() }).items.len(), 1);
+        let mut seen: Vec<String> = Vec::new();
+        for offset in (0..80).step_by(30) {
+            seen.extend(dir(&w, &w.me, DirectoryQuery { limit: Some(30), offset: Some(offset), ..Default::default() }).items.into_iter().map(|t| t.id));
+        }
+        assert_eq!(seen.len(), 75);
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 75, "no teacher twice across pages");
+        assert!(dir(&w, &w.me, DirectoryQuery { offset: Some(75), ..Default::default() }).items.is_empty());
+        // two teachers with the same name still page deterministically (by id)
+        let twin = teacher(&w.conn, "twin@x.com", "معلم 00", "active");
+        let a = dir(&w, &w.me, DirectoryQuery { q: Some("معلم 00".into()), ..Default::default() });
+        let b = dir(&w, &w.me, DirectoryQuery { q: Some("معلم 00".into()), ..Default::default() });
+        assert_eq!((a.items.iter().map(|t| t.id.clone()).collect::<Vec<_>>(), a.total), (b.items.iter().map(|t| t.id.clone()).collect::<Vec<_>>(), 2));
+        let _ = twin;
+    }
+
+    #[test]
+    fn the_following_list_has_the_students_active_teachers_newest_follow_first() {
+        let w = world();
+        let list = |who: &User| my_following(&w.conn, &who.id).unwrap().items;
+        let items = list(&w.me);
+        assert_eq!(items.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), [w.bob.id.as_str(), w.ali.id.as_str()], "newest follow first");
+        assert_eq!((items[0].followed_at, items[0].subject_count, items[1].followed_at, items[1].subject_count), (200, 0, 100, 2));
+        assert_eq!((items[1].full_name.as_str(), items[1].bio.as_deref()), ("أحمد علي", Some("نبذة أحمد علي")));
+        assert!(list(&w.other).is_empty(), "only the caller's rows");
+        // a teacher who is no longer an active teacher drops out (the row stays)
+        w.conn.execute("UPDATE users SET status = 'suspended' WHERE id = ?1", params![w.bob.id]).unwrap();
+        assert_eq!(list(&w.me).len(), 1);
+        w.conn.execute("UPDATE users SET status = 'active' WHERE id = ?1", params![w.bob.id]).unwrap();
+        assert_eq!(list(&w.me).len(), 2);
+        w.conn.execute("UPDATE users SET role = 'student' WHERE id = ?1", params![w.bob.id]).unwrap();
+        assert_eq!(list(&w.me).len(), 1);
+        // the same time: by id
+        let c = teacher(&w.conn, "c2@x.com", "جديد", "active");
+        follow_at(&w.conn, &w.me, &c, 100);
+        let order: Vec<String> = list(&w.me).into_iter().map(|t| t.id).collect();
+        let mut tie = vec![w.ali.id.clone(), c.id.clone()];
+        tie.sort();
+        assert_eq!(order, tie);
+        // the JSON shape
+        let v = serde_json::to_value(my_following(&w.conn, &w.me.id).unwrap()).unwrap();
+        let mut keys: Vec<&str> = v["items"][0].as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["bio", "followed_at", "full_name", "id", "subject_count"]);
+    }
+
+    #[test]
+    fn the_directory_json_shape_is_the_agreed_one() {
+        let w = world();
+        let v = serde_json::to_value(dir(&w, &w.me, DirectoryQuery::default())).unwrap();
+        let mut top: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        top.sort();
+        assert_eq!(top, ["items", "total"]);
+        let mut keys: Vec<&str> = v["items"][0].as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["bio", "following", "full_name", "id", "subject_count"]);
+    }
+
+    /// `main.rs` registers `/teachers`, then merges the directory, then registers `/teachers/{id}`: building a router in
+    /// that order must not panic (axum refuses overlapping routes at construction, which would be a startup crash).
+    #[test]
+    fn the_routes_can_be_registered_in_the_order_main_uses() {
+        use axum::routing::get;
+        let _router: axum::Router<Arc<AppState>> = axum::Router::new()
+            .route("/api/platform/teachers", get(list_teachers_handler))
+            .merge(directory_routes())
+            .route("/api/platform/teachers/{id}", get(teacher_page_handler))
+            .route("/api/platform/teachers/{id}/follow", axum::routing::post(follow_handler).delete(unfollow_handler))
+            .merge(crate::platform_search::routes())
+            .merge(crate::platform_bookmarks::routes())
+            .merge(crate::platform_student_learning::routes());
     }
 }

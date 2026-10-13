@@ -6,16 +6,26 @@ mod platform_admin;
 mod platform_ai;
 mod platform_backup;
 mod platform_bank;
+mod platform_bookmarks;
 mod platform_exam_admin;
+mod platform_exam_key;
+mod platform_exam_teacher;
 mod platform_grading;
 mod platform_content;
 mod platform_engage;
 mod platform_exams;
 mod platform_ops;
+mod platform_practice;
 mod platform_public;
 mod platform_reminders;
+mod platform_search;
 mod platform_settings;
+mod platform_stats;
+mod platform_student;
+mod platform_student_learning;
+mod platform_student_stats;
 mod platform_learning;
+mod platform_teacher;
 mod relay;
 mod routes;
 mod security_headers;
@@ -113,6 +123,8 @@ async fn main() {
     let token_limiter = Arc::new(token_limit::TokenLimiter::from_env());
     println!("Signed-in API budget: {} requests/minute per session (PLATFORM_TOKEN_RPM, 0 = off)", token_limiter.per_minute());
     println!("Client address: trusted proxy hops = {}", proxy.describe());
+    println!("Sign-in limits: {}", state.platform.limits.describe());
+    println!("Reports: {}", state.platform.report_limits.describe());
 
     let static_dir =
         std::env::var("STATIC_DIR").unwrap_or_else(|_| "../frontend/dist".to_string());
@@ -164,10 +176,14 @@ async fn main() {
         .route("/api/platform/me/placement", get(platform_learning::get_placement_handler).put(platform_learning::set_placement_handler))
         .route("/api/platform/teaching", get(platform_learning::my_teaching_handler).post(platform_learning::request_teaching_handler))
         .route("/api/platform/teaching/{subject_id}", delete(platform_learning::drop_teaching_handler))
+        .route("/api/platform/teaching/{subject_id}/impact", get(platform_learning::teaching_impact_handler))
         .route("/api/platform/admin/teaching", get(platform_learning::admin_teaching_handler).patch(platform_learning::admin_decide_teaching_handler))
+        .route("/api/platform/admin/teaching/impact", get(platform_learning::admin_teaching_impact_handler))
         .route("/api/platform/enrollments", get(platform_learning::my_enrollments_handler).post(platform_learning::enroll_handler))
         .route("/api/platform/enrollments/{subject_id}", delete(platform_learning::unenroll_handler))
         .route("/api/platform/teachers", get(platform_learning::list_teachers_handler))
+        // the paged directory and the following list (phase 4-2); `/teachers/directory` is a static segment next to `{id}`
+        .merge(platform_learning::directory_routes())
         .route("/api/platform/teachers/{id}", get(platform_learning::teacher_page_handler))
         .route("/api/platform/teachers/{id}/follow", post(platform_learning::follow_handler).delete(platform_learning::unfollow_handler))
         .route("/api/platform/subjects/{id}", get(platform_learning::subject_page_handler))
@@ -176,6 +192,7 @@ async fn main() {
             "/api/platform/posts/{id}",
             get(platform_content::get_post_handler).patch(platform_content::update_post_handler).delete(platform_content::delete_post_handler),
         )
+        .route("/api/platform/posts/{id}/duplicate", post(platform_content::duplicate_post_handler))
         .route(
             "/api/platform/posts/{id}/file",
             post(platform_content::upload_file_handler).delete(platform_content::remove_file_handler).layer(platform_content::upload_limit()),
@@ -186,6 +203,7 @@ async fn main() {
             "/api/platform/courses/{id}",
             get(platform_content::get_course_handler).patch(platform_content::update_course_handler).delete(platform_content::delete_course_handler),
         )
+        .route("/api/platform/courses/{id}/duplicate", post(platform_content::duplicate_course_handler))
         .route("/api/platform/courses/{id}/lessons", post(platform_content::add_lesson_handler))
         .route(
             "/api/platform/lessons/{id}",
@@ -195,7 +213,7 @@ async fn main() {
         .route("/api/platform/live", post(platform_content::create_live_handler))
         .route(
             "/api/platform/live/{id}",
-            axum::routing::patch(platform_content::update_live_handler).delete(platform_content::delete_live_handler),
+            get(platform_content::get_live_handler).patch(platform_content::update_live_handler).delete(platform_content::delete_live_handler),
         )
         .route("/api/platform/subjects/{id}/content", get(platform_content::subject_content_handler))
         .route("/api/platform/teachers/{id}/content", get(platform_content::teacher_content_handler))
@@ -227,16 +245,22 @@ async fn main() {
         .route("/api/platform/admin/reports", get(platform_ops::list_reports_handler))
         .route("/api/platform/admin/reports/{id}", axum::routing::patch(platform_ops::resolve_report_handler))
         .route("/api/platform/admin/stats", get(platform_ops::stats_handler))
+        .route("/api/platform/admin/stats/institutions", get(platform_stats::institutions_stats_handler))
+        .route("/api/platform/admin/stats/subjects", get(platform_stats::subjects_stats_handler))
         .route("/api/platform/admin/backup", post(platform_backup::create_handler))
         .route("/api/platform/admin/backups", get(platform_backup::list_handler))
         .route("/api/platform/admin/backups/{id}", get(platform_backup::download_handler))
         .route("/api/platform/admin/system", get(platform_backup::system_handler))
         .route("/api/platform/admin/audit", get(platform_ops::audit_handler))
-        .route("/api/platform/search", get(platform_ops::search_handler))
+        // unified search over six groups (phase 4-2)
+        .merge(platform_search::routes())
         .route("/api/platform/me/password", post(platform_ops::change_password_handler))
+        .route("/api/platform/me/deletion-impact", get(platform_ops::deletion_impact_handler))
         .route("/api/platform/me", delete(platform_ops::delete_account_handler))
+        .route("/api/platform/teacher/stats", get(platform_teacher::stats_handler))
         .route("/api/platform/public/config", get(platform_public::public_config_handler))
         .route("/api/platform/public/logo", get(platform_public::logo_handler))
+        .route("/api/platform/public/stats", get(platform_stats::public_stats_handler))
         .route("/api/platform/public/legal/{slug}", get(platform_public::legal_get_handler))
         .route("/api/platform/admin/settings", get(platform_ai::get_settings_handler).put(platform_ai::put_settings_handler))
         .route("/api/platform/admin/settings/ai/test", post(platform_ai::test_handler))
@@ -247,9 +271,16 @@ async fn main() {
         .route("/api/platform/admin/bank/bulk", post(platform_bank::bulk_handler))
         .route("/api/platform/admin/bank/import", post(platform_bank::import_handler).layer(platform_bank::import_limit()))
         .route("/api/platform/admin/bank/{id}", axum::routing::patch(platform_bank::update_handler))
-        .route("/api/platform/admin/exams", get(platform_exam_admin::list_handler).post(platform_exam_admin::create_handler))
-        .route("/api/platform/admin/exams/{id}", get(platform_exam_admin::get_handler).patch(platform_exam_admin::update_handler).delete(platform_exam_admin::delete_handler))
-        .route("/api/platform/admin/exams/{id}/{action}", post(platform_exam_admin::action_handler))
+        // the exam builder, both doors (admin and teacher) and the answer-key correction: see platform_exam_teacher::routes
+        .merge(platform_exam_teacher::routes())
+        // the student's screens (phase 4-1): My exams, the overview, suggested subjects and bulk enrolment
+        .merge(platform_student::routes())
+        // the student's learning hub, live page schedule and calendar file, and saved items (phase 4-2)
+        .merge(platform_student_learning::routes())
+        .merge(platform_bookmarks::routes())
+        // practice mode (ungraded, shows the answers; writes nothing) and the student's own statistics (phase 4-3)
+        .merge(platform_practice::routes())
+        .merge(platform_student_stats::routes())
         .route("/api/platform/attempts/{id}/answers", axum::routing::put(platform_exams::save_handler))
         .route("/api/platform/attempts/{id}/events", post(platform_exams::event_handler))
         .route("/api/platform/grading/pending", get(platform_grading::pending_handler))
@@ -257,6 +288,7 @@ async fn main() {
         .route("/api/platform/assessments/{id}/grade-batch", post(platform_grading::batch_handler))
         .route("/api/platform/assessments/{id}/analytics", get(platform_grading::analytics_handler))
         .route("/api/platform/assessments/{id}/attempts", get(platform_grading::table_handler))
+        .route("/api/platform/assessments/{id}/absent", get(platform_grading::absent_handler))
         .route("/api/platform/assessments/{id}/export", get(platform_grading::export_handler))
         .route("/api/platform/admin/branding", axum::routing::put(platform_public::set_branding_handler))
         .route(

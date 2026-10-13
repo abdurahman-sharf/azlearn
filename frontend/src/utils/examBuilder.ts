@@ -33,7 +33,7 @@ export function normalizeAnswer(type: string, options: string[], answer: string)
   return answer.trim()
 }
 
-export type Problem = 'stem' | 'options' | 'answer' | 'score'
+export type Problem = 'stem' | 'options' | 'answer' | 'score' | 'length'
 
 /** Instant checks shown in the review step (the server repeats them authoritatively). */
 export function validateQuestion(q: Question): Problem | null {
@@ -41,8 +41,11 @@ export function validateQuestion(q: Question): Problem | null {
   const isChoice = q.type === 'single_choice' || q.type === 'multi_choice'
   const opts = q.options.map((o) => o.trim()).filter(Boolean)
   if (isChoice && (opts.length < 2 || opts.length > 10)) return 'options'
-  if (!q.answer.trim() || normalizeAnswer(q.type, q.type === 'true_false' ? opts : opts, q.answer) === null) return 'answer'
+  const answer = q.answer.trim() ? normalizeAnswer(q.type, opts, q.answer) : null
+  if (answer === null) return 'answer'
   if (q.score !== undefined && (!Number.isFinite(q.score) || q.score < 0 || q.score > 100)) return 'score'
+  // the server's size limits: answer 2000, analysis 6000, each choice option 1000 characters
+  if (answer.length > 2000 || (q.analysis ?? '').length > 6000 || (isChoice && opts.some((o) => o.length > 1000))) return 'length'
   return null
 }
 
@@ -55,7 +58,8 @@ export function adoptQuestions(raw: Question[], nextId: () => string, src?: (q: 
       id: nextId(),
       type: q.type,
       stem: String(q.stem ?? ''),
-      options: q.type === 'true_false' && !options.length ? ['صحيح', 'خطأ'] : options,
+      // only choice and true/false questions carry options (the server drops them for the other types)
+      options: q.type === 'true_false' ? (options.length ? options : ['صحيح', 'خطأ']) : q.type === 'single_choice' || q.type === 'multi_choice' ? options : [],
       answer,
       analysis: String(q.analysis ?? ''),
       score: q.score ?? 1,

@@ -1,11 +1,11 @@
 //! Student engagement: lesson progress, ratings & reviews, in-app notifications.
 //! Other platform modules call `notify` / `notify_audience` when something worth telling happens.
 
-use crate::platform::{bad, db_err, lock, new_id, opt_text, require_active, require_role, Res, User};
+use crate::platform::{bad, db_err, lock, new_id, opt_text, require_active, require_role, Res, User, INSTITUTION_ACTIVE, SUBJECT_ACTIVE};
 use crate::relay::{err, now_ms};
 use crate::routes::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -75,6 +75,202 @@ pub fn purge_old_notifications(state: &crate::platform::PlatformState) {
     }
 }
 
+// ───────── coalesced notices (phase 3-4) ─────────
+
+/// What [`upsert_unread`] does once the caller has seen the current unread notice (if there is one).
+pub(crate) enum Fold {
+    /// Store this data: the unread notice is updated in place (and moved to the top, `created_at` = now), or inserted
+    /// when there is none.
+    Write(Value),
+    /// Take the unread notice away (a no-op when there is none).
+    Remove,
+    /// Leave everything as it is.
+    Skip,
+}
+
+/// **The one helper for notices that must not pile up** (new enrolments, new followers, "answers wait for you", score
+/// changes, new feedback): finds the newest UNREAD notice of `user_id` with this `kind` and `link`, hands its data
+/// (`None` = there is none) to `fold`, and does what `fold` answers. A notice that was already read is never touched, so
+/// the next event starts a new one. `now` is passed in (never read from the clock here) so the callers' rules around it
+/// can be tested at their exact boundaries. Errors are returned: a caller inside a transaction must be able to roll back.
+pub(crate) fn upsert_unread(conn: &Connection, user_id: &str, kind: &str, link: &str, now: i64, fold: impl FnOnce(Option<Value>) -> Res<Fold>) -> Res<()> {
+    let existing: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, data FROM notifications WHERE user_id = ?1 AND kind = ?2 AND link = ?3 AND read_at IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![user_id, kind, link],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let current = existing.as_ref().map(|(_, data)| serde_json::from_str::<Value>(data).unwrap_or(Value::Null));
+    match (fold(current)?, existing) {
+        (Fold::Skip, _) | (Fold::Remove, None) => {}
+        (Fold::Remove, Some((id, _))) => {
+            conn.execute("DELETE FROM notifications WHERE id = ?1", params![id]).map_err(db_err)?;
+        }
+        (Fold::Write(data), Some((id, _))) => {
+            conn.execute("UPDATE notifications SET data = ?2, created_at = ?3 WHERE id = ?1", params![id, data.to_string(), now]).map_err(db_err)?;
+        }
+        (Fold::Write(data), None) => {
+            conn.execute(
+                "INSERT INTO notifications(id, user_id, kind, data, link, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![new_id(), user_id, kind, data.to_string(), link, now],
+            )
+            .map_err(db_err)?;
+        }
+    }
+    Ok(())
+}
+
+/// `count` of a coalesced notice's data (1 when it has none), plus one.
+fn next_count(current: &Option<Value>) -> i64 {
+    current.as_ref().and_then(|d| d["count"].as_i64()).unwrap_or(0).max(0) + 1
+}
+
+/// Teachers who get "something happened in your subject": active teachers with an APPROVED assignment for it.
+fn approved_teachers(conn: &Connection, subject_id: &str) -> Res<Vec<String>> {
+    conn.prepare(
+        "SELECT ts.teacher_id FROM teacher_subjects ts JOIN users u ON u.id = ts.teacher_id
+         WHERE ts.subject_id = ?1 AND ts.status = 'approved' AND u.role = 'teacher' AND u.status = 'active' ORDER BY ts.teacher_id",
+    )
+    .map_err(db_err)?
+    .query_map(params![subject_id], |r| r.get(0))
+    .map_err(db_err)?
+    .collect::<Result<Vec<String>, _>>()
+    .map_err(db_err)
+}
+
+/// The text of a coalesced "people joined" notice (new enrolments, new followers) after one more person joined.
+///
+/// The count is **derived from state, not from events**: the notice remembers `since` (when its first person joined) and
+/// `count_since(since)` says how many of those people are *still* there, so one student who leaves and joins again ten
+/// times is one student. When nothing changed (the same person came back) the notice is left alone - not even moved to
+/// the top. A notice without `since` (written before it existed) keeps counting events and starts remembering from now.
+fn fold_joined(cur: &Option<Value>, now: i64, mut data: serde_json::Map<String, Value>, count_since: impl FnOnce(i64) -> Res<i64>) -> Res<Fold> {
+    let since = cur.as_ref().and_then(|d| d["since"].as_i64());
+    let (count, since) = match (cur, since) {
+        (Some(_), Some(since)) => (count_since(since)?.max(1), since),
+        (Some(_), None) => (next_count(cur), now),
+        (None, _) => (1, now),
+    };
+    if cur.as_ref().map_or(false, |d| d["count"].as_i64() == Some(count) && d["since"].as_i64() == Some(since)) {
+        return Ok(Fold::Skip);
+    }
+    data.insert("count".into(), json!(count));
+    data.insert("since".into(), json!(since));
+    Ok(Fold::Write(Value::Object(data)))
+}
+
+/// A student has just enrolled in `subject_id`: every active teacher approved for it gets ONE unread notice per subject
+/// (`new_enrollment {subject, count, since}`), the count growing while it stays unread (see [`fold_joined`]: students
+/// who joined since the notice began and are still enrolled). The student is never named.
+pub(crate) fn tell_new_enrollment(conn: &Connection, subject_id: &str, now: i64) -> Res<()> {
+    let name: String = conn.query_row("SELECT name_ar FROM subjects WHERE id = ?1", params![subject_id], |r| r.get(0)).optional().map_err(db_err)?.unwrap_or_default();
+    let link = format!("/platform/subjects/{subject_id}");
+    for teacher in approved_teachers(conn, subject_id)? {
+        upsert_unread(conn, &teacher, "new_enrollment", &link, now, |cur| {
+            let mut data = serde_json::Map::new();
+            data.insert("subject".into(), json!(name));
+            fold_joined(&cur, now, data, |since| {
+                conn.query_row(
+                    "SELECT count(*) FROM subject_enrollments e JOIN users u ON u.id = e.student_id AND u.status = 'active'
+                     WHERE e.subject_id = ?1 AND e.created_at >= ?2",
+                    params![subject_id, since],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)
+            })
+        })?;
+    }
+    Ok(())
+}
+
+/// A student has just followed `teacher_id` (a NEW follow): `new_follower {count, since}`, coalesced like enrolments
+/// (people who followed since the notice began and still do). No name.
+pub(crate) fn tell_new_follower(conn: &Connection, teacher_id: &str, now: i64) -> Res<()> {
+    let link = format!("/platform/teachers/{teacher_id}");
+    upsert_unread(conn, teacher_id, "new_follower", &link, now, |cur| {
+        fold_joined(&cur, now, serde_json::Map::new(), |since| {
+            conn.query_row(
+                "SELECT count(*) FROM teacher_follows f JOIN users u ON u.id = f.student_id AND u.status = 'active'
+                 WHERE f.teacher_id = ?1 AND f.created_at >= ?2",
+                params![teacher_id, since],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
+        })
+    })
+}
+
+/// A lesson was added to a published course that students can see (the caller checks that): every ACTIVE student enrolled in
+/// its subject gets ONE unread `new_lesson {course, subject, title, count}` per course, however many lessons are added while it
+/// stays unread — `title` is the latest lesson's, `count` the number of lessons added since the student last opened the
+/// notice. The notice links to the course. A student who read the previous one starts a new notice. All or nothing.
+pub(crate) fn tell_new_lesson(conn: &Connection, course_id: &str, lesson_title: &str, now: i64) -> Res<()> {
+    let row: Option<(String, String, String)> = conn
+        .query_row("SELECT c.title, c.subject_id, s.name_ar FROM courses c JOIN subjects s ON s.id = c.subject_id WHERE c.id = ?1", params![course_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()
+        .map_err(db_err)?;
+    let Some((course, subject_id, subject)) = row else { return Ok(()) };
+    let students: Vec<String> = conn
+        .prepare(
+            "SELECT e.student_id FROM subject_enrollments e JOIN users st ON st.id = e.student_id
+              WHERE e.subject_id = ?1 AND st.role = 'student' AND st.status = 'active' ORDER BY e.student_id",
+        )
+        .map_err(db_err)?
+        .query_map(params![subject_id], |r| r.get(0))
+        .map_err(db_err)?
+        .collect::<Result<_, _>>()
+        .map_err(db_err)?;
+    let link = format!("/platform/courses/{course_id}");
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    for student in &students {
+        upsert_unread(&tx, student, "new_lesson", &link, now, |cur| {
+            Ok(Fold::Write(json!({ "course": course, "subject": subject, "title": lesson_title, "count": next_count(&cur) })))
+        })?;
+    }
+    tx.commit().map_err(db_err)
+}
+
+/// The least time between two "answers wait for you" notices of one exam (when the first was read in between).
+pub(crate) const SUBMISSION_NOTICE_GAP_MS: i64 = 3_600_000;
+
+/// A student has submitted an attempt of `exam_id` that holds written answers nobody has graded. The exam's OWNER (an
+/// active teacher; an admin's exam has none - the admin has the sidebar badge) gets `submission_pending {title, count}`
+/// linking to the grading sheet. **Throttle: at most one notice per exam per hour.** While an unread one exists it is
+/// updated in place (`count` of folded submissions, moved to the top) and no second one is ever added; once it has been
+/// read, the next submission starts a new notice only when the newest one is at least an hour old, otherwise nothing is
+/// sent.
+pub(crate) fn tell_submission_pending(conn: &Connection, exam_id: &str, now: i64) -> Res<()> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT a.teacher_id, a.title FROM assessments a JOIN users u ON u.id = a.teacher_id AND u.role = 'teacher' AND u.status = 'active' WHERE a.id = ?1",
+            params![exam_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let Some((owner, title)) = row else { return Ok(()) };
+    let link = format!("/platform/grading/{exam_id}");
+    upsert_unread(conn, &owner, "submission_pending", &link, now, |cur| {
+        if cur.is_some() {
+            return Ok(Fold::Write(json!({ "title": title, "count": next_count(&cur) })));
+        }
+        let newest: Option<i64> = conn
+            .query_row("SELECT max(created_at) FROM notifications WHERE user_id = ?1 AND kind = 'submission_pending' AND link = ?2", params![owner, link], |r| r.get(0))
+            .map_err(db_err)?;
+        Ok(if newest.map_or(false, |t| now - t < SUBMISSION_NOTICE_GAP_MS) { Fold::Skip } else { Fold::Write(json!({ "title": title, "count": 1 })) })
+    })
+}
+
+/// A grader wrote (new or changed) feedback on an answer of this attempt: the student gets ONE unread
+/// `feedback_added {title}` per attempt, however many answers were commented - a later comment only moves it up.
+pub(crate) fn tell_feedback_added(conn: &Connection, student_id: &str, attempt_id: &str, title: &str, now: i64) -> Res<()> {
+    upsert_unread(conn, student_id, "feedback_added", &format!("/platform/attempts/{attempt_id}"), now, |_| Ok(Fold::Write(json!({ "title": title }))))
+}
+
+// ───────── listing ─────────
+
 #[derive(Serialize, Debug)]
 pub struct Notification {
     id: String,
@@ -85,39 +281,106 @@ pub struct Notification {
     created_at: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct NotificationList {
-    unread: i64,
-    items: Vec<Notification>,
+    /// Every unread notice of the user, whatever the filters of this request.
+    pub(crate) unread: i64,
+    pub(crate) items: Vec<Notification>,
+    /// Pass back as `cursor` for the next page; `None` on the last page.
+    pub(crate) next: Option<String>,
 }
 
-fn list_notifications(conn: &Connection, user_id: &str) -> Res<NotificationList> {
-    let unread: i64 = conn
+/// `GET /notifications` query. All optional: without any of it the first page of 20 comes back.
+#[derive(Deserialize, Default, Debug, Clone)]
+pub struct NotifQuery {
+    limit: Option<i64>,
+    /// Opaque `"<created_at>:<rowid>"` of the last row of the previous page.
+    cursor: Option<String>,
+    /// `exams` | `content` | `people` | `account`.
+    group: Option<String>,
+    /// `1` / `true`: only unread notices.
+    unread: Option<String>,
+}
+
+const NOTIF_DEFAULT_LIMIT: i64 = 20;
+const NOTIF_MAX_LIMIT: i64 = 50;
+
+/// The SQL condition for a notification group. The strings are literals of this file (never request text).
+fn group_condition(group: &str) -> Res<&'static str> {
+    Ok(match group {
+        "exams" => "kind IN ('new_assessment','assessment_graded','exam_closing','exam_opened','exam_results','score_changed','feedback_added','submission_pending','exam_admin_closed','exam_admin_archived','exam_admin_released')",
+        "content" => "kind IN ('new_post','new_course','new_lesson','live_scheduled','live_cancelled','live_updated','live_soon','new_review','content_unpublished','content_auto_hidden')",
+        "people" => "kind IN ('new_enrollment','new_follower')",
+        "account" => "(kind LIKE 'account\\_%' ESCAPE '\\' OR kind LIKE 'teaching\\_%' ESCAPE '\\')",
+        _ => return Err(bad("invalid_group")),
+    })
+}
+
+/// Strict `"<created_at>:<rowid>"`: two canonical non-negative integers. Anything else is a 400, never a guess.
+fn parse_cursor(raw: &str) -> Res<(i64, i64)> {
+    let invalid = || bad("invalid_cursor");
+    let (a, b) = raw.split_once(':').ok_or_else(invalid)?;
+    let (created, rowid) = (a.parse::<i64>().map_err(|_| invalid())?, b.parse::<i64>().map_err(|_| invalid())?);
+    if created < 0 || rowid < 0 || format!("{created}:{rowid}") != raw {
+        return Err(invalid());
+    }
+    Ok((created, rowid))
+}
+
+pub(crate) fn list_notifications(conn: &Connection, user_id: &str, q: &NotifQuery) -> Res<NotificationList> {
+    let limit = q.limit.unwrap_or(NOTIF_DEFAULT_LIMIT).clamp(1, NOTIF_MAX_LIMIT);
+    let unread_total: i64 = conn
         .query_row("SELECT count(*) FROM notifications WHERE user_id = ?1 AND read_at IS NULL", params![user_id], |r| r.get(0))
         .map_err(db_err)?;
-    let items = conn
-        .prepare("SELECT id, kind, data, link, read_at, created_at FROM notifications WHERE user_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 50")
+    let mut conds = vec!["user_id = ?1".to_string()];
+    let mut args: Vec<rusqlite::types::Value> = vec![user_id.to_string().into()];
+    if let Some(g) = q.group.as_deref().filter(|g| !g.is_empty()) {
+        conds.push(group_condition(g)?.to_string());
+    }
+    if matches!(q.unread.as_deref(), Some("1" | "true")) {
+        conds.push("read_at IS NULL".into());
+    }
+    if let Some(c) = q.cursor.as_deref().filter(|c| !c.is_empty()) {
+        let (created, rowid) = parse_cursor(c)?;
+        args.push(created.into());
+        args.push(rowid.into());
+        conds.push(format!("(created_at < ?{0} OR (created_at = ?{0} AND rowid < ?{1}))", args.len() - 1, args.len()));
+    }
+    let sql = format!(
+        "SELECT rowid, id, kind, data, link, read_at, created_at FROM notifications WHERE {} ORDER BY created_at DESC, rowid DESC LIMIT {}",
+        conds.join(" AND "),
+        limit + 1 // one more than asked: its presence says there is a next page
+    );
+    let mut rows = conn
+        .prepare(&sql)
         .map_err(db_err)?
-        .query_map(params![user_id], |r| {
-            let data: String = r.get(2)?;
-            Ok(Notification {
-                id: r.get(0)?,
-                kind: r.get(1)?,
-                data: serde_json::from_str(&data).unwrap_or(Value::Null),
-                link: r.get(3)?,
-                read: r.get::<_, Option<i64>>(4)?.is_some(),
-                created_at: r.get(5)?,
-            })
+        .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            let data: String = r.get(3)?;
+            let rowid: i64 = r.get(0)?;
+            Ok((
+                rowid,
+                Notification {
+                    id: r.get(1)?,
+                    kind: r.get(2)?,
+                    data: serde_json::from_str(&data).unwrap_or(Value::Null),
+                    link: r.get(4)?,
+                    read: r.get::<_, Option<i64>>(5)?.is_some(),
+                    created_at: r.get(6)?,
+                },
+            ))
         })
         .map_err(db_err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
-    Ok(NotificationList { unread, items })
+    let more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let next = if more { rows.last().map(|(rowid, n)| format!("{}:{}", n.created_at, rowid)) } else { None };
+    Ok(NotificationList { unread: unread_total, items: rows.into_iter().map(|(_, n)| n).collect(), next })
 }
 
-pub async fn notifications_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res<Json<NotificationList>> {
+pub async fn notifications_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Query(q): Query<NotifQuery>) -> Res<Json<NotificationList>> {
     let user = require_active(&state, &headers)?;
-    list_notifications(&*lock(&state)?, &user.id).map(Json)
+    list_notifications(&*lock(&state)?, &user.id, &q).map(Json)
 }
 
 #[derive(Deserialize)]
@@ -152,13 +415,16 @@ pub async fn mark_read_handler(State(state): State<Arc<AppState>>, headers: Head
 /// The lesson's course must be visible to the student (published, teacher active+approved) and the
 /// student enrolled in the course's subject.
 fn lesson_accessible(conn: &Connection, student_id: &str, lesson_id: &str) -> Res<bool> {
+    // `visible` = published, teacher active and approved for the subject, subject AND its institution active
     conn.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM lessons l JOIN courses c ON c.id = l.course_id
-           JOIN users u ON u.id = c.teacher_id JOIN subjects s ON s.id = c.subject_id
-           WHERE l.id = ?1 AND c.status = 'published' AND u.status = 'active' AND s.is_active = 1
-             AND EXISTS(SELECT 1 FROM teacher_subjects ts WHERE ts.teacher_id = c.teacher_id AND ts.subject_id = c.subject_id AND ts.status = 'approved')
-             AND EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?2 AND e.subject_id = c.subject_id))",
+        &format!(
+            "SELECT EXISTS(
+               SELECT 1 FROM lessons l JOIN courses c ON c.id = l.course_id
+               JOIN users u ON u.id = c.teacher_id JOIN subjects s ON s.id = c.subject_id
+               WHERE l.id = ?1 AND {}
+                 AND EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?2 AND e.subject_id = c.subject_id))",
+            crate::platform_content::visible("c", "published")
+        ),
         params![lesson_id, student_id],
         |r| r.get(0),
     )
@@ -212,31 +478,27 @@ pub async fn course_progress_handler(State(state): State<Arc<AppState>>, headers
 pub struct ProgressItem {
     course_id: String,
     title: String,
+    subject_id: String,
     subject_name: String,
     total: i64,
     completed: i64,
+    /// Completed lessons in percent of the course's lessons, two decimals.
+    percent: f64,
+    /// The first lesson (by position) the student has not completed; `null` for a finished course.
+    next_lesson_id: Option<String>,
 }
 
+/// The courses the student has started (at least one lesson done), newest activity first, at most 20 — finished ones
+/// included. Built from the same [`crate::platform_student_learning::learning_items`] as `GET /my/learning` and the overview,
+/// so the three always agree on what a student can open and how far they are.
 fn my_progress(conn: &Connection, student_id: &str) -> Res<Vec<ProgressItem>> {
-    conn.prepare(
-        "SELECT c.id, c.title, s.name_ar,
-                (SELECT count(*) FROM lessons l WHERE l.course_id = c.id),
-                (SELECT count(*) FROM lesson_progress p JOIN lessons l ON l.id = p.lesson_id WHERE l.course_id = c.id AND p.student_id = ?1),
-                (SELECT max(p.completed_at) FROM lesson_progress p JOIN lessons l ON l.id = p.lesson_id WHERE l.course_id = c.id AND p.student_id = ?1) AS last
-         FROM courses c JOIN subjects s ON s.id = c.subject_id JOIN users u ON u.id = c.teacher_id
-         WHERE c.status = 'published' AND u.status = 'active' AND s.is_active = 1
-           AND EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?1 AND e.subject_id = c.subject_id)
-           AND EXISTS(SELECT 1 FROM teacher_subjects ts WHERE ts.teacher_id = c.teacher_id AND ts.subject_id = c.subject_id AND ts.status = 'approved')
-           AND last IS NOT NULL
-         ORDER BY last DESC LIMIT 20",
-    )
-    .map_err(db_err)?
-    .query_map(params![student_id], |r| {
-        Ok(ProgressItem { course_id: r.get(0)?, title: r.get(1)?, subject_name: r.get(2)?, total: r.get(3)?, completed: r.get(4)? })
-    })
-    .map_err(db_err)?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(db_err)
+    let mut items: Vec<_> = crate::platform_student_learning::learning_items(conn, student_id, None, None)?.into_iter().filter(|i| i.completed > 0).collect();
+    items.sort_by(|a, b| b.last_at.cmp(&a.last_at).then_with(|| a.course_id.cmp(&b.course_id)));
+    Ok(items
+        .into_iter()
+        .take(20)
+        .map(|i| ProgressItem { course_id: i.course_id, title: i.title, subject_id: i.subject_id, subject_name: i.subject_name, total: i.total, completed: i.completed, percent: i.percent, next_lesson_id: i.next_lesson_id })
+        .collect())
 }
 
 pub async fn my_progress_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res<Json<Vec<ProgressItem>>> {
@@ -256,7 +518,7 @@ pub struct Review {
     created_at: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ReviewSummary {
     average: f64,
     count: i64,
@@ -273,18 +535,37 @@ fn first_name(full: &str) -> String {
 /// Only students enrolled in the subject (course) or in a subject the teacher is approved for may review.
 fn can_review(conn: &Connection, student_id: &str, target_type: &str, target_id: &str) -> Res<bool> {
     let sql = match target_type {
-        "course" => {
-            "SELECT EXISTS(SELECT 1 FROM courses c JOIN subject_enrollments e ON e.subject_id = c.subject_id AND e.student_id = ?1
-              WHERE c.id = ?2 AND c.status = 'published')"
-        }
-        "teacher" => {
-            "SELECT EXISTS(SELECT 1 FROM teacher_subjects ts JOIN subject_enrollments e ON e.subject_id = ts.subject_id AND e.student_id = ?1
+        // a course can be reviewed while students can see it (published, teacher in good standing, subject and
+        // institution active) and only by someone enrolled in its subject
+        "course" => format!(
+            "SELECT EXISTS(SELECT 1 FROM courses c JOIN users u ON u.id = c.teacher_id JOIN subjects s ON s.id = c.subject_id
+              JOIN subject_enrollments e ON e.subject_id = c.subject_id AND e.student_id = ?1
+              WHERE c.id = ?2 AND {})",
+            crate::platform_content::visible("c", "published")
+        ),
+        // a teacher can be reviewed through an enrolment the student can still see: the subject and its institution
+        // must be active (a hidden institution is hidden everywhere, reviews included)
+        "teacher" => format!(
+            "SELECT EXISTS(SELECT 1 FROM teacher_subjects ts JOIN subjects s ON s.id = ts.subject_id
+              JOIN subject_enrollments e ON e.subject_id = ts.subject_id AND e.student_id = ?1
               JOIN users u ON u.id = ts.teacher_id AND u.role = 'teacher' AND u.status = 'active'
-              WHERE ts.teacher_id = ?2 AND ts.status = 'approved')"
-        }
+              WHERE ts.teacher_id = ?2 AND ts.status = 'approved' AND {SUBJECT_ACTIVE} AND {INSTITUTION_ACTIVE})"
+        ),
         _ => return Err(bad("invalid_target")),
     };
-    conn.query_row(sql, params![student_id, target_id], |r| r.get(0)).map_err(db_err)
+    conn.query_row(&sql, params![student_id, target_id], |r| r.get(0)).map_err(db_err)
+}
+
+/// Takes away the "new review" notices that quote reviews which are about to be deleted (the notice carries the first
+/// 80 characters of the comment, which must not outlive the comment). `reviews_sql` selects those review ids and takes
+/// one parameter; callers pass a literal of their own, never request text. Run it BEFORE the reviews are deleted.
+pub(crate) fn purge_review_notices(conn: &Connection, reviews_sql: &str, param: &str) -> Res<()> {
+    conn.execute(
+        &format!("DELETE FROM notifications WHERE kind = 'new_review' AND json_extract(data, '$.review') IN ({reviews_sql})"),
+        params![param],
+    )
+    .map_err(db_err)?;
+    Ok(())
 }
 
 fn review_owner(conn: &Connection, target_type: &str, target_id: &str) -> Res<Option<(String, String)>> {
@@ -336,7 +617,23 @@ fn upsert_review(conn: &Connection, student: &User, r: &ReviewReq) -> Res<()> {
     )
     .map_err(db_err)?;
     if !existed {
-        notify(conn, &teacher_id, "new_review", json!({ "rating": r.rating, "target": r.target_type }), &link);
+        // what the teacher needs to see without opening anything: which course (empty for a review of the teacher) and
+        // how it starts (plain text, 80 characters at most - rendered as text by the client, never as markup).
+        // `review` ties the notice to its review, so that deleting the review takes the quoted comment away too.
+        let review_id: String = conn
+            .query_row(
+                "SELECT id FROM reviews WHERE student_id = ?1 AND target_type = ?2 AND target_id = ?3",
+                params![student.id, r.target_type, r.target_id],
+                |x| x.get(0),
+            )
+            .map_err(db_err)?;
+        let title: String = if r.target_type == "course" {
+            conn.query_row("SELECT title FROM courses WHERE id = ?1", params![r.target_id], |x| x.get(0)).optional().map_err(db_err)?.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let comment: String = comment.as_deref().unwrap_or("").chars().take(80).collect();
+        notify(conn, &teacher_id, "new_review", json!({ "rating": r.rating, "target": r.target_type, "title": title, "comment": comment, "review": review_id }), &link);
     }
     Ok(())
 }
@@ -344,6 +641,16 @@ fn upsert_review(conn: &Connection, student: &User, r: &ReviewReq) -> Res<()> {
 fn review_summary(conn: &Connection, viewer: &User, target_type: &str, target_id: &str) -> Res<ReviewSummary> {
     if target_type != "course" && target_type != "teacher" {
         return Err(bad("invalid_target"));
+    }
+    if target_type == "course" && viewer.role != "admin" {
+        // the ratings, comments and reviewer names of a course are shown only while students can see the course
+        // (published, teacher in good standing, subject and institution active) - or to its owner
+        let owner: Option<String> =
+            conn.query_row("SELECT teacher_id FROM courses WHERE id = ?1", params![target_id], |r| r.get(0)).optional().map_err(db_err)?;
+        let shown = owner.as_deref() == Some(viewer.id.as_str()) || crate::platform_content::visible_to_public(conn, "courses", "c", target_id, "published")?;
+        if !shown {
+            return Err(err(StatusCode::NOT_FOUND, "not_found"));
+        }
     }
     let (average, count): (Option<f64>, i64) = conn
         .query_row(
@@ -371,7 +678,16 @@ fn review_summary(conn: &Connection, viewer: &User, target_type: &str, target_id
         .map_err(db_err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
-    let mine = items.iter().find(|r| r.mine).cloned();
+    // The viewer's own review is looked up directly: it is shown whatever its position among the newest 30.
+    let mine = conn
+        .query_row(
+            "SELECT r.id, r.rating, r.comment, u.full_name, r.created_at FROM reviews r JOIN users u ON u.id = r.student_id
+             WHERE r.student_id = ?1 AND r.target_type = ?2 AND r.target_id = ?3",
+            params![viewer.id, target_type, target_id],
+            |r| Ok(Review { id: r.get(0)?, rating: r.get(1)?, comment: r.get(2)?, student_name: first_name(&r.get::<_, String>(3)?), mine: true, created_at: r.get(4)? }),
+        )
+        .optional()
+        .map_err(db_err)?;
     let eligible = viewer.role == "student" && can_review(conn, &viewer.id, target_type, target_id)?;
     Ok(ReviewSummary { average: (average.unwrap_or(0.0) * 10.0).round() / 10.0, count, can_review: eligible, mine, items })
 }
@@ -385,6 +701,7 @@ fn delete_review(conn: &Connection, user: &User, id: &str) -> Res<()> {
     if owner != user.id && user.role != "admin" {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
+    purge_review_notices(conn, "SELECT id FROM reviews WHERE id = ?1", id)?;
     conn.execute("DELETE FROM reviews WHERE id = ?1", params![id]).map_err(db_err)?;
     if owner != user.id {
         crate::platform::audit(conn, &user.id, id, "review_deleted", "");
@@ -430,9 +747,9 @@ mod tests {
         let student = insert_test_user(&conn, "s@x.com", "student", "active");
         let outsider = insert_test_user(&conn, "o@x.com", "student", "active");
         let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
-        conn.execute("INSERT INTO teacher_subjects VALUES (?1,'s1','approved',0,0)", params![teacher.id]).unwrap();
+        conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,'s1','approved',0,0)", params![teacher.id]).unwrap();
         conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![student.id]).unwrap();
-        conn.execute("INSERT INTO courses VALUES ('c1', ?1, 's1', 'دورة', NULL, 'published', 0, 0)", params![teacher.id]).unwrap();
+        conn.execute("INSERT INTO courses VALUES ('c1', ?1, 's1', 'دورة', NULL, 'published', 0, 0, NULL)", params![teacher.id]).unwrap();
         for (i, n) in ["l1", "l2", "l3"].iter().enumerate() {
             conn.execute("INSERT INTO lessons VALUES (?1,'c1',?2,NULL,'د',NULL,'https://x.com/a.mp4','https://x.com/a.mp4','file',0)", params![n, i as i64 + 1]).unwrap();
         }
@@ -500,14 +817,470 @@ mod tests {
         // student is enrolled AND (also) follows -> must still get exactly one
         w.conn.execute("INSERT INTO teacher_follows VALUES (?1, ?2, 0)", params![w.student.id, w.teacher.id]).unwrap();
         notify_audience(&w.conn, &w.teacher.id, "s1", "new_post", json!({"title": "t"}), "/platform/posts/x");
-        let count = |u: &User| list_notifications(&w.conn, &u.id).unwrap().items.len();
+        let count = |u: &User| list_notifications(&w.conn, &u.id, &NotifQuery::default()).unwrap().items.len();
         assert_eq!((count(&w.student), count(&follower), count(&suspended), count(&w.outsider), count(&w.teacher)), (1, 1, 0, 0, 0));
-        let list = list_notifications(&w.conn, &w.student.id).unwrap();
+        let list = list_notifications(&w.conn, &w.student.id, &NotifQuery::default()).unwrap();
         assert_eq!(list.unread, 1);
         mark_read(&w.conn, &w.outsider.id, &None).unwrap(); // cannot touch others'
-        assert_eq!(list_notifications(&w.conn, &w.student.id).unwrap().unread, 1);
+        assert_eq!(list_notifications(&w.conn, &w.student.id, &NotifQuery::default()).unwrap().unread, 1);
         mark_read(&w.conn, &w.student.id, &Some(vec![list.items[0].id.clone()])).unwrap();
-        assert_eq!(list_notifications(&w.conn, &w.student.id).unwrap().unread, 0);
-        assert_eq!(list_notifications(&w.conn, &w.student.id).unwrap().items[0].data["title"], "t");
+        assert_eq!(list_notifications(&w.conn, &w.student.id, &NotifQuery::default()).unwrap().unread, 0);
+        assert_eq!(list_notifications(&w.conn, &w.student.id, &NotifQuery::default()).unwrap().items[0].data["title"], "t");
+    }
+
+    // ───── phase 3-2: a hidden institution takes the course out of reach ─────
+
+    #[test]
+    fn a_hidden_institution_closes_the_lessons_the_progress_list_and_course_reviews() {
+        let w = world();
+        let review = ReviewReq { target_type: "course".into(), target_id: "c1".into(), rating: 4, comment: None };
+        set_complete(&w.conn, &w.student, "l1", true).unwrap();
+        assert!(lesson_accessible(&w.conn, &w.student.id, "l2").unwrap());
+        assert_eq!(my_progress(&w.conn, &w.student.id).unwrap().len(), 1);
+        assert!(review_summary(&w.conn, &w.student, "course", "c1").unwrap().can_review);
+
+        w.conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        assert!(!lesson_accessible(&w.conn, &w.student.id, "l2").unwrap());
+        assert_eq!(set_complete(&w.conn, &w.student, "l2", true).unwrap_err().0, StatusCode::NOT_FOUND, "no new progress in a hidden institution");
+        assert_eq!(set_complete(&w.conn, &w.student, "l1", false).unwrap_err().0, StatusCode::NOT_FOUND, "nor can it be un-ticked");
+        assert!(my_progress(&w.conn, &w.student.id).unwrap().is_empty(), "the course leaves the student's progress list");
+        assert_eq!(upsert_review(&w.conn, &w.student, &review).unwrap_err().0, StatusCode::FORBIDDEN);
+        // the ratings, comments and reviewer names of the hidden course are no longer readable by a student either
+        assert_eq!(review_summary(&w.conn, &w.student, "course", "c1").unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(review_summary(&w.conn, &w.outsider, "course", "c1").unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(review_summary(&w.conn, &w.teacher, "course", "c1").unwrap().count, 0, "the owner still sees their own course");
+        assert_eq!(review_summary(&w.conn, &w.admin, "course", "c1").unwrap().count, 0, "and so does an admin (moderation)");
+        let kept: i64 = w.conn.query_row("SELECT count(*) FROM lesson_progress", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, 1, "what the student already did is kept");
+
+        w.conn.execute("UPDATE institutions SET is_active = 1 WHERE id = 'i1'", []).unwrap();
+        assert_eq!(my_progress(&w.conn, &w.student.id).unwrap()[0].completed, 1, "and is there again when the institution is");
+        set_complete(&w.conn, &w.student, "l2", true).unwrap();
+        // the same door closes for the other reasons `visible()` knows about
+        w.conn.execute("UPDATE users SET role = 'student' WHERE id = ?1", params![w.teacher.id]).unwrap();
+        assert!(!lesson_accessible(&w.conn, &w.student.id, "l3").unwrap(), "a teacher whose role changed no longer serves courses");
+    }
+
+    #[test]
+    fn a_hidden_course_or_institution_closes_reviews_for_students() {
+        let w = world();
+        let rev = |t: &str, id: &str| ReviewReq { target_type: t.into(), target_id: id.into(), rating: 5, comment: Some("جيد".into()) };
+        upsert_review(&w.conn, &w.student, &rev("course", "c1")).unwrap();
+        assert_eq!(review_summary(&w.conn, &w.outsider, "course", "c1").unwrap().items.len(), 1, "a visible course shows its reviews");
+        // a draft course: reviews are the owner's and the admin's business only
+        w.conn.execute("UPDATE courses SET status = 'draft' WHERE id = 'c1'", []).unwrap();
+        assert_eq!(review_summary(&w.conn, &w.student, "course", "c1").unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(review_summary(&w.conn, &w.teacher, "course", "c1").unwrap().items.len(), 1);
+        w.conn.execute("UPDATE courses SET status = 'published' WHERE id = 'c1'", []).unwrap();
+        // an id that does not exist is a 404, never an empty (information-free but different) summary
+        assert_eq!(review_summary(&w.conn, &w.student, "course", "nope").unwrap_err().0, StatusCode::NOT_FOUND);
+
+        // a teacher can be reviewed only through an enrolment in a subject whose institution (and the subject) is active
+        assert!(can_review(&w.conn, &w.student.id, "teacher", &w.teacher.id).unwrap());
+        w.conn.execute("UPDATE institutions SET is_active = 0 WHERE id = 'i1'", []).unwrap();
+        assert!(!can_review(&w.conn, &w.student.id, "teacher", &w.teacher.id).unwrap(), "hidden institution");
+        assert_eq!(upsert_review(&w.conn, &w.student, &rev("teacher", &w.teacher.id)).unwrap_err().0, StatusCode::FORBIDDEN);
+        let before: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE kind = 'new_review'", [], |r| r.get(0)).unwrap();
+        w.conn.execute("UPDATE institutions SET is_active = 1 WHERE id = 'i1'", []).unwrap();
+        w.conn.execute("UPDATE subjects SET is_active = 0 WHERE id = 's1'", []).unwrap();
+        assert!(!can_review(&w.conn, &w.student.id, "teacher", &w.teacher.id).unwrap(), "hidden subject");
+        // an enrolment in a second, still visible subject keeps the door open
+        w.conn.execute("INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES ('s2','i1','أخرى',1,0)", []).unwrap();
+        w.conn.execute("INSERT INTO teacher_subjects(teacher_id, subject_id, status, created_at, decided_at) VALUES (?1,'s2','approved',0,0)", params![w.teacher.id]).unwrap();
+        w.conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s2',0)", params![w.student.id]).unwrap();
+        assert!(can_review(&w.conn, &w.student.id, "teacher", &w.teacher.id).unwrap(), "an enrolment that is still visible keeps the door open");
+        let after: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE kind = 'new_review'", [], |r| r.get(0)).unwrap();
+        assert_eq!(before, after);
+    }
+
+    // ───── phase 3-4: paging, groups, coalescing, the review preview ─────
+
+    fn put(conn: &Connection, user: &User, kind: &str, created_at: i64, read: bool) -> String {
+        let id = new_id();
+        conn.execute(
+            "INSERT INTO notifications(id, user_id, kind, data, link, read_at, created_at) VALUES (?1,?2,?3,'{}',NULL,?4,?5)",
+            params![id, user.id, kind, read.then_some(1_i64), created_at],
+        )
+        .unwrap();
+        id
+    }
+
+    fn page(w: &W, user: &User, f: impl FnOnce(&mut NotifQuery)) -> NotificationList {
+        let mut q = NotifQuery::default();
+        f(&mut q);
+        list_notifications(&w.conn, &user.id, &q).unwrap()
+    }
+
+    fn ids(l: &NotificationList) -> Vec<String> {
+        l.items.iter().map(|n| n.id.clone()).collect()
+    }
+
+    #[test]
+    fn pages_follow_the_cursor_in_a_stable_order_even_when_every_timestamp_is_equal() {
+        let w = world();
+        // 45 notices in the same millisecond: only the row number can order them
+        let all: Vec<String> = (0..45).map(|_| put(&w.conn, &w.student, "new_post", 1_000, false)).collect();
+        let newest_first: Vec<String> = all.iter().rev().cloned().collect();
+        let mut seen: Vec<String> = vec![];
+        let mut cursor: Option<String> = None;
+        let mut sizes = vec![];
+        loop {
+            let l = page(&w, &w.student, |q| q.cursor = cursor.clone());
+            sizes.push(l.items.len());
+            seen.extend(ids(&l));
+            assert_eq!(l.unread, 45, "the unread total does not depend on the page");
+            match l.next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(sizes, [20, 20, 5], "pages of 20 by default");
+        assert_eq!(seen, newest_first, "every notice exactly once, newest first, ties by insertion order");
+        // an exact multiple has no phantom last page: `next` is null on the last full page
+        let w2 = world();
+        for _ in 0..40 {
+            put(&w2.conn, &w2.student, "new_post", 1_000, false);
+        }
+        let first = page(&w2, &w2.student, |_| {});
+        let second = page(&w2, &w2.student, |q| q.cursor = first.next.clone());
+        assert_eq!((first.items.len(), second.items.len(), first.next.is_some(), second.next), (20, 20, true, None));
+        // a different created_at orders before the row number; a newer one comes first
+        let newer = put(&w.conn, &w.student, "new_course", 2_000, false);
+        let top = page(&w, &w.student, |_| {});
+        assert_eq!(top.items[0].id, newer);
+        // limits: default 20, at most 50, at least 1
+        assert_eq!(page(&w, &w.student, |q| q.limit = Some(500)).items.len(), 46.min(50));
+        assert_eq!(page(&w, &w.student, |q| q.limit = Some(0)).items.len(), 1);
+        assert_eq!(page(&w, &w.student, |q| q.limit = Some(-7)).items.len(), 1);
+        let l = page(&w, &w.student, |q| q.limit = Some(7));
+        assert_eq!((l.items.len(), l.next.is_some()), (7, true));
+        // the cursor encodes where the page ended: "<created_at>:<rowid>"
+        let (c, r) = l.next.as_deref().unwrap().split_once(':').unwrap();
+        assert_eq!(c.parse::<i64>().unwrap(), 1_000);
+        assert!(r.parse::<i64>().unwrap() > 0);
+    }
+
+    #[test]
+    fn a_garbage_cursor_is_a_400_never_a_guess() {
+        let w = world();
+        put(&w.conn, &w.student, "new_post", 1_000, false);
+        for bad_cursor in ["x", "1", "1:", ":1", "a:b", "1:2:3", "-1:5", "5:-1", "01:2", "+1:2", " 1:2", "1: 2", "1:2 ", "1.5:2", "0x10:2", "99999999999999999999:1", "1;DROP TABLE users:1"] {
+            let e = list_notifications(&w.conn, &w.student.id, &NotifQuery { cursor: Some(bad_cursor.into()), ..Default::default() }).unwrap_err();
+            assert_eq!((e.0, e.1.contains("invalid_cursor")), (StatusCode::BAD_REQUEST, true), "{bad_cursor:?}");
+        }
+        // an absent or empty cursor is simply the first page; a well-formed one that points past everything is an empty page
+        assert_eq!(page(&w, &w.student, |q| q.cursor = Some(String::new())).items.len(), 1);
+        let end = page(&w, &w.student, |q| q.cursor = Some("0:0".into()));
+        assert_eq!((end.items.len(), end.next), (0, None));
+    }
+
+    #[test]
+    fn groups_map_kinds_on_the_server_and_an_unknown_group_is_a_400() {
+        let w = world();
+        let groups: [(&str, &[&str]); 4] = [
+            ("exams", &["new_assessment", "assessment_graded", "exam_closing", "exam_results", "score_changed", "feedback_added", "submission_pending", "exam_admin_closed", "exam_admin_archived", "exam_admin_released"]),
+            ("content", &["new_post", "new_course", "live_scheduled", "live_cancelled", "live_updated", "new_review", "content_unpublished", "content_auto_hidden"]),
+            ("people", &["new_enrollment", "new_follower"]),
+            ("account", &["account_active", "account_rejected", "account_suspended", "teaching_approved", "teaching_rejected", "teaching_revoked"]),
+        ];
+        for (_, kinds) in &groups {
+            for k in *kinds {
+                put(&w.conn, &w.student, k, 1_000, false);
+            }
+        }
+        // kinds that belong to no group, and look-alikes of the account prefixes, show up only in the unfiltered list
+        for k in ["something_new", "accountant", "teachingx", "newsletter"] {
+            put(&w.conn, &w.student, k, 1_000, false);
+        }
+        let kinds_of = |l: &NotificationList| -> std::collections::BTreeSet<String> { l.items.iter().map(|n| n.kind.clone()).collect() };
+        for (g, kinds) in &groups {
+            let l = page(&w, &w.student, |q| { q.group = Some((*g).into()); q.limit = Some(50); });
+            assert_eq!(kinds_of(&l), kinds.iter().map(|s| s.to_string()).collect(), "group {g}");
+            assert_eq!(l.unread, (groups.iter().map(|(_, k)| k.len()).sum::<usize>() + 4) as i64, "the unread total ignores the group");
+        }
+        assert_eq!(page(&w, &w.student, |q| q.limit = Some(50)).items.len(), 26 + 4);
+        assert_eq!(page(&w, &w.student, |q| q.group = Some(String::new())).items.len(), 20, "an empty group is no group");
+        for bad_group in ["Exams", "everything", "exams,content", "exams'--", "*"] {
+            let e = list_notifications(&w.conn, &w.student.id, &NotifQuery { group: Some(bad_group.into()), ..Default::default() }).unwrap_err();
+            assert_eq!((e.0, e.1.contains("invalid_group")), (StatusCode::BAD_REQUEST, true), "{bad_group:?}");
+        }
+        // a group pages like the whole list
+        let p1 = page(&w, &w.student, |q| { q.group = Some("exams".into()); q.limit = Some(4); });
+        let p2 = page(&w, &w.student, |q| { q.group = Some("exams".into()); q.limit = Some(4); q.cursor = p1.next.clone(); });
+        assert!(p1.items.iter().chain(&p2.items).all(|n| groups[0].1.contains(&n.kind.as_str())) && p2.next.is_some());
+    }
+
+    #[test]
+    fn the_unread_filter_keeps_unread_ones_while_the_unread_total_stays_the_whole_truth() {
+        let w = world();
+        let read: Vec<String> = (0..3).map(|i| put(&w.conn, &w.student, "new_post", 100 + i, true)).collect();
+        let unread: Vec<String> = (0..4).map(|i| put(&w.conn, &w.student, "new_course", 200 + i, false)).collect();
+        put(&w.conn, &w.student, "new_enrollment", 300, false);
+        let only = page(&w, &w.student, |q| q.unread = Some("1".into()));
+        assert_eq!((only.items.len(), only.unread), (5, 5));
+        assert!(only.items.iter().all(|n| !n.read));
+        assert!(unread.iter().all(|u| ids(&only).contains(u)) && read.iter().all(|r| !ids(&only).contains(r)));
+        let people_unread = page(&w, &w.student, |q| { q.unread = Some("true".into()); q.group = Some("people".into()); });
+        assert_eq!((people_unread.items.len(), people_unread.unread), (1, 5), "the total is not the filtered count");
+        let all = page(&w, &w.student, |q| q.unread = Some("0".into()));
+        assert_eq!((all.items.len(), all.unread), (8, 5), "anything but 1/true leaves the read ones in");
+        // paging through the unread ones only
+        let p1 = page(&w, &w.student, |q| { q.unread = Some("1".into()); q.limit = Some(2); });
+        let p2 = page(&w, &w.student, |q| { q.unread = Some("1".into()); q.limit = Some(2); q.cursor = p1.next.clone(); });
+        let p3 = page(&w, &w.student, |q| { q.unread = Some("1".into()); q.limit = Some(2); q.cursor = p2.next.clone(); });
+        assert_eq!((p1.items.len(), p2.items.len(), p3.items.len(), p3.next), (2, 2, 1, None));
+        // and the notices of one user never show up for another
+        put(&w.conn, &w.outsider, "new_post", 999, false);
+        assert!(!page(&w, &w.student, |q| q.limit = Some(50)).items.iter().any(|n| n.created_at == 999));
+        assert_eq!(page(&w, &w.outsider, |_| {}).unread, 1);
+    }
+
+    #[test]
+    fn a_client_that_sends_no_query_still_gets_the_newest_twenty_with_the_old_fields() {
+        let w = world();
+        for i in 0..30 {
+            put(&w.conn, &w.student, "new_post", i, i % 2 == 0);
+        }
+        let l = list_notifications(&w.conn, &w.student.id, &NotifQuery::default()).unwrap();
+        assert_eq!((l.items.len(), l.unread, l.items[0].created_at, l.items[19].created_at), (20, 15, 29, 10));
+        let json = serde_json::to_value(&l).unwrap();
+        assert!(json["items"].is_array() && json["unread"].is_number() && json["next"].is_string(), "{json}");
+        for key in ["id", "kind", "data", "link", "read", "created_at"] {
+            assert!(json["items"][0].get(key).is_some(), "{key}");
+        }
+        // mark-all-read is untouched by the paging
+        mark_read(&w.conn, &w.student.id, &None).unwrap();
+        assert_eq!(list_notifications(&w.conn, &w.student.id, &NotifQuery::default()).unwrap().unread, 0);
+    }
+
+    #[test]
+    fn upsert_unread_updates_the_unread_notice_in_place_and_leaves_read_ones_alone() {
+        let w = world();
+        let get = |kind: &str| -> Vec<(String, Value, bool, i64)> {
+            w.conn
+                .prepare("SELECT id, data, read_at, created_at FROM notifications WHERE user_id = ?1 AND kind = ?2 ORDER BY rowid")
+                .unwrap()
+                .query_map(params![w.student.id, kind], |r| Ok((r.get(0)?, serde_json::from_str(&r.get::<_, String>(1)?).unwrap(), r.get::<_, Option<i64>>(2)?.is_some(), r.get(3)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let write = |kind: &str, link: &str, now: i64, v: i64| upsert_unread(&w.conn, &w.student.id, kind, link, now, |cur| Ok(Fold::Write(json!({ "v": v, "before": cur.map(|c| c["v"].clone()) })))).unwrap();
+        write("k", "/a", 10, 1);
+        let first = get("k");
+        assert_eq!((first.len(), first[0].1["v"].as_i64(), first[0].1["before"].is_null(), first[0].3), (1, Some(1), true, 10));
+        write("k", "/a", 20, 2);
+        let second = get("k");
+        assert_eq!((second.len(), second[0].0.clone(), second[0].1["before"].as_i64(), second[0].3), (1, first[0].0.clone(), Some(1), 20), "same row, folded, moved to the new time");
+        // another link or kind is another notice
+        write("k", "/b", 30, 3);
+        write("other", "/a", 30, 4);
+        assert_eq!((get("k").len(), get("other").len()), (2, 1));
+        // a read notice is history: the next write starts a new one, the read one is untouched
+        w.conn.execute("UPDATE notifications SET read_at = 99 WHERE id = ?1", params![first[0].0]).unwrap();
+        write("k", "/a", 40, 5);
+        let rows: Vec<_> = get("k").into_iter().filter(|r| r.1["v"].as_i64() != Some(3)).collect();
+        assert_eq!((rows.len(), rows[0].2, rows[0].1["v"].as_i64(), rows[1].2, rows[1].1["v"].as_i64()), (2, true, Some(2), false, Some(5)));
+        // Skip leaves everything; Remove takes the unread one away (and is a no-op without one)
+        let before = get("k").len();
+        upsert_unread(&w.conn, &w.student.id, "k", "/a", 50, |_| Ok(Fold::Skip)).unwrap();
+        assert_eq!(get("k").len(), before);
+        upsert_unread(&w.conn, &w.student.id, "k", "/a", 50, |_| Ok(Fold::Remove)).unwrap();
+        assert_eq!(get("k").len(), before - 1);
+        upsert_unread(&w.conn, &w.student.id, "k", "/a", 50, |cur| { assert!(cur.is_none(), "the read one is not offered"); Ok(Fold::Remove) }).unwrap();
+        assert_eq!(get("k").len(), before - 1);
+        // a failing fold writes nothing
+        let e = upsert_unread(&w.conn, &w.student.id, "k", "/zzz", 60, |_| Err(bad("boom"))).unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        assert_eq!(get("k").len(), before - 1);
+    }
+
+    #[test]
+    fn deleting_a_review_takes_the_comment_the_teacher_was_shown_away_too() {
+        let w = world();
+        let second = insert_test_user(&w.conn, "s2@x.com", "student", "active");
+        w.conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![second.id]).unwrap();
+        let req = |c: &str| ReviewReq { target_type: "course".into(), target_id: "c1".into(), rating: 2, comment: Some(c.into()) };
+        upsert_review(&w.conn, &w.student, &req("سيئة جدا ورقمي 0501234567")).unwrap();
+        upsert_review(&w.conn, &second, &req("جيدة")).unwrap();
+        upsert_review(&w.conn, &w.student, &ReviewReq { target_type: "teacher".into(), target_id: w.teacher.id.clone(), rating: 4, comment: Some("معلم رائع".into()) }).unwrap();
+        let quoted = |w: &W| -> Vec<String> {
+            w.conn.prepare("SELECT data FROM notifications WHERE kind = 'new_review' ORDER BY rowid").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(quoted(&w).len(), 3);
+        assert!(quoted(&w)[0].contains("\"review\":\""), "the notice names its review: {}", quoted(&w)[0]);
+        // the author withdraws the first review (the teacher has already read the notice: it goes anyway)
+        w.conn.execute("UPDATE notifications SET read_at = 3 WHERE kind = 'new_review'", []).unwrap();
+        let mine: String = w.conn.query_row("SELECT id FROM reviews WHERE student_id = ?1 AND target_type = 'course'", params![w.student.id], |r| r.get(0)).unwrap();
+        delete_review(&w.conn, &w.student, &mine).unwrap();
+        let rest = quoted(&w);
+        assert_eq!(rest.len(), 2);
+        assert!(rest.iter().all(|d| !d.contains("0501234567") && !d.contains("سيئة")), "{rest:?}");
+        // an admin's moderation does the same, and only for that review
+        let theirs: String = w.conn.query_row("SELECT id FROM reviews WHERE student_id = ?1", params![second.id], |r| r.get(0)).unwrap();
+        delete_review(&w.conn, &w.admin, &theirs).unwrap();
+        let rest = quoted(&w);
+        assert_eq!(rest.len(), 1);
+        assert!(rest[0].contains("معلم رائع"), "the teacher review's notice stays while the review does: {rest:?}");
+    }
+
+    #[test]
+    fn a_new_review_tells_the_teacher_which_course_and_how_the_comment_starts() {
+        let w = world();
+        let long: String = "ممتازة جدا".repeat(20);
+        assert!(long.chars().count() > 80);
+        upsert_review(&w.conn, &w.student, &ReviewReq { target_type: "course".into(), target_id: "c1".into(), rating: 5, comment: Some(format!("  {long}  ")) }).unwrap();
+        upsert_review(&w.conn, &w.student, &ReviewReq { target_type: "teacher".into(), target_id: w.teacher.id.clone(), rating: 4, comment: None }).unwrap();
+        let rows: Vec<(Value, String)> = w.conn
+            .prepare("SELECT data, link FROM notifications WHERE user_id = ?1 AND kind = 'new_review' ORDER BY rowid")
+            .unwrap()
+            .query_map(params![w.teacher.id], |r| Ok((serde_json::from_str(&r.get::<_, String>(0)?).unwrap(), r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let (course, teacher) = (&rows[0].0, &rows[1].0);
+        assert_eq!((course["rating"].as_i64(), course["target"].as_str(), course["title"].as_str()), (Some(5), Some("course"), Some("دورة")));
+        assert_eq!(course["comment"].as_str().map(|c| c.chars().count()), Some(80), "the first 80 characters, counted as characters");
+        assert_eq!(course["comment"].as_str().unwrap(), long.chars().take(80).collect::<String>(), "trimmed, then cut");
+        assert_eq!((teacher["rating"].as_i64(), teacher["target"].as_str(), teacher["title"].as_str(), teacher["comment"].as_str()), (Some(4), Some("teacher"), Some(""), Some("")));
+        assert_eq!((rows[0].1.as_str(), rows[1].1.as_str()), ("/platform/courses/c1", format!("/platform/teachers/{}", w.teacher.id).as_str()), "the target link is unchanged");
+        // a short comment is kept whole; an update of the same review sends nothing new
+        let w2 = world();
+        upsert_review(&w2.conn, &w2.student, &ReviewReq { target_type: "course".into(), target_id: "c1".into(), rating: 3, comment: Some("جيدة".into()) }).unwrap();
+        upsert_review(&w2.conn, &w2.student, &ReviewReq { target_type: "course".into(), target_id: "c1".into(), rating: 1, comment: Some("سيئة".into()) }).unwrap();
+        let d: String = w2.conn.query_row("SELECT data FROM notifications WHERE kind = 'new_review'", [], |r| r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&d).unwrap()["comment"].as_str(), Some("جيدة"));
+        assert_eq!(w2.conn.query_row::<i64, _, _>("SELECT count(*) FROM notifications WHERE kind = 'new_review'", [], |r| r.get(0)).unwrap(), 1);
+    }
+}
+
+/// Phase 4-2: the student's own review is looked up directly, the progress list shares the learning rows, and the new
+/// notification kinds belong to a group.
+#[cfg(test)]
+mod phase_4_2_tests {
+    use super::*;
+    use crate::platform::{create_test_db, insert_test_user};
+
+    struct W {
+        conn: Connection,
+        me: User,
+        admin: User,
+        teacher: User,
+    }
+
+    fn world() -> W {
+        let conn = create_test_db();
+        conn.execute_batch(
+            "INSERT INTO institutions(id,type,name_ar,is_active,created_at) VALUES ('i1','university','ج',1,0);
+             INSERT INTO subjects(id,institution_id,name_ar,is_active,created_at) VALUES ('s1','i1','برمجة',1,0);",
+        )
+        .unwrap();
+        let teacher = insert_test_user(&conn, "t@x.com", "teacher", "active");
+        let me = insert_test_user(&conn, "me@x.com", "student", "active");
+        let admin = insert_test_user(&conn, "a@x.com", "admin", "active");
+        conn.execute("INSERT INTO teacher_subjects(teacher_id,subject_id,status,created_at,decided_at) VALUES (?1,'s1','approved',0,0)", params![teacher.id]).unwrap();
+        conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![me.id]).unwrap();
+        conn.execute("INSERT INTO courses(id,teacher_id,subject_id,title,status,created_at,updated_at) VALUES ('c1',?1,'s1','دورة','published',0,0)", params![teacher.id]).unwrap();
+        W { conn, me, admin, teacher }
+    }
+
+    fn student_review(w: &W, n: usize, rating: i64, at: i64) -> User {
+        let u = insert_test_user(&w.conn, &format!("r{n}@x.com"), "student", "active");
+        w.conn.execute("INSERT INTO subject_enrollments VALUES (?1,'s1',0)", params![u.id]).unwrap();
+        w.conn
+            .execute("INSERT INTO reviews(id,student_id,target_type,target_id,rating,comment,created_at,updated_at) VALUES (?1,?2,'course','c1',?3,'تعليق',?4,?4)", params![format!("rv{n}"), u.id, rating, at])
+            .unwrap();
+        u
+    }
+
+    #[test]
+    fn the_viewers_own_review_is_found_even_when_it_is_not_among_the_newest_thirty() {
+        let w = world();
+        // mine is the OLDEST of 36; the list shows the newest 30
+        w.conn
+            .execute("INSERT INTO reviews(id,student_id,target_type,target_id,rating,comment,created_at,updated_at) VALUES ('mine',?1,'course','c1',2,'رأيي',1,1)", params![w.me.id])
+            .unwrap();
+        for n in 0..35 {
+            student_review(&w, n, 5, 100 + n as i64);
+        }
+        let s = review_summary(&w.conn, &w.me, "course", "c1").unwrap();
+        assert_eq!(s.items.len(), 30, "the list is the newest 30");
+        assert!(!s.items.iter().any(|r| r.id == "mine"), "mine is not in it");
+        let mine = s.mine.expect("the student's own review");
+        assert_eq!((mine.id.as_str(), mine.rating, mine.comment.as_deref(), mine.mine), ("mine", 2, Some("رأيي"), true));
+        assert_eq!((s.count, s.average), (36, (((35.0 * 5.0 + 2.0) / 36.0) * 10.0f64).round() / 10.0));
+        assert!(s.can_review);
+        // nobody else gets it
+        let other = student_review(&w, 99, 4, 500);
+        let theirs = review_summary(&w.conn, &other, "course", "c1").unwrap().mine.unwrap();
+        assert_eq!((theirs.id.as_str(), theirs.rating), ("rv99", 4));
+        // staff and a student without a review have none
+        for who in [&w.admin, &w.teacher] {
+            assert!(review_summary(&w.conn, who, "course", "c1").unwrap().mine.is_none());
+        }
+        let nobody = insert_test_user(&w.conn, "none@x.com", "student", "active");
+        assert!(review_summary(&w.conn, &nobody, "course", "c1").unwrap().mine.is_none());
+        // and it is still the same row when it is among the newest
+        w.conn.execute("UPDATE reviews SET created_at = 9999, updated_at = 9999 WHERE id = 'mine'", []).unwrap();
+        let s = review_summary(&w.conn, &w.me, "course", "c1").unwrap();
+        assert!(s.items.iter().any(|r| r.id == "mine" && r.mine) && s.mine.unwrap().id == "mine");
+    }
+
+    #[test]
+    fn the_progress_list_carries_the_subject_the_percent_and_the_next_lesson() {
+        let w = world();
+        for (n, id) in ["a", "b", "c"].iter().enumerate() {
+            w.conn.execute("INSERT INTO lessons(id,course_id,position,title,video_url,video_kind,created_at) VALUES (?1,'c1',?2,?1,'https://x.example/v','link',?2)", params![id, n as i64 + 1]).unwrap();
+        }
+        assert!(my_progress(&w.conn, &w.me.id).unwrap().is_empty(), "a course not started is not 'progress'");
+        set_complete(&w.conn, &w.me, "a", true).unwrap();
+        set_complete(&w.conn, &w.me, "c", true).unwrap();
+        let items = my_progress(&w.conn, &w.me.id).unwrap();
+        let v = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "course_id": "c1", "title": "دورة", "subject_id": "s1", "subject_name": "برمجة", "total": 3, "completed": 2, "percent": 66.67, "next_lesson_id": "b" })
+        );
+        set_complete(&w.conn, &w.me, "b", true).unwrap();
+        let v = serde_json::to_value(&my_progress(&w.conn, &w.me.id).unwrap()[0]).unwrap();
+        assert_eq!((v["percent"].clone(), v["next_lesson_id"].clone()), (serde_json::json!(100.0), serde_json::Value::Null), "a finished course is still listed");
+        // it follows the one visibility rule
+        w.conn.execute("UPDATE courses SET status = 'draft'", []).unwrap();
+        assert!(my_progress(&w.conn, &w.me.id).unwrap().is_empty());
+    }
+
+    fn put(w: &W, kind: &str, at: i64) {
+        w.conn.execute("INSERT INTO notifications(id,user_id,kind,data,created_at) VALUES (?1,?2,?3,'{}',?4)", params![format!("n-{kind}"), w.me.id, kind, at]).unwrap();
+    }
+
+    fn group(w: &W, name: &str) -> Vec<String> {
+        let q = NotifQuery { group: Some(name.into()), limit: Some(50), ..Default::default() };
+        let mut v: Vec<String> = list_notifications(&w.conn, &w.me.id, &q).unwrap().items.into_iter().map(|n| n.kind).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn the_new_notification_kinds_belong_to_the_right_chips() {
+        let w = world();
+        for (i, kind) in ["new_lesson", "live_soon", "exam_opened", "live_scheduled", "exam_closing", "new_enrollment", "teaching_approved"].iter().enumerate() {
+            put(&w, kind, i as i64 + 1);
+        }
+        assert_eq!(group(&w, "content"), ["live_scheduled", "live_soon", "new_lesson"]);
+        assert_eq!(group(&w, "exams"), ["exam_closing", "exam_opened"]);
+        assert_eq!(group(&w, "people"), ["new_enrollment"]);
+        assert_eq!(group(&w, "account"), ["teaching_approved"]);
+    }
+
+    #[test]
+    fn a_new_lesson_for_a_course_that_does_not_exist_is_a_no_op() {
+        let w = world();
+        tell_new_lesson(&w.conn, "nope", "درس", 5).unwrap();
+        let n: i64 = w.conn.query_row("SELECT count(*) FROM notifications", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+        tell_new_lesson(&w.conn, "c1", "درس", 5).unwrap();
+        let (kind, link): (String, String) = w.conn.query_row("SELECT kind, link FROM notifications WHERE user_id = ?1", params![w.me.id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((kind.as_str(), link.as_str()), ("new_lesson", "/platform/courses/c1"));
     }
 }

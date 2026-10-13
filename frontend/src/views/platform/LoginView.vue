@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { usePt, platformErrorKey } from '@/i18n/platform'
@@ -8,12 +8,18 @@ import { useBrandingStore } from '@/stores/branding'
 import BrandMark from '@/components/platform/BrandMark.vue'
 import LegalLinks from '@/components/platform/LegalLinks.vue'
 import { PlatformError } from '@/lib/platformApi'
+import { isExamTakePath } from '@/utils/platformGuard'
 
 const pt = usePt()
 const auth = useAuthStore()
 onMounted(() => useBrandingStore().load())
 const router = useRouter()
 const route = useRoute()
+
+// The session ended while the person was on a page (see the router's unauthorized handler): say so instead of
+// silently turning the screen into a login form. An exam in progress keeps its answers in a local draft.
+const expired = computed(() => route.query.expired === '1')
+const examKept = computed(() => expired.value && isExamTakePath(route.query.redirect))
 
 const email = ref('')
 const password = ref('')
@@ -41,6 +47,9 @@ async function submit() {
   <div class="max-w-md mx-auto pb-8">
     <div class="flex justify-center mb-4"><router-link to="/"><BrandMark :size="40" /></router-link></div>
     <h1 class="text-display-sm font-bold tracking-tight mb-6">{{ pt('login') }}</h1>
+    <p v-if="expired" class="card-filled p-3 text-body-sm mb-4" role="status" data-testid="login-expired">
+      {{ pt('unauthorized') }}<template v-if="examKept"> {{ pt('sessionExamKept') }}</template>
+    </p>
     <form class="card-elevated p-6 space-y-4" @submit.prevent="submit">
       <label class="block">
         <span class="text-label-lg font-semibold">{{ pt('email') }}</span>

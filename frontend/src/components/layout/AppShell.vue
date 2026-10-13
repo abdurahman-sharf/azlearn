@@ -5,8 +5,15 @@ import { useI18nStore } from '@/stores/i18n'
 import { useTheme } from '@/composables/useTheme'
 import { platformEnabled } from '@/lib/platformApi'
 import { useBrandingStore } from '@/stores/branding'
+import { useAuthStore } from '@/stores/auth'
 import { usePt } from '@/i18n/platform'
 import BrandMark from '@/components/platform/BrandMark.vue'
+import AdminSidebar from '@/components/platform/AdminSidebar.vue'
+import TeacherSidebar from '@/components/platform/TeacherSidebar.vue'
+import StudentSidebar from '@/components/platform/StudentSidebar.vue'
+import { refreshDocumentTitle } from '@/lib/docTitle'
+import SignOutBankDialog from '@/components/platform/SignOutBankDialog.vue'
+import LandingNav from './LandingNav.vue'
 import { isTauri, isMacOS, isWindows, isLinux } from '@/utils/platform'
 import TitleBar from './TitleBar.vue'
 import CookieBanner from './CookieBanner.vue'
@@ -21,6 +28,7 @@ import {
   MagnifyingGlassIcon,
   UserCircleIcon,
   LanguageIcon,
+  WifiIcon,
 } from '@heroicons/vue/24/outline'
 
 const router = useRouter()
@@ -28,7 +36,48 @@ const route = useRoute()
 const i18n = useI18nStore()
 const showLanguageDialog = ref(false)
 const brand = useBrandingStore()
+const auth = useAuthStore()
 const pt = usePt()
+
+// Role frame: on every /platform page an admin, a teacher or a student opens, that role's navigation sits beside <main>
+// (not inside it, so the skip link still bypasses it and there is a single main landmark). The router guards have
+// awaited auth.init() by now. Admins keep the legacy practice/generate/search/mine tabs; teachers and students get the
+// sidebar INSTEAD of them (their one link to the local tools lives in the sidebar), so those tabs, the mobile bottom bar
+// and the GitHub button are hidden for them here.
+const inPlatform = computed(() => platformEnabled && /^\/platform(\/|$)/.test(route.path))
+// Focus mode: while a student takes an exam nothing leads away from it - no sidebar, no tabs, no bottom bar, no GitHub
+// button, and the brand is not a link (language and theme stay).
+const focusMode = computed(() => platformEnabled && route.name === 'platform-assessment-take')
+const adminFrame = computed(() => inPlatform.value && auth.role === 'admin')
+const teacherFrame = computed(() => inPlatform.value && auth.role === 'teacher' && auth.isActive)
+const studentFrame = computed(() => inPlatform.value && auth.role === 'student' && auth.isActive && !focusMode.value)
+const roleFrame = computed(() => adminFrame.value || teacherFrame.value || studentFrame.value)
+/** the legacy practice/generate/search/mine tabs, the mobile bottom bar and the GitHub button */
+const hideLegacyNav = computed(() => teacherFrame.value || studentFrame.value || focusMode.value)
+const shellTestid = computed(() =>
+  adminFrame.value ? 'admin-shell' : teacherFrame.value ? 'teacher-shell' : studentFrame.value ? 'student-shell' : focusMode.value ? 'focus-shell' : undefined,
+)
+// The stored session could not be checked because of the network: said on the platform's own pages (the local practice
+// tools work offline and need no banner).
+const showOffline = computed(() => platformEnabled && auth.offline && (inPlatform.value || route.path.startsWith('/auth/') || route.name === 'home'))
+const retrying = ref(false)
+const stillOffline = ref(false)
+/** The banner's button: ask again, show that something is happening, and say so when the server is still out of reach. */
+async function retryNow() {
+  if (retrying.value) return
+  retrying.value = true
+  stillOffline.value = false
+  try {
+    await auth.retry()
+  } finally {
+    retrying.value = false
+  }
+  stillOffline.value = auth.offline
+}
+// The page title follows the language too (the router sets it on every navigation, see lib/docTitle.ts).
+watch(() => i18n.locale, refreshDocumentTitle)
+// Landing header: routes flagged `landingHeader` show the landing menu instead of the practice/generate/search links.
+const landing = computed(() => platformEnabled && route.meta.landingHeader === true)
 const mainEl = ref<HTMLElement | null>(null)
 function focusMain() {
   mainEl.value?.focus()
@@ -103,7 +152,8 @@ const headerStyle = {
 </script>
 
 <template>
-  <div class="min-h-screen flex flex-col" :style="{ backgroundColor: 'rgb(var(--md-surface))' }">
+  <!-- --shell-top: what sits above the header (the desktop title bar, or the phone's safe-area inset), so a page can stick something right under the header -->
+  <div class="min-h-screen flex flex-col" :style="{ backgroundColor: 'rgb(var(--md-surface))', '--shell-top': isDesktopTauri ? '38px' : 'env(safe-area-inset-top, 0px)' }">
     <!-- ====== Desktop TitleBar (Tauri only) ====== -->
     <TitleBar v-if="isDesktopTauri" />
 
@@ -118,8 +168,9 @@ const headerStyle = {
     >
       <div class="mx-auto w-full max-w-[90rem] flex items-center h-14 sm:h-16 gap-2 sm:gap-3 px-3 sm:px-6">
         <!-- Logo (browser / mobile only — desktop shows it in TitleBar) -->
+        <div v-if="!isDesktopTauri && focusMode" class="flex items-center gap-3 shrink-0" data-testid="focus-brand"><BrandMark :size="38" data-testid="header-brand" /></div>
         <router-link
-          v-if="!isDesktopTauri"
+          v-else-if="!isDesktopTauri"
           :to="homePath"
           class="flex items-center gap-3 shrink-0 no-underline group"
         >
@@ -133,8 +184,10 @@ const headerStyle = {
           </template>
         </router-link>
 
+        <LandingNav v-if="landing" mode="top" />
+
         <!-- Desktop Nav — Pixel Segmented sliding pill navigation -->
-        <div class="hidden sm:flex items-center" :class="isDesktopTauri ? '' : 'ml-6'">
+        <div v-else-if="!hideLegacyNav" class="hidden sm:flex items-center" :class="isDesktopTauri ? '' : 'ml-6'">
           <nav
             :aria-label="headerName"
             class="relative flex items-center p-1 rounded-full gap-0.5 shadow-sm"
@@ -168,7 +221,12 @@ const headerStyle = {
 
         <!-- Actions -->
         <div class="flex items-center gap-1.5">
+          <template v-if="landing">
+            <router-link to="/auth/login" class="btn-text hidden sm:inline-flex" data-testid="header-login">{{ pt('login') }}</router-link>
+            <router-link to="/auth/register" class="btn-filled !px-4 !py-2 text-sm" data-testid="header-register">{{ pt('register') }}</router-link>
+          </template>
           <button
+            v-if="!landing && !hideLegacyNav"
             class="btn-icon"
             @click="openGitHub"
             title="GitHub"
@@ -196,17 +254,47 @@ const headerStyle = {
       </div>
     </header>
 
+    <!-- The stored session could not be checked (no network / server down): the person stays signed in and the app
+         tries again by itself when the connection returns (see stores/auth.ts). -->
+    <section
+      v-if="showOffline"
+      class="mx-auto w-full max-w-[90rem] px-3 sm:px-6 pt-3"
+      :aria-label="pt('offlineLabel')"
+      data-testid="offline-banner"
+    >
+      <div class="rounded-2xl px-4 py-3 flex flex-wrap items-center gap-3" role="status" style="background-color: rgb(var(--azl-amber)); color: rgb(var(--azl-on-amber))">
+        <WifiIcon class="w-5 h-5 shrink-0" aria-hidden="true" />
+        <span class="flex-1 min-w-0 text-body-md font-semibold">{{ pt('offlineBanner') }}</span>
+        <!-- the answer to "Try again": the button is busy while it runs, and a failed try says so (it is a live region) -->
+        <span v-if="stillOffline && !retrying" class="text-body-sm font-semibold" data-testid="offline-still">{{ pt('offlineStill') }}</span>
+        <button type="button" class="btn-outlined !py-1.5 text-sm" style="color: inherit; border-color: currentColor" :disabled="retrying" :aria-busy="retrying ? 'true' : undefined" data-testid="offline-retry" @click="retryNow">{{ retrying ? pt('offlineRetrying') : pt('offlineRetry') }}</button>
+      </div>
+    </section>
+
     <!-- ====== Main Content ====== -->
-    <main id="main-content" ref="mainEl" tabindex="-1" class="flex-1 mx-auto w-full max-w-5xl xl:max-w-6xl px-3 sm:px-6 py-4 sm:py-7 focus:outline-none">
-      <router-view v-slot="{ Component }">
-        <transition name="slide-up" mode="out-in">
-          <component :is="Component" />
-        </transition>
-      </router-view>
-    </main>
+    <div
+      class="flex-1 mx-auto w-full px-3 sm:px-6 py-4 sm:py-7"
+      :class="roleFrame ? 'max-w-[90rem] flex flex-col md:flex-row md:items-start gap-3 md:gap-8' : 'max-w-5xl xl:max-w-6xl'"
+      :data-testid="shellTestid"
+    >
+      <AdminSidebar v-if="adminFrame" />
+      <TeacherSidebar v-else-if="teacherFrame" />
+      <StudentSidebar v-else-if="studentFrame" />
+      <main id="main-content" ref="mainEl" tabindex="-1" class="focus:outline-none" :class="roleFrame ? 'min-w-0 w-full md:flex-1' : ''">
+        <router-view v-slot="{ Component }">
+          <!-- no page animation inside a role frame: the sidebar stays put and every click is instant -->
+          <transition :name="roleFrame ? 'none' : 'slide-up'" mode="out-in">
+            <!-- the key changes only when the profile arrives after a network failure: the page then loads its data again -->
+            <component :is="Component" :key="auth.epoch" />
+          </transition>
+        </router-view>
+      </main>
+    </div>
 
     <!-- ====== Bottom Navigation Bar (Mobile Pixel M3) ====== -->
+    <LandingNav v-if="landing" mode="bottom" />
     <nav
+      v-else-if="!hideLegacyNav"
       :aria-label="headerName"
       class="sm:hidden sticky bottom-0 z-30 safe-bottom"
       :style="{
@@ -252,10 +340,14 @@ const headerStyle = {
       </div>
     </nav>
     <CookieBanner />
+    <!-- the one "clear the local question banks?" question every sign-out button shares (see composables/signOutBank.ts) -->
+    <SignOutBankDialog />
     <UpdateDialog />
     <LanguageDialog v-if="showLanguageDialog" @close="showLanguageDialog = false" />
   </div>
 </template>
 
 <style>
+/* the page heading receives focus after a navigation (router/index.ts); it is not a control, so no focus ring */
+#main-content h1[tabindex='-1']:focus { outline: none; }
 </style>

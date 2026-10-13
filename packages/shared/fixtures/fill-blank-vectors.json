@@ -1,0 +1,500 @@
+[
+ {
+  "answer": "القاهرة",
+  "given": "القاهرة",
+  "correct": true,
+  "note": "exact"
+ },
+ {
+  "answer": "Cairo",
+  "given": "cairo",
+  "correct": true,
+  "note": "case is ignored"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "  القاهرة  ",
+  "correct": true,
+  "note": "outer spaces are trimmed"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "\u00a0القاهرة\u00a0",
+  "correct": true,
+  "note": "no-break spaces at the ends"
+ },
+ {
+  "answer": "نهر النيل",
+  "given": "نهر\u00a0النيل",
+  "correct": true,
+  "note": "inner no-break space is one space"
+ },
+ {
+  "answer": "نهر النيل",
+  "given": "نهر    النيل",
+  "correct": true,
+  "note": "a run of spaces is one space"
+ },
+ {
+  "answer": "نهر النيل",
+  "given": "نهر\tالنيل",
+  "correct": true,
+  "note": "a tab is whitespace"
+ },
+ {
+  "answer": "نهر النيل",
+  "given": "نهر\n النيل",
+  "correct": true,
+  "note": "a line break plus a space is one space"
+ },
+ {
+  "answer": "نهر النيل",
+  "given": "نهرالنيل",
+  "correct": false,
+  "note": "a missing space is a different answer"
+ },
+ {
+  "answer": "مصر",
+  "given": "مِصْر",
+  "correct": true,
+  "note": "diacritics are ignored"
+ },
+ {
+  "answer": "مصر",
+  "given": "مـصـر",
+  "correct": true,
+  "note": "tatweel is ignored"
+ },
+ {
+  "answer": "إسلام",
+  "given": "اسلام",
+  "correct": true,
+  "note": "alef forms are one letter"
+ },
+ {
+  "answer": "آمال",
+  "given": "امال",
+  "correct": true,
+  "note": "alef madda folds to alef"
+ },
+ {
+  "answer": "على",
+  "given": "علي",
+  "correct": true,
+  "note": "alef maqsura folds to yeh"
+ },
+ {
+  "answer": "الله",
+  "given": "اللّٰه",
+  "correct": true,
+  "note": "shadda and superscript alef are ignored"
+ },
+ {
+  "answer": "مدرسة",
+  "given": "مدرسه",
+  "correct": false,
+  "note": "teh marbuta and heh are deliberately NOT folded"
+ },
+ {
+  "answer": "مدرسه",
+  "given": "مدرسة",
+  "correct": false,
+  "note": "heh and teh marbuta are deliberately NOT folded"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "الجيزة",
+  "correct": false,
+  "note": "a different word"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "الق\u200bاهرة",
+  "correct": true,
+  "note": "zero-width space inside"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "\u200fالقاهرة\u200e",
+  "correct": true,
+  "note": "RLM and LRM around"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "ا\u200cلقاهرة",
+  "correct": true,
+  "note": "zero-width non-joiner inside"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "\ufeffالقاهرة",
+  "correct": true,
+  "note": "byte order mark in front"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "القاهرة.",
+  "correct": true,
+  "note": "trailing full stop"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "القاهرة،",
+  "correct": true,
+  "note": "trailing Arabic comma"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "القاهرة؛",
+  "correct": true,
+  "note": "trailing Arabic semicolon"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "القاهرة؟",
+  "correct": true,
+  "note": "trailing Arabic question mark"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "«القاهرة»",
+  "correct": true,
+  "note": "guillemets"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "“القاهرة”",
+  "correct": true,
+  "note": "curly double quotes"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "'القاهرة'",
+  "correct": true,
+  "note": "straight single quotes"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "(القاهرة)",
+  "correct": true,
+  "note": "parentheses"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "[القاهرة]",
+  "correct": true,
+  "note": "brackets"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "-القاهرة",
+  "correct": true,
+  "note": "a leading hyphen before a letter is decoration"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "\u2013 القاهرة \u2014",
+  "correct": true,
+  "note": "en and em dashes that stand apart"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "_القاهرة_",
+  "correct": true,
+  "note": "underscores"
+ },
+ {
+  "answer": "مصر",
+  "given": "( مصر ). ",
+  "correct": true,
+  "note": "a mix of whitespace and punctuation at the ends"
+ },
+ {
+  "answer": "القاهرة.",
+  "given": "القاهرة",
+  "correct": true,
+  "note": "the key is normalised the same way"
+ },
+ {
+  "answer": "ابن-سينا",
+  "given": "ابن سينا",
+  "correct": false,
+  "note": "punctuation INSIDE the answer stays"
+ },
+ {
+  "answer": "ابن-سينا",
+  "given": "ابن-سينا",
+  "correct": true,
+  "note": "inner hyphen on both sides"
+ },
+ {
+  "answer": "5",
+  "given": "-5",
+  "correct": false,
+  "note": "the minus sign is part of the number"
+ },
+ {
+  "answer": "123",
+  "given": "١٢٣",
+  "correct": true,
+  "note": "Arabic-Indic digits"
+ },
+ {
+  "answer": "١٢٣",
+  "given": "123",
+  "correct": true,
+  "note": "Arabic-Indic digits in the key"
+ },
+ {
+  "answer": "123",
+  "given": "۱۲۳",
+  "correct": true,
+  "note": "Persian digits"
+ },
+ {
+  "answer": "Python 3",
+  "given": "python ٣",
+  "correct": true,
+  "note": "digits and case together"
+ },
+ {
+  "answer": "3.5",
+  "given": "٣٫٥",
+  "correct": true,
+  "note": "Arabic decimal separator"
+ },
+ {
+  "answer": "1,000",
+  "given": "١٬٠٠٠",
+  "correct": true,
+  "note": "Arabic thousands separator"
+ },
+ {
+  "answer": "3.5",
+  "given": "35",
+  "correct": false,
+  "note": "an inner dot is not dropped"
+ },
+ {
+  "answer": "3.5",
+  "given": "3,5",
+  "correct": false,
+  "note": "comma is not a dot"
+ },
+ {
+  "answer": "12",
+  "given": "21",
+  "correct": false,
+  "note": "different digits"
+ },
+ {
+  "answer": "القاهرة|مصر",
+  "given": "مصر",
+  "correct": true,
+  "note": "second alternative"
+ },
+ {
+  "answer": "القاهرة|مصر",
+  "given": "القاهرة",
+  "correct": true,
+  "note": "first alternative"
+ },
+ {
+  "answer": "القاهرة|مصر",
+  "given": "الإسكندرية",
+  "correct": false,
+  "note": "none of the alternatives"
+ },
+ {
+  "answer": "القاهرة | مصر",
+  "given": "مصر",
+  "correct": true,
+  "note": "spaces around the bar"
+ },
+ {
+  "answer": "إسلام|الاسلام",
+  "given": "الإسلام",
+  "correct": true,
+  "note": "each alternative is normalised"
+ },
+ {
+  "answer": "القاهرة|مصر",
+  "given": "القاهرة|مصر",
+  "correct": false,
+  "note": "what the student typed is never split on the bar"
+ },
+ {
+  "answer": "القاهرة||مصر",
+  "given": "مصر",
+  "correct": true,
+  "note": "an empty alternative is harmless"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "",
+  "correct": false,
+  "note": "nothing typed"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "   ",
+  "correct": false,
+  "note": "only spaces"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "...",
+  "correct": false,
+  "note": "only punctuation"
+ },
+ {
+  "answer": "...",
+  "given": "...",
+  "correct": true,
+  "note": "a key made only of punctuation is compared as typed"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "القاهرة -",
+  "correct": true,
+  "note": "a trailing hyphen that stands apart (after a space) is decoration"
+ },
+ {
+  "answer": "القاهرة",
+  "given": "القاهرة-",
+  "correct": false,
+  "note": "a hyphen glued to the end of a word belongs to it"
+ },
+ {
+  "answer": "-5",
+  "given": "5",
+  "correct": false,
+  "note": "a key with a minus sign is not matched by the bare number"
+ },
+ {
+  "answer": "-5",
+  "given": "-5",
+  "correct": true,
+  "note": "minus sign on both sides"
+ },
+ {
+  "answer": "-5",
+  "given": "\u22125",
+  "correct": true,
+  "note": "the true minus sign U+2212 is a hyphen"
+ },
+ {
+  "answer": "-5",
+  "given": "(-5)",
+  "correct": true,
+  "note": "brackets around a negative number"
+ },
+ {
+  "answer": "-5",
+  "given": "-٥",
+  "correct": true,
+  "note": "a negative number in Arabic-Indic digits"
+ },
+ {
+  "answer": "-5",
+  "given": "\u20135",
+  "correct": false,
+  "note": "an en dash before a digit is not folded into the minus sign (it is kept, so it never matches the bare number either)"
+ },
+ {
+  "answer": ".5",
+  "given": "5",
+  "correct": false,
+  "note": "a leading decimal point is part of the number"
+ },
+ {
+  "answer": "5",
+  "given": ".5",
+  "correct": false,
+  "note": "…also on the typed side"
+ },
+ {
+  "answer": ".5",
+  "given": ".5",
+  "correct": true,
+  "note": "leading decimal point on both sides"
+ },
+ {
+  "answer": "-.5",
+  "given": "-.5",
+  "correct": true,
+  "note": "negative with a leading decimal point"
+ },
+ {
+  "answer": "-.5",
+  "given": ".5",
+  "correct": false,
+  "note": "the sign of -.5 is kept"
+ },
+ {
+  "answer": "5",
+  "given": "5.",
+  "correct": true,
+  "note": "a trailing full stop after a number"
+ },
+ {
+  "answer": "Cl-",
+  "given": "Cl",
+  "correct": false,
+  "note": "an ion is not the atom"
+ },
+ {
+  "answer": "Cl",
+  "given": "Cl-",
+  "correct": false,
+  "note": "…also the other way round"
+ },
+ {
+  "answer": "Cl-",
+  "given": "cl-",
+  "correct": true,
+  "note": "the same ion, other case"
+ },
+ {
+  "answer": "NO3-",
+  "given": "(NO3-)",
+  "correct": true,
+  "note": "brackets around an ion"
+ },
+ {
+  "answer": "?",
+  "given": "?",
+  "correct": true,
+  "note": "a key made only of punctuation is compared as typed"
+ },
+ {
+  "answer": "?",
+  "given": "!",
+  "correct": false,
+  "note": "…and another punctuation mark is a different answer"
+ },
+ {
+  "answer": "-",
+  "given": "-",
+  "correct": true,
+  "note": "a lone hyphen key"
+ },
+ {
+  "answer": "?",
+  "given": " ",
+  "correct": false,
+  "note": "spaces are not an answer"
+ },
+ {
+  "answer": "...",
+  "given": "",
+  "correct": false,
+  "note": "nothing typed never matches"
+ },
+ {
+  "answer": "القاهرة|?",
+  "given": "?",
+  "correct": true,
+  "note": "a punctuation-only alternative next to a word"
+ }
+]

@@ -102,8 +102,42 @@ let failures = 0; const ok = (label, cond) => { console.log((cond ? 'PASS' : 'FA
   console.log(`   passers per server ${sum.json.passed}, expected ${passExpected} (total points ${exam.total_points})`)
   ok('pass count matches the independent calculation', sum.json.passed === passExpected)
 
+  // ── hard-end phase (CLOSE_PHASE=0 skips): a second exam is started by everybody, every student autosaves part of the sheet
+  // (merge mode), then the admin closes the exam while all 300 attempts are running. The close must settle every attempt
+  // from its autosave inside one request, with exactly the right scores, while ordinary reads keep being served.
+  if (process.env.CLOSE_PHASE !== '0') {
+    const exam2 = (await call('POST', '/admin/exams', admin, { subject_id: subj.id, title: 'امتحان الإغلاق', questions: Q, status: 'published', duration_min: 60, max_attempts: 1, shuffle_questions: true, shuffle_options: true, pass_mark: 50 })).json
+    const starts2 = await Promise.all(ids.map(i => call('POST', `/assessments/${exam2.id}/start`, tok[i], {})))
+    const bad2 = stats('CLOSE phase: START burst', starts2)
+    const S2 = starts2.map(s => s.json)
+    const answersFor2 = i => { const a = {}; for (const q of plan[i].right) { const shown = S2[i].questions.find(x => x.id === q.id); if (q.type === 'true_false') a[q.id] = 'A'; else { const want = q.answer.split('').map(c => q.options['ABCDE'.indexOf(c)]); a[q.id] = shown.options.map((t, k) => want.includes(t) ? 'ABCDE'[k] : '').join('') } } return a }
+    const saves2 = await Promise.all(ids.map(i => call('PUT', `/attempts/${S2[i].attempt_id}/answers`, tok[i], { answers: answersFor2(i) })))
+    stats('CLOSE phase: partial autosave', saves2)
+    ok('all 300 attempts are running with a saved sheet before the close', bad2 === 0 && saves2.every(r => r.status === 200))
+    // reads while the close runs: the overview/exam list of 60 students and the search
+    const reads = Promise.all(ids.slice(0, 60).flatMap(i => [call('GET', '/student/overview', tok[i]), call('GET', '/my/exams', tok[i]), call('GET', `/search?q=${encodeURIComponent('امتحان')}`, tok[i])]))
+    const closeRes = await call('POST', `/admin/exams/${exam2.id}/close`, admin, {})
+    const readRes = await reads
+    console.log(`   manual close of 300 running attempts: HTTP ${closeRes.status} in ${closeRes.ms.toFixed(0)} ms`)
+    stats('CLOSE phase: reads during the close', readRes)
+    ok('the close succeeded and its latency is bounded (< 5 s)', closeRes.status === 200 && closeRes.ms < 5000)
+    ok('no read failed while the close ran', readRes.every(r => r.status === 200))
+    const after = await Promise.all(ids.map(i => call('GET', `/attempts/${S2[i].attempt_id}`, tok[i])))
+    stats('CLOSE phase: attempt pages after the close', after)
+    const wrong2 = after.map((r, i) => [i, r.json && r.json.score, plan[i].expected]).filter(([, got, exp]) => got !== exp)
+    ok(`every running attempt was submitted by the close with exactly the right score (${N - wrong2.length}/${N})`, wrong2.length === 0 && after.every(r => r.json && r.json.status === 'submitted'))
+    if (wrong2.length) console.log('   first mismatches:', wrong2.slice(0, 5))
+    const late = await call('PUT', `/attempts/${S2[0].attempt_id}/answers`, tok[0], { answers: { q1: 'A' } })
+    ok('a save after the close is refused', late.status >= 400)
+    const restart = await call('POST', `/assessments/${exam2.id}/start`, tok[0], {})
+    ok('no new attempt can start on the closed exam', restart.status >= 400)
+    const sum2 = await call('GET', `/assessments/${exam2.id}/results`, admin)
+    ok('admin results count all 300 submitted attempts (none left running)', sum2.json.submitted === N && sum2.json.attempts.length === N)
+    console.log(`server RSS after the close phase: ${rssMb()} MB`)
+  }
+
   console.log(`\nserver RSS at the end: ${rssMb()} MB`)
   const integrity = execFileSync('python3', ['-I', '-c', `import sqlite3;c=sqlite3.connect('${DIR}/p.db');print(c.execute("pragma integrity_check").fetchone()[0], c.execute("select count(*) from attempts where status='submitted'").fetchone()[0])`]).toString().trim()
-  ok(`database integrity after the storm: "${integrity}"`, integrity === `ok ${N}`)
+  ok(`database integrity after the storm: "${integrity}"`, integrity === `ok ${N}` || (process.env.CLOSE_PHASE !== '0' && integrity === `ok ${2 * N}`))
   proc.kill(); console.log(failures ? `\n${failures} FAILED` : '\nALL PASSED'); process.exit(failures ? 1 : 0)
 })().catch(e => { console.error(e); try { proc.kill() } catch {} process.exit(2) })

@@ -1,6 +1,7 @@
 import type { Question } from '@exameow/shared'
 import { Difficulty, QuestionType as QT } from '@exameow/shared'
 import * as XLSX from 'xlsx'
+import { arabicChoiceAnswer, arabicDifficulty, arabicLettersToLatin, arabicTrueFalseAnswer, arabicTypeFromLabel, classifyArabicHeader, normalizeDigits } from './arabicImport'
 
 type QuestionType = typeof QT[keyof typeof QT]
 
@@ -21,6 +22,8 @@ export interface ColumnMapping {
   subject: number | null
   chapter: number | null
   difficulty: number | null
+  /** Optional points column (Arabic "الدرجة"); absent in mappings built by older callers. */
+  score?: number | null
 }
 
 export type MissingField = 'stem' | 'answer' | 'options'
@@ -31,6 +34,8 @@ export interface ImportAnalysis {
   hasHeader: boolean
   mapping: ColumnMapping
   missing: MissingField[]
+  /** Spreadsheet row (1-based, header included) of each entry of `rows`; for CSV, the record number. */
+  rowNumbers?: number[]
 }
 
 function normalize(s: string): string {
@@ -46,7 +51,10 @@ export function normalizeDifficulty(value: string): Difficulty | undefined {
     case 'medium': return Difficulty.Medium
     case '困难':
     case 'hard': return Difficulty.Hard
-    default: return undefined
+    default: {
+      const ar = arabicDifficulty(value)
+      return ar === 'easy' ? Difficulty.Easy : ar === 'medium' ? Difficulty.Medium : ar === 'hard' ? Difficulty.Hard : undefined
+    }
   }
 }
 
@@ -55,6 +63,7 @@ function looksLikeHeader(cell: string): boolean {
   const t = cell.trim()
   if (/^\d+$/.test(t)) return false
   if (t.length > 30) return false
+  if (classifyArabicHeader(t)) return true
   const keywords = [
     '题干', '题目', '题', 'stem', 'question', 'title',
     '题型', '类型', 'type',
@@ -87,10 +96,15 @@ function detectColumnType(val: string): QuestionType | null {
   if (v.includes('判断') || v.includes('true') || v.includes('false') || v.includes('对错') || v === '是非' || v.includes('是非')) return TF
   if (v.includes('填空') || v.includes('fill') || v.includes('blank') || v.includes('blanks')) return FB
   if (v.includes('简答') || v.includes('问答') || v.includes('short') || v.includes('essay') || v.includes('主观')) return SA
-  return null
+  const ar = arabicTypeFromLabel(val)
+  return ar ? (ar as QuestionType) : null
 }
 
 function detectColumnTypeFromQA(stem: string, answer: string, hasOptions: boolean): QuestionType | null {
+  if (hasOptions) {
+    const letters = arabicLettersToLatin(answer)
+    if (letters) return letters.length > 1 ? MT : ST
+  }
   if (hasOptions && answer.length <= 3) {
     if (answer.includes(',') || answer.includes(';') || answer.includes('、') || answer.length > 1) {
       return MT
@@ -117,10 +131,20 @@ function buildColumnMap(headers: string[]): ColumnMapping {
     optionsDelimiter: '', answer: null, analysis: null, subject: null, chapter: null, difficulty: null,
   }
 
+  const letterOf = new Map<number, number>()
   for (let i = 0; i < headers.length; i++) {
     const h = headers[i]
     if (!h) continue
     const n = normalize(h)
+
+    const ar = classifyArabicHeader(h)
+    if (ar) {
+      // exact Arabic header match; a second column with the same meaning is ignored rather than re-claimed below
+      if (ar.field === 'option') { map.options.push(i); letterOf.set(i, ar.index) }
+      else if (ar.field === 'options') { if (map.combinedOptions === null) map.combinedOptions = i }
+      else if (map[ar.field] == null) map[ar.field] = i
+      continue
+    }
 
     if (map.stem === null && (
       n.includes('题干') || n.includes('题目') || n === '题' || n.includes('stem') || n.includes('question') || n === 'title' || n.includes('内容') || n === 'q'
@@ -188,6 +212,10 @@ function buildColumnMap(headers: string[]): ColumnMapping {
     }
   }
 
+  // Arabic option headers name their letter, so honour it even when the columns are out of order.
+  if (map.options.length > 1 && map.options.every(c => letterOf.has(c))) {
+    map.options.sort((a, b) => (letterOf.get(a) as number) - (letterOf.get(b) as number))
+  }
   return map
 }
 
@@ -378,23 +406,47 @@ function analyzeRows(rawRows: string[][], forceNativeXlsx: boolean): ImportAnaly
   return { headers, rows, hasHeader, mapping, missing }
 }
 
-export function parseWithMapping(analysis: ImportAnalysis, mapping: ColumnMapping, source: string): Question[] {
-  const questions: Question[] = []
+export interface ParsedRow {
+  question: Question
+  /** Spreadsheet row of the question (see `ImportAnalysis.rowNumbers`). */
+  rowNumber: number
+}
+export interface SkippedRow {
+  rowNumber: number
+  reason: 'empty_stem'
+}
+
+/** Parses every row and keeps where it came from: which rows became questions, and which non-blank ones were skipped. */
+export function parseWithMappingDetailed(analysis: ImportAnalysis, mapping: ColumnMapping, source: string): { items: ParsedRow[]; skipped: SkippedRow[] } {
+  const items: ParsedRow[] = []
+  const skipped: SkippedRow[] = []
   const rows = analysis.rows
+  const firstRow = analysis.hasHeader ? 2 : 1
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]
     if (!row || row.length === 0) continue
     const allBlank = row.every(c => !c || c.trim() === '')
     if (allBlank) continue
+    const rowNumber = analysis.rowNumbers?.[i] ?? i + firstRow
 
     const stem = mapping.stem !== null ? (row[mapping.stem] ?? '').trim() : ''
-    if (!stem) continue
+    if (!stem) {
+      skipped.push({ rowNumber, reason: 'empty_stem' })
+      continue
+    }
 
     let qtype: QuestionType = SA
+    let explicitArabicType = false
     if (mapping.type !== null) {
       const t = (row[mapping.type] ?? '').trim()
-      qtype = typeLabelToEnum(t)
+      const ar = arabicTypeFromLabel(t)
+      if (ar) {
+        qtype = ar as QuestionType
+        explicitArabicType = true
+      } else {
+        qtype = typeLabelToEnum(t)
+      }
     }
 
     const options: string[] = []
@@ -410,31 +462,52 @@ export function parseWithMapping(analysis: ImportAnalysis, mapping: ColumnMappin
       }
     }
 
-    const answer = mapping.answer !== null ? (row[mapping.answer] ?? '').trim() : ''
-    const analysis = mapping.analysis !== null ? (row[mapping.analysis] ?? '').trim() : ''
+    let answer = mapping.answer !== null ? (row[mapping.answer] ?? '').trim() : ''
+    const analysis_ = mapping.analysis !== null ? (row[mapping.analysis] ?? '').trim() : ''
     const difficulty = mapping.difficulty !== null
       ? normalizeDifficulty(row[mapping.difficulty] ?? '')
       : undefined
 
-    if (!qtype || qtype === SA) {
+    // An Arabic label like "إجابة قصيرة" is an explicit choice: do not re-infer fill-blank from "_____" in the stem.
+    if (!explicitArabicType && (!qtype || qtype === SA)) {
       const inferred = detectColumnTypeFromQA(stem, answer, options.length > 0)
       if (inferred) qtype = inferred
     }
 
-    questions.push({
+    // Arabic-letter answers (أ، ج) and answers given as the option's own text become the letters graders expect.
+    if (qtype === ST || qtype === MT) {
+      const letters = arabicChoiceAnswer(answer, options)
+      if (letters) answer = letters
+    } else if (qtype === TF) {
+      answer = arabicTrueFalseAnswer(answer) ?? answer
+    }
+
+    let score: number | undefined
+    if (mapping.score != null) {
+      const raw = normalizeDigits(row[mapping.score] ?? '').trim()
+      if (raw !== '' && /^\d+(\.\d+)?$/.test(raw)) score = Number(raw)
+    }
+
+    const question: Question = {
       id: `${source}-${i + 1}`,
       type: qtype,
       stem,
       options,
       answer,
-      analysis,
+      analysis: analysis_,
       subject: mapping.subject !== null ? (row[mapping.subject] ?? '').trim() || undefined : undefined,
       chapter: mapping.chapter !== null ? (row[mapping.chapter] ?? '').trim() || undefined : undefined,
       difficulty,
-    })
+    }
+    if (score !== undefined) question.score = score
+    items.push({ question, rowNumber })
   }
 
-  return questions
+  return { items, skipped }
+}
+
+export function parseWithMapping(analysis: ImportAnalysis, mapping: ColumnMapping, source: string): Question[] {
+  return parseWithMappingDetailed(analysis, mapping, source).items.map(item => item.question)
 }
 
 function detectXlsxFormat(headers: string[]): boolean {
@@ -448,10 +521,12 @@ function detectXlsxFormat(headers: string[]): boolean {
 }
 
 export function analyzeCSV(text: string): ImportAnalysis | null {
-  const rows = parseCSVText(text).filter(r => r.some(c => c.trim() !== ''))
+  const rows = parseCSVText(text.replace(/^\uFEFF/, '')).filter(r => r.some(c => c.trim() !== ''))
   if (rows.length === 0) return null
   if (rows.length < 2 && !isCanonicalHeaderlessRow(rows[0] ?? [])) return null
-  return analyzeRows(rows, false)
+  const analysis = analyzeRows(rows, false)
+  if (analysis) analysis.rowNumbers = rows.map((_, i) => i + 1).slice(analysis.hasHeader ? 1 : 0)
+  return analysis
 }
 
 export function analyzeExcel(buffer: ArrayBuffer): ImportAnalysis | null {
@@ -462,12 +537,19 @@ export function analyzeExcel(buffer: ArrayBuffer): ImportAnalysis | null {
   const sheet = workbook.Sheets[sheetName]
   if (!sheet) return null
 
-  const rawRows: (string[] | undefined)[] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', blankrows: false })
-  const rows = rawRows.filter((r): r is string[] => r !== undefined).map(r => r.map(c => String(c ?? '')))
-  if (rows.length === 0) return null
+  // Blank rows are kept while reading so every row keeps its real sheet number, then dropped.
+  const firstSheetRow = sheet['!ref'] ? XLSX.utils.decode_range(sheet['!ref']).s.r : 0
+  const rawRows: (string[] | undefined)[] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', blankrows: true })
+  const numbered = rawRows
+    .map((r, i) => ({ cells: (r ?? []).map(c => String(c ?? '')), row: firstSheetRow + i + 1 }))
+    .filter(r => r.cells.some(c => c.trim() !== ''))
+  if (numbered.length === 0) return null
 
+  const rows = numbered.map(r => r.cells)
   const headers = rows[0] ?? []
-  return analyzeRows(rows, detectXlsxFormat(headers))
+  const analysis = analyzeRows(rows, detectXlsxFormat(headers))
+  if (analysis) analysis.rowNumbers = numbered.map(r => r.row).slice(analysis.hasHeader ? 1 : 0)
+  return analysis
 }
 
 export function parseCSV(text: string): { questions: Question[]; source: string } {

@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { platformEnabled, platformFetch } from '@/lib/platformApi'
 import { brandCss } from '@/utils/brandTheme'
+import { setTitleBrand } from '@/lib/docTitle'
 
 export interface PublicConfig {
   name: string | null
@@ -65,7 +66,8 @@ export const useBrandingStore = defineStore('branding', () => {
   const name = computed(() => config.value.name)
   const title = (n: string | null) => {
     if (!platformEnabled) return
-    document.title = n ?? 'azlearn'
+    // "<page> · <name>": the page part comes from the router (see lib/docTitle.ts)
+    setTitleBrand(n)
     const icon = document.querySelector<HTMLLinkElement>('link[rel="icon"]')
     if (icon && n === null) icon.href = '/azlearn-favicon.png'
   }

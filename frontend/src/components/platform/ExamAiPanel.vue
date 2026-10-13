@@ -47,10 +47,10 @@ async function run() {
 
 <template>
   <section class="card-filled p-5 space-y-4" data-testid="ai-panel">
-    <h3 class="text-title-md font-bold">{{ pt('exSourceAi') }}</h3>
+    <h2 class="text-title-md font-bold">{{ pt('exSourceAi') }}</h2>
     <label class="block">
       <span class="text-label-lg">{{ pt('exAiFile') }}</span>
-      <input type="file" accept=".pdf,.docx,.xlsx,.xls,.pptx,.epub,.odt,.txt,.md,.csv,.html,.htm" class="block mt-1" data-testid="ai-file" @change="onFile" />
+      <input type="file" accept=".pdf,.docx,.xlsx,.xls,.pptx,.epub,.odt,.txt,.md,.csv,.html,.htm" class="block mt-1 w-full max-w-full" data-testid="ai-file" @change="onFile" />
       <span class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))">{{ pt('exAiFileHint') }}</span>
     </label>
     <fieldset>

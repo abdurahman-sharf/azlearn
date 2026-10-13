@@ -5,6 +5,7 @@ import { analyzeCSV, analyzeExcel, parseWithMapping } from '@/utils/importParser
 import type { ColumnMapping, ImportAnalysis } from '@/utils/importParser'
 import { usePracticeHistoryStore } from '@/stores/practiceHistory'
 import { matchPracticeFilter, reconcileMockConfig } from '@/utils/practiceFilter'
+import { choiceCorrect, fillCorrect } from '@/utils/localGrade'
 
 const STORAGE_KEY = 'exameow-banks'
 const SESSION_KEY = 'exameow-practice-session'
@@ -157,6 +158,17 @@ export const usePracticeStore = defineStore('practice', () => {
     saveBanks(banks.value)
   }
 
+  /**
+   * Adds the bank, or replaces the bank that has the same id in place (it keeps its creation time): saving the same thing
+   * twice never makes a copy. Used for banks with a stable id, like the ones the exam practice page keeps.
+   */
+  function upsertBank(bank: QuestionBank) {
+    const i = banks.value.findIndex(b => b.id === bank.id)
+    if (i < 0) banks.value.push(bank)
+    else banks.value[i] = { ...bank, createdAt: banks.value[i]!.createdAt }
+    saveBanks(banks.value)
+  }
+
   function removeBank(id: string) {
     banks.value = banks.value.filter(b => b.id !== id)
     saveBanks(banks.value)
@@ -258,17 +270,13 @@ export const usePracticeStore = defineStore('practice', () => {
 
     const q = item.question
     if (q.type === 'single_choice' || q.type === 'multi_choice') {
-      const userAns = (answer ?? '').trim().toUpperCase().replace(/[^A-H]/g, '').split('').sort().join('')
-      const correctAns = q.answer.trim().toUpperCase().replace(/[^A-H]/g, '').split('').sort().join('')
-      item.isCorrect = userAns === correctAns
+      item.isCorrect = choiceCorrect(q.answer, answer)
     } else if (q.type === 'true_false') {
       const userAns = normalizeTF(answer ?? '')
       const correctAns = normalizeTF(q.answer)
       item.isCorrect = userAns === correctAns
     } else if (q.type === 'fill_blank') {
-      const userAns = (answer ?? '').trim().toLowerCase()
-      const correctAns = q.answer.trim().toLowerCase()
-      item.isCorrect = userAns !== '' && userAns === correctAns
+      item.isCorrect = fillCorrect(q.answer, answer)
     }
 
     usePracticeHistoryStore().record(q.type, item.isCorrect)
@@ -457,6 +465,7 @@ export const usePracticeStore = defineStore('practice', () => {
     score,
     autoGradedCount,
     addBank,
+    upsertBank,
     removeBank,
     getBank,
     saveGeneratedAsBank,
