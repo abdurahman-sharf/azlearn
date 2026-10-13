@@ -334,7 +334,7 @@ struct Row {
 pub fn analytics(conn: &Connection, user: &User, id: &str, now: i64) -> Res<Analytics> {
     require_grader(conn, user, id)?;
     let info = get_info(conn, &user.id, id)?;
-    settle_assessment(conn, id, info.duration_min, now)?;
+    settle_assessment(conn, id, now)?;
     let questions = load_questions(conn, id)?;
     let enrolled: i64 = conn.query_row("SELECT count(*) FROM subject_enrollments WHERE subject_id = ?1", params![info.subject_id], |r| r.get(0)).map_err(db_err)?;
     let rows: Vec<Row> = conn
@@ -482,8 +482,7 @@ const FAILED_SQL: &str = "(t.status = 'submitted' AND t.pending = 0 AND a.pass_m
 
 pub fn attempts_table(conn: &Connection, user: &User, id: &str, f: &TableQuery, now: i64, unpaged: bool) -> Res<TablePage> {
     require_grader(conn, user, id)?;
-    let info = get_info(conn, &user.id, id)?;
-    settle_assessment(conn, id, info.duration_min, now)?;
+    settle_assessment(conn, id, now)?;
     let mut args: Vec<Value> = vec![Value::Text(id.to_string())];
     let mut conds = vec!["t.assessment_id = ?1".to_string()];
     match f.result.as_deref().unwrap_or("") {
@@ -635,7 +634,7 @@ pub fn students_table(conn: &Connection, user: &User, id: &str, f: &TableQuery, 
         _ => return Err(bad("invalid_filter")),
     };
     let info = get_info(conn, &user.id, id)?;
-    settle_assessment(conn, id, info.duration_min, now)?;
+    settle_assessment(conn, id, now)?;
     let rows: Vec<(String, String, String, AttemptFacts)> = conn
         .prepare(
             "SELECT t.student_id, u.full_name, u.email, t.id, t.status, t.score, t.pending, t.started_at, t.submitted_at, t.tab_leaves

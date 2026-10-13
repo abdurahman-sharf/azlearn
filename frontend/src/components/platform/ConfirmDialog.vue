@@ -16,6 +16,8 @@ const props = withDefaults(defineProps<{
   error?: string
   /** prefix of the test ids: `<testid>`, `<testid>-yes`, `<testid>-no` */
   testid?: string
+  /** the cancel button's text when "Cancel" is not the right word (e.g. "Stay in the exam") */
+  cancelLabel?: string
 }>(), { testid: 'confirm-dialog' })
 const emit = defineEmits<{ confirm: []; close: [] }>()
 const pt = usePt()
@@ -41,9 +43,11 @@ useDialog(open, panel, () => emit('close'))
         <ul v-if="props.items?.length" class="list-disc ps-5 text-body-md space-y-0.5" :data-testid="props.testid + '-items'">
           <li v-for="(it, i) in props.items" :key="i" dir="auto" class="break-words">{{ it }}</li>
         </ul>
+        <!-- extra content of the dialog (a choice, a summary): its form controls take part in the dialog's focus cycle -->
+        <slot />
         <p v-if="props.error" role="alert" class="text-body-sm font-semibold" style="color: rgb(var(--md-error))">{{ props.error }}</p>
         <div class="flex flex-wrap gap-2 justify-end">
-          <button type="button" class="btn-outlined" :data-testid="props.testid + '-no'" @click="emit('close')">{{ pt('cancel') }}</button>
+          <button type="button" class="btn-outlined" :data-testid="props.testid + '-no'" @click="emit('close')">{{ props.cancelLabel ?? pt('cancel') }}</button>
           <button type="submit" class="btn-filled" data-autofocus :disabled="props.busy" :data-testid="props.testid + '-yes'">{{ props.confirmLabel }}</button>
         </div>
       </form>

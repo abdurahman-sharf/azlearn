@@ -287,6 +287,13 @@ const router = createRouter({
       meta: { titleKey: 'stexTitle', title: 'My exams', requiresAuth: true, requiresActive: true, roles: ['student'] },
     },
     {
+      // My progress: the student's own results by subject (private; no ranking).
+      path: '/platform/progress',
+      name: 'platform-student-progress',
+      component: () => import('@/views/platform/StudentProgressView.vue'),
+      meta: { titleKey: 'prgTitle', title: 'My progress', requiresAuth: true, requiresActive: true, roles: ['student'] },
+    },
+    {
       path: '/platform/my-subjects',
       name: 'platform-student-subjects',
       component: () => import('@/views/platform/StudentSubjectsView.vue'),
@@ -459,6 +466,13 @@ const router = createRouter({
       name: 'platform-assessment-take',
       component: () => import('@/views/platform/TakeAssessmentView.vue'),
       meta: { titleKey: 'tkPageTitle', title: 'platform-assessment-take', requiresAuth: true, requiresActive: true, roles: ['student'] },
+    },
+    {
+      // Practice: the exam's questions with their answers, checked on the student's device. Nothing is stored on the server.
+      path: '/platform/assessments/:id/practice',
+      name: 'platform-assessment-practice',
+      component: () => import('@/views/platform/PracticeAttemptView.vue'),
+      meta: { titleKey: 'prcTitle', title: 'platform-assessment-practice', requiresAuth: true, requiresActive: true, roles: ['student'] },
     },
     {
       path: '/platform/assessments/:id/results',

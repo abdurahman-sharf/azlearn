@@ -21,7 +21,8 @@
 use crate::platform::{audit, bad, db_err, lock, new_id, opt_text, require_admin, text, Res, User};
 use crate::platform_content::{exam_reason_sql, presence, require_assignment, HiddenReason};
 use crate::platform_exams::{
-    announce, check_closing_ahead, check_duration, check_freeze, check_window, clean_questions, get_info, points_of, round2, shown_state, AssessmentInfo, Cfg, INFO_COLS, INFO_FROM,
+    announce, atomically, audit_practice_change, check_closing_ahead, check_duration, check_freeze, check_window, clean_questions, get_info, points_of, round2, settle_assessment, settle_on_close, shown_state, AssessmentInfo,
+    Cfg, INFO_COLS, INFO_FROM,
 };
 use crate::relay::{err, now_ms};
 use crate::routes::AppState;
@@ -52,6 +53,9 @@ pub struct ExamReq {
     pub(crate) clear_duration: Option<bool>,
     pub(crate) opens_at: Option<i64>,
     pub(crate) clear_opens: Option<bool>,
+    /// The closing time is a HARD END (phase 4-3): attempts still running at that moment are submitted from their
+    /// autosave (see `platform_exams::attempt_end`), and `after_close` results are released once the grace after it is over.
+    /// Can only be moved later once students have sat the exam.
     pub(crate) closes_at: Option<i64>,
     pub(crate) clear_closes: Option<bool>,
     pub(crate) max_attempts: Option<i64>,
@@ -65,6 +69,9 @@ pub struct ExamReq {
     pub(crate) release_mode: Option<String>,
     /// Create only: `draft` (default) or `published`. Later changes go through the lifecycle actions.
     pub(crate) status: Option<String>,
+    /// Practice mode (phase 4-3): enrolled students may run the exam as an ungraded practice that shows the correct answers.
+    /// Absent = off on create and unchanged on update. NOT part of the freeze: the owner may flip it at any time.
+    pub(crate) allow_practice: Option<bool>,
 }
 
 /// Applies the request on top of `base`, validating every field.
@@ -200,8 +207,8 @@ fn phase_of(i: &AssessmentInfo, now: i64) -> String {
 type RowData = (AssessmentInfo, i64, i64, Option<String>);
 
 /// `SELECT` of everything an [`ExamRow`] needs in ONE statement (counts and the reason are correlated subqueries, so a
-/// page of exams costs one query, not one per row). `?1` = the viewer (for `attempts_used`). Columns: the 26 of
-/// `map_info`, then `submitted` (26), `pending_answers` (27) and the reason (28).
+/// page of exams costs one query, not one per row). `?1` = the viewer (for `attempts_used`). Columns: the 27 of
+/// `map_info`, then `submitted` (27), `pending_answers` (28) and the reason (29).
 fn row_select() -> String {
     format!(
         "SELECT {INFO_COLS},
@@ -213,7 +220,7 @@ fn row_select() -> String {
 }
 
 fn map_row(r: &rusqlite::Row) -> rusqlite::Result<RowData> {
-    Ok((crate::platform_exams::map_info(r)?, r.get(26)?, r.get(27)?, r.get(28)?))
+    Ok((crate::platform_exams::map_info(r)?, r.get(27)?, r.get(28)?, r.get(29)?))
 }
 
 fn row_of(viewer: &User, (info, submitted, pending_answers, reason): RowData, now: i64) -> ExamRow {
@@ -291,18 +298,20 @@ pub fn create_exam(conn: &Connection, user: &User, r: &ExamReq, now: i64) -> Res
         check_publishable(&questions, subject_active, &cfg, now)?;
     }
     let id = new_id();
+    let allow_practice = r.allow_practice.unwrap_or(false);
     conn.execute(
         "INSERT INTO assessments(id, teacher_id, created_by, subject_id, title, description, questions, question_count, total_points, duration_min,
-           opens_at, closes_at, max_attempts, show_answers, shuffle_questions, shuffle_options, pass_mark, release_mode, status, source_map, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)",
+           opens_at, closes_at, max_attempts, show_answers, shuffle_questions, shuffle_options, pass_mark, release_mode, status, source_map, created_at, updated_at, allow_practice)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21, ?22)",
         params![
             id, owner, user.id, subject_id, title, description, serde_json::to_string(&questions).map_err(db_err)?, questions.len() as i64, total_of(&questions),
             cfg.duration_min, cfg.opens_at, cfg.closes_at, cfg.max_attempts, cfg.show_answers, cfg.shuffle_questions, cfg.shuffle_options, cfg.pass_mark,
-            cfg.release_mode, status, serde_json::to_string(&sources).map_err(db_err)?, now
+            cfg.release_mode, status, serde_json::to_string(&sources).map_err(db_err)?, now, allow_practice
         ],
     )
     .map_err(db_err)?;
     audit(conn, &user.id, &id, "exam_create", status);
+    audit_practice_change(conn, &user.id, &id, false, allow_practice);
     if status == "published" {
         audit(conn, &user.id, &id, "exam_publish", "on create");
         announce(conn, user, subject_id, &id, &title, now);
@@ -342,6 +351,9 @@ pub fn update_exam(conn: &Connection, user: &User, id: &str, r: &ExamReq, now: i
     if r.status.is_some() {
         return Err(bad("invalid_status")); // lifecycle changes use their own actions
     }
+    // Attempts whose end (and grace) has already gone by are settled BEFORE the closing time can move: settlement is lazy,
+    // and an extension must lengthen only the attempts that are still running, not bring back one nobody has touched yet.
+    settle_assessment(conn, id, now)?;
     let frozen = cur.attempt_count > 0;
     let base = Cfg::of(&cur);
     let cfg = merge(&base, r)?;
@@ -385,20 +397,25 @@ pub fn update_exam(conn: &Connection, user: &User, id: &str, r: &ExamReq, now: i
     if cur.status == "published" && questions.is_empty() {
         return Err(bad("invalid_question_count"));
     }
-    if cur.status == "published" && cfg.closes_at.map_or(false, |c| c <= now) && !frozen {
+    // a closing time that is not in the future cannot be SET on a published exam; one that has simply been reached (nobody
+    // sat the exam) does not stop the owner from changing something else, such as the practice switch
+    if cur.status == "published" && cfg.closes_at != base.closes_at && cfg.closes_at.map_or(false, |c| c <= now) && !frozen {
         return Err(bad("invalid_time"));
     }
+    // the practice switch is deliberately outside the freeze (`Cfg` does not hold it): the owner decides at any time
+    let allow_practice = r.allow_practice.unwrap_or(cur.allow_practice);
     conn.execute(
         "UPDATE assessments SET subject_id = ?2, title = ?3, description = ?4, questions = ?5, question_count = ?6, total_points = ?7, duration_min = ?8,
            opens_at = ?9, closes_at = ?10, max_attempts = ?11, show_answers = ?12, shuffle_questions = ?13, shuffle_options = ?14, pass_mark = ?15,
-           release_mode = ?16, source_map = ?17, updated_at = ?18 WHERE id = ?1",
+           release_mode = ?16, source_map = ?17, updated_at = ?18, allow_practice = ?19 WHERE id = ?1",
         params![
             id, subject_id, title, description, serde_json::to_string(&questions).map_err(db_err)?, questions.len() as i64, total_of(&questions),
             cfg.duration_min, cfg.opens_at, cfg.closes_at, cfg.max_attempts, cfg.show_answers, cfg.shuffle_questions, cfg.shuffle_options, cfg.pass_mark,
-            cfg.release_mode, serde_json::to_string(&sources).map_err(db_err)?, now
+            cfg.release_mode, serde_json::to_string(&sources).map_err(db_err)?, now, allow_practice
         ],
     )
     .map_err(db_err)?;
+    audit_practice_change(conn, &user.id, id, cur.allow_practice, allow_practice);
     // extending a closing time that had already passed reopens the exam (see `reopen`)
     if base.closes_at.map_or(false, |c| c <= now) && cfg.closes_at.map_or(true, |c| c > now) {
         crate::platform_reminders::reset_results(conn, id);
@@ -490,7 +507,14 @@ pub fn act(conn: &Connection, user: &User, id: &str, action: &str, now: i64) -> 
             if cur.status != "published" {
                 return conflict("invalid_transition");
             }
-            set(Move { status: "closed", closed_at: Some(now), closed_by: Some(actor), archived_at: None, archived_by: None })?;
+            // The closing time is a hard end, and so is closing by hand: every attempt still running is ended in the SAME
+            // transaction (from its autosave, no grace), so nobody keeps writing - or sees an answer - after the close, and
+            // reopening later does not bring them back.
+            atomically(conn, "exam_close", || {
+                set(Move { status: "closed", closed_at: Some(now), closed_by: Some(actor), archived_at: None, archived_by: None })?;
+                settle_on_close(conn, id, now)?;
+                Ok(())
+            })?;
         }
         "reopen" => {
             if cur.status != "closed" {
@@ -912,12 +936,15 @@ mod tests {
         assert_eq!(avail, vec![id.clone()], "an admin exam shows up for enrolled students");
         let started = crate::platform_exams::start_attempt(&w.conn, &student, &id, NOW + 1).expect("no teacher needed to take an admin exam");
         assert_eq!(started.questions.len(), 3);
-        // a closed exam can no longer be started by someone who has no open attempt
+        // a closed exam can no longer be started by anybody - closing is a hard end (phase 4-3), so the attempt that was in
+        // progress is ended by the close itself (nothing was autosaved: expired) and cannot be resumed either
         act(&w.conn, &w.admin, &id, "close", NOW + 2).unwrap();
         let other = insert_test_user(&w.conn, "s2@x.com", "student", "active");
         w.conn.execute("INSERT INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1, 's1', 0)", params![other.id]).unwrap();
         assert!(crate::platform_exams::start_attempt(&w.conn, &other, &id, NOW + 3).is_err(), "closed exams refuse new attempts");
-        assert!(crate::platform_exams::start_attempt(&w.conn, &student, &id, NOW + 3).unwrap().resumed, "an attempt already in progress can still be resumed");
+        let status: String = w.conn.query_row("SELECT status FROM attempts WHERE id = ?1", params![started.attempt_id], |r| r.get(0)).unwrap();
+        assert_eq!(status, "expired", "the sitting in progress was ended by the close");
+        assert!(crate::platform_exams::start_attempt(&w.conn, &student, &id, NOW + 3).is_err(), "…so it cannot be resumed");
         assert!(crate::platform_exams::list_available(&w.conn, &other.id).unwrap().is_empty(), "closed exams leave the student's 'available' list");
     }
 

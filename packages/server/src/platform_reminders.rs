@@ -17,6 +17,7 @@
 use crate::platform::{db_err, Res};
 use crate::platform_content::{exam_standing, visible};
 use crate::platform_engage::notify;
+use crate::platform_exams::GRACE_MS;
 use crate::relay::now_ms;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
@@ -132,7 +133,7 @@ fn deliver(conn: &Connection, assessment_id: &str, student_id: &str, kind: &str,
 }
 
 /// Active students enrolled in `subject_id` who have no attempt of any status on the exam and no `kind` marker yet: the
-/// people "closing" and "opened" are for ("has not taken it": an abandoned attempt is already settled at its deadline).
+/// people "opened" is for ("has not taken it": an abandoned attempt is already settled at its deadline).
 fn untouched_students(conn: &Connection, subject_id: &str, exam_id: &str, kind: &str) -> Res<Vec<String>> {
     conn.prepare(
         "SELECT e.student_id FROM subject_enrollments e JOIN users st ON st.id = e.student_id
@@ -147,11 +148,36 @@ fn untouched_students(conn: &Connection, subject_id: &str, exam_id: &str, kind: 
     .map_err(db_err)
 }
 
-/// Reminds students who have not started an exam closing within 24 hours.
+/// The people a "closing soon" reminder is for (phase 4-3): active students enrolled in `subject_id` who have no `closing`
+/// marker yet and who
+/// * have not touched the exam at all (no attempt of any status), or
+/// * are sitting it right now - the closing time is a hard end, so a running attempt is submitted automatically at that
+///   moment, whatever else is true of them, or
+/// * still have attempts left and have never handed one in (an abandoned or expired attempt does not count as finished).
+///
+/// Nobody else: a student who used every attempt, or who already handed one in and is not sitting another, gets nothing.
+fn closing_audience(conn: &Connection, subject_id: &str, exam_id: &str, max_attempts: i64) -> Res<Vec<String>> {
+    conn.prepare(
+        "SELECT e.student_id FROM subject_enrollments e JOIN users st ON st.id = e.student_id
+          WHERE e.subject_id = ?1 AND st.role = 'student' AND st.status = 'active'
+            AND NOT EXISTS(SELECT 1 FROM exam_reminders r WHERE r.assessment_id = ?2 AND r.student_id = e.student_id AND r.kind = 'closing')
+            AND (NOT EXISTS(SELECT 1 FROM attempts t WHERE t.assessment_id = ?2 AND t.student_id = e.student_id)
+                 OR EXISTS(SELECT 1 FROM attempts t WHERE t.assessment_id = ?2 AND t.student_id = e.student_id AND t.status = 'in_progress')
+                 OR ((SELECT count(*) FROM attempts t WHERE t.assessment_id = ?2 AND t.student_id = e.student_id) < ?3
+                     AND NOT EXISTS(SELECT 1 FROM attempts t WHERE t.assessment_id = ?2 AND t.student_id = e.student_id AND t.status = 'submitted')))",
+    )
+    .map_err(db_err)?
+    .query_map(params![subject_id, exam_id, max_attempts], |r| r.get(0))
+    .map_err(db_err)?
+    .collect::<Result<_, _>>()
+    .map_err(db_err)
+}
+
+/// Reminds the students an exam closing within 24 hours matters to ([`closing_audience`]).
 fn remind_closing(conn: &Connection, now: i64) -> Res<usize> {
-    let exams: Vec<(String, String, String, i64)> = conn
+    let exams: Vec<(String, String, String, i64, i64)> = conn
         .prepare(&format!(
-            "SELECT a.id, a.title, a.subject_id, a.closes_at FROM assessments a
+            "SELECT a.id, a.title, a.subject_id, a.closes_at, a.max_attempts FROM assessments a
                LEFT JOIN users u ON u.id = a.teacher_id JOIN subjects s ON s.id = a.subject_id
               WHERE a.status = 'published' AND a.closes_at > ?1 AND a.closes_at <= ?1 + ?2
                 AND (a.opens_at IS NULL OR a.opens_at <= ?1)
@@ -160,14 +186,14 @@ fn remind_closing(conn: &Connection, now: i64) -> Res<usize> {
             exam_standing("a")
         ))
         .map_err(db_err)?
-        .query_map(params![now, CLOSING_LEAD_MS, AFTER_ANNOUNCE_MS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .query_map(params![now, CLOSING_LEAD_MS, AFTER_ANNOUNCE_MS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
         .map_err(db_err)?
         .collect::<Result<_, _>>()
         .map_err(db_err)?;
     let mut sent = 0;
-    for (id, title, subject_id, closes_at) in exams {
+    for (id, title, subject_id, closes_at, max_attempts) in exams {
         let tx = conn.unchecked_transaction().map_err(db_err)?;
-        let students = untouched_students(&tx, &subject_id, &id, "closing")?;
+        let students = closing_audience(&tx, &subject_id, &id, max_attempts)?;
         let link = format!("/platform/assessments/{id}");
         for st in &students {
             if deliver(&tx, &id, st, "closing", now, json!({ "title": title, "closes_at": closes_at }), &link)? {
@@ -270,13 +296,15 @@ fn remind_live(conn: &Connection, now: i64) -> Res<usize> {
     Ok(sent)
 }
 
-/// The moment an `after_close` exam's results became visible: its closing time or the manual close,
-/// whichever came first (matches `platform_exams::is_released`).
+/// The moment an `after_close` exam's results became visible: the manual close, or the closing time plus the grace after it
+/// (the last moment an attempt that ends at the closing time can still be handed in), whichever came first (matches
+/// `platform_exams::is_released`, which turns true one millisecond later).
 fn release_moment(status: &str, closes_at: Option<i64>, closed_at: Option<i64>, updated_at: i64) -> Option<i64> {
     let manual = matches!(status, "closed" | "archived").then(|| closed_at.unwrap_or(updated_at));
-    match (manual, closes_at) {
-        (Some(m), Some(c)) => Some(m.min(c)),
-        (m, c) => m.or(c),
+    let timed = closes_at.map(|c| c + GRACE_MS);
+    match (manual, timed) {
+        (Some(m), Some(t)) => Some(m.min(t)),
+        (m, t) => m.or(t),
     }
 }
 /// Tells students with a submitted attempt that the result of a closed `after_close` exam is now visible.
@@ -288,13 +316,13 @@ fn announce_released(conn: &Connection, now: i64) -> Res<usize> {
             "SELECT a.id, a.title, a.status, a.closes_at, a.closed_at, a.updated_at FROM assessments a
                LEFT JOIN users u ON u.id = a.teacher_id JOIN subjects s ON s.id = a.subject_id
               WHERE a.release_mode = 'after_close' AND a.status IN ('published','closed')
-                AND (a.status = 'closed' OR a.closes_at <= ?1)
+                AND (a.status = 'closed' OR a.closes_at + ?3 < ?1)
                 AND COALESCE(a.closed_at, a.closes_at, a.updated_at) >= ?2
                 AND {}",
             exam_standing("a")
         ))
         .map_err(db_err)?
-        .query_map(params![now, now - RELEASE_LOOKBACK_MS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+        .query_map(params![now, now - RELEASE_LOOKBACK_MS, GRACE_MS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
         .map_err(db_err)?
         .collect::<Result<_, _>>()
         .map_err(db_err)?;
@@ -334,6 +362,12 @@ fn announce_released(conn: &Connection, now: i64) -> Res<usize> {
 
 /// Runs every job. A failure in one does not stop the others (it is retried by the next sweep).
 pub fn sweep(conn: &Connection, now: i64) -> Sweep {
+    // Attempts whose end (the duration, or the exam's closing time) has gone by are settled first, so nobody counts as "still
+    // sitting it" past their end and every attempt that ended at the closing time is a submitted one by the time the
+    // results are announced.
+    if let Err(e) = crate::platform_exams::settle_all(conn, now) {
+        eprintln!("Platform: settling overdue attempts failed: {}", e.1);
+    }
     let closing = remind_closing(conn, now).unwrap_or_else(|e| {
         eprintln!("Platform: closing reminders failed: {}", e.1);
         0
@@ -470,14 +504,16 @@ mod tests {
         take(&w, &w.students[0], &id, T0 + 2 * H, 10 * MIN);
         take(&w, &w.students[1], &id, T0 + 2 * H, 10 * MIN);
         start_attempt(&w.conn, &w.students[2], &id, T0 + 3 * H).unwrap();
-        // 23 h to go: due
+        // 23 h to go: due. Since phase 4-3 the closing time is a hard end, so the one still sitting it is told as well
+        // (their attempt will be handed in at that moment); the two who finished are left alone
         let first = sweep(&w.conn, T0 + 7 * H);
-        assert_eq!(first, Sweep { closing: 2, ..Default::default() });
+        assert_eq!(first, Sweep { closing: 3, ..Default::default() });
         assert_eq!((count_for(&w, &w.students[3], "exam_closing"), count_for(&w, &w.students[4], "exam_closing")), (1, 1));
-        for who in &w.students[..3] {
-            assert_eq!(count_for(&w, who, "exam_closing"), 0, "someone who already started or finished is left alone");
+        assert_eq!(count_for(&w, &w.students[2], "exam_closing"), 1, "a running attempt is submitted at the closing time: worth knowing");
+        for who in &w.students[..2] {
+            assert_eq!(count_for(&w, who, "exam_closing"), 0, "someone who already finished is left alone");
         }
-        assert_eq!(count(&w, "exam_closing"), 2, "not the suspended student, not other subjects, not people without an enrolment");
+        assert_eq!(count(&w, "exam_closing"), 3, "not the suspended student, not other subjects, not people without an enrolment");
         // the stored notification carries what the client needs to render it
         let (data, link): (String, String) = w.conn.query_row("SELECT data, link FROM notifications WHERE kind = 'exam_closing' LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         let data: serde_json::Value = serde_json::from_str(&data).unwrap();
@@ -487,7 +523,55 @@ mod tests {
         for step in [MIN, 5 * MIN, H, 10 * H, 22 * H] {
             assert_eq!(sweep(&w.conn, T0 + 7 * H + step), Sweep::default(), "no duplicate after {step}");
         }
-        assert_eq!((count(&w, "exam_closing"), markers(&w, "closing")), (2, 2));
+        assert_eq!((count(&w, "exam_closing"), markers(&w, "closing")), (3, 3));
+    }
+
+    /// Phase 4-3: the closing time is a hard end, so the reminder is also for whoever is sitting the exam right now and for
+    /// whoever still has attempts and has never handed one in - and for nobody who is finished.
+    #[test]
+    fn the_closing_reminder_goes_to_everyone_it_matters_to_and_to_nobody_else() {
+        let w = world();
+        let id = exam(&w, serde_json::json!({ "closes_at": T0 + 30 * H, "max_attempts": 2 }), T0);
+        let raw = |who: &User, status: &str, started: i64| {
+            let submitted: Option<i64> = (status == "submitted").then_some(started + MIN);
+            w.conn
+                .execute(
+                    "INSERT INTO attempts(id, assessment_id, student_id, started_at, submitted_at, status) VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![crate::platform::new_id(), id, who.id, started, submitted, status],
+                )
+                .unwrap();
+        };
+        let extra = insert_test_user(&w.conn, "extra@x.com", "student", "active");
+        w.conn.execute("INSERT INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1,'s1',0)", params![extra.id]).unwrap();
+        let extra2 = insert_test_user(&w.conn, "extra2@x.com", "student", "active");
+        w.conn.execute("INSERT INTO subject_enrollments(student_id, subject_id, created_at) VALUES (?1,'s1',0)", params![extra2.id]).unwrap();
+        // 0: sitting it right now (the first attempt)
+        raw(&w.students[0], "in_progress", T0 + 3 * H);
+        // 1: one attempt that expired, one left, never finished
+        raw(&w.students[1], "expired", T0 + H);
+        // 2: finished (submitted) with an attempt to spare
+        raw(&w.students[2], "submitted", T0 + H);
+        // 3: used both attempts, neither finished, nothing running
+        raw(&w.students[3], "expired", T0 + H);
+        raw(&w.students[3], "expired", T0 + 2 * H);
+        // 4: nothing at all (as before)
+        // extra: the last attempt is running - every attempt is used, but the hard end is coming for this one
+        raw(&extra, "expired", T0 + H);
+        raw(&extra, "in_progress", T0 + 3 * H);
+        // extra2: finished once and sitting a second attempt now
+        raw(&extra2, "submitted", T0 + H);
+        raw(&extra2, "in_progress", T0 + 3 * H);
+        let first = sweep(&w.conn, T0 + 7 * H);
+        assert_eq!(first, Sweep { closing: 5, ..Default::default() });
+        for (who, expected) in [(&w.students[0], 1), (&w.students[1], 1), (&w.students[2], 0), (&w.students[3], 0), (&w.students[4], 1), (&extra, 1), (&extra2, 1)] {
+            assert_eq!(count_for(&w, who, "exam_closing"), expected, "{}", who.email);
+        }
+        // exactly once, however many sweeps follow - also for the ones that start or finish afterwards
+        raw(&w.students[2], "expired", T0 + 8 * H);
+        for step in [MIN, H, 10 * H] {
+            assert_eq!(sweep(&w.conn, T0 + 7 * H + step), Sweep::default(), "no duplicate after {step}");
+        }
+        assert_eq!((count(&w, "exam_closing"), markers(&w, "closing")), (5, 5));
     }
 
     #[test]
@@ -599,13 +683,21 @@ mod tests {
         let a0 = take(&w, &w.students[0], &id, T0 + 10 * MIN, 5 * MIN);
         let a1 = take(&w, &w.students[1], &id, T0 + 20 * MIN, 5 * MIN);
         start_attempt(&w.conn, &w.students[2], &id, T0 + 30 * MIN).unwrap(); // never submitted
-        // a late starter who finishes after the exam closed sees the result at once, so no notification
+        // a late starter, who hands in during the grace after the closing time (the last moment anything can still land)
         let late = start_attempt(&w.conn, &w.students[4], &id, T0 + 2 * H - MIN).unwrap();
+        submit_attempt(&w.conn, &w.students[4], &late.attempt_id, &answers(), T0 + 2 * H + GRACE_MS / 2).unwrap();
         // not closed yet
         assert_eq!(sweep(&w.conn, T0 + H).released, 0);
-        // closed
-        assert_eq!(sweep(&w.conn, T0 + 2 * H).released, 2);
-        assert_eq!((count_for(&w, &w.students[0], "exam_results"), count_for(&w, &w.students[1], "exam_results")), (1, 1));
+        // the announcement and the embargo turn at the same moment: the sweep says "available" exactly when `is_released` does
+        let embargo = |t: i64| crate::platform_exams::is_released("after_close", "published", Some(T0 + 2 * H), t);
+        assert!(!embargo(T0 + 2 * H + GRACE_MS) && embargo(T0 + 2 * H + GRACE_MS + 1));
+        // The closing time is a hard end (phase 4-3): an attempt that ends at it may still be handed in for the grace after
+        // it, so nothing is released - or announced - until that has run out too
+        assert_eq!(sweep(&w.conn, T0 + 2 * H).released, 0, "the closing time itself");
+        assert_eq!(sweep(&w.conn, T0 + 2 * H + GRACE_MS).released, 0, "the last millisecond anything can still land");
+        // the next millisecond: both attempts that were handed in, and the late one, are told - the sitting nobody finished is not
+        assert_eq!(sweep(&w.conn, T0 + 2 * H + GRACE_MS + 1).released, 3);
+        assert_eq!((count_for(&w, &w.students[0], "exam_results"), count_for(&w, &w.students[1], "exam_results"), count_for(&w, &w.students[4], "exam_results")), (1, 1, 1));
         let link: String = w.conn.query_row("SELECT link FROM notifications WHERE kind = 'exam_results' AND user_id = ?1", params![w.students[0].id], |r| r.get(0)).unwrap();
         assert_eq!(link, format!("/platform/attempts/{a0}"));
         assert_ne!(a0, a1);
@@ -613,11 +705,11 @@ mod tests {
         for step in [MIN, H, 3 * 24 * H] {
             assert_eq!(sweep(&w.conn, T0 + 2 * H + step).released, 0);
         }
-        submit_attempt(&w.conn, &w.students[4], &late.attempt_id, &answers(), T0 + 2 * H + 5 * MIN).unwrap();
-        assert_eq!(sweep(&w.conn, T0 + 2 * H + 10 * MIN).released, 0, "submitted after the close: saw the result immediately");
-        assert_eq!(count(&w, "exam_results"), 2);
-        assert_eq!(count_for(&w, &w.students[2], "exam_results"), 0, "never submitted");
+        assert_eq!(count(&w, "exam_results"), 3);
+        assert_eq!(count_for(&w, &w.students[2], "exam_results"), 0, "never submitted: the sweep ended the sitting without an answer");
         assert_eq!(count_for(&w, &w.students[3], "exam_results"), 0, "never took it");
+        let status: String = w.conn.query_row("SELECT status FROM attempts WHERE student_id = ?1", params![w.students[2].id], |r| r.get(0)).unwrap();
+        assert_eq!(status, "expired", "the closing time ended the attempt that was still running");
     }
 
     #[test]
@@ -684,10 +776,13 @@ mod tests {
     }
 
     #[test]
-    fn release_moment_is_the_earlier_of_the_closing_time_and_the_manual_close() {
-        assert_eq!(release_moment("published", Some(100), None, 500), Some(100));
-        assert_eq!(release_moment("closed", Some(100), Some(60), 500), Some(60), "closed by hand before the deadline");
-        assert_eq!(release_moment("closed", Some(100), Some(160), 500), Some(100), "closed by hand after the deadline passed");
+    fn release_moment_is_the_earlier_of_the_closing_time_plus_grace_and_the_manual_close() {
+        let c = 1_000_000;
+        // by time: the closing time is a hard end, and an attempt that ends at it can still land for the grace after it
+        assert_eq!(release_moment("published", Some(c), None, 5), Some(c + GRACE_MS));
+        assert_eq!(release_moment("closed", Some(c), Some(c - 400_000), 5), Some(c - 400_000), "closed by hand before the closing time");
+        assert_eq!(release_moment("closed", Some(c), Some(c + GRACE_MS / 2), 5), Some(c + GRACE_MS / 2), "closed by hand inside the grace");
+        assert_eq!(release_moment("closed", Some(c), Some(c + 10 * GRACE_MS), 5), Some(c + GRACE_MS), "closed by hand long after the grace ran out");
         assert_eq!(release_moment("closed", None, Some(60), 500), Some(60));
         assert_eq!(release_moment("closed", None, None, 500), Some(500), "falls back to the last change");
         assert_eq!(release_moment("published", None, None, 500), None);

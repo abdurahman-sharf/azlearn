@@ -1,4 +1,5 @@
 import { nextTick, onBeforeUnmount, watch, type Ref } from 'vue'
+import { tabStopIndexes } from '@/utils/dialogFocus'
 
 const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'
 
@@ -13,7 +14,10 @@ export function useDialog(open: Ref<boolean>, container: Ref<HTMLElement | null>
   let listening = false
 
   function items(): HTMLElement[] {
-    return [...(container.value?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [])].filter((el) => el.offsetParent !== null || el === document.activeElement)
+    const all = [...(container.value?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [])].filter((el) => el.offsetParent !== null || el === document.activeElement)
+    // a radio group is ONE tab stop (its checked radio): the trap's first and last element must be real stops
+    const radio = (el: HTMLElement): el is HTMLInputElement => el instanceof HTMLInputElement && el.type === 'radio'
+    return tabStopIndexes(all.map((el) => ({ isRadio: radio(el), name: radio(el) ? el.name : '', checked: radio(el) ? el.checked : false }))).map((i) => all[i]!)
   }
 
   function onKey(e: KeyboardEvent) {

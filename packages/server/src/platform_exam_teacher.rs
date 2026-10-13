@@ -946,6 +946,8 @@ mod tests {
             // the exam (AssessmentInfo)
             "id", "teacher_id", "teacher_name", "subject_id", "subject_name", "title", "description", "question_count", "total_points", "duration_min", "opens_at", "closes_at",
             "max_attempts", "show_answers", "status", "attempts_used", "attempt_count", "shuffle_questions", "shuffle_options", "pass_mark", "release_mode", "closed_at", "archived_at", "created_by",
+            // practice mode (phase 4-3)
+            "allow_practice",
             // what the builder adds
             "phase", "can_edit", "owned", "locked", "submitted", "pending_answers", "visible", "hidden_reason", "questions", "sources",
         ]
@@ -976,7 +978,7 @@ mod tests {
         let r: ExamReq = serde_json::from_value(json!({
             "subject_id": "s1", "title": "ت", "description": "و", "questions": [], "sources": {"q": "b"}, "duration_min": 5, "clear_duration": false,
             "opens_at": 1, "clear_opens": false, "closes_at": 2, "clear_closes": false, "max_attempts": 2, "show_answers": true, "shuffle_questions": true,
-            "shuffle_options": true, "pass_mark": 50.5, "clear_pass_mark": false, "release_mode": "immediate", "status": "draft"
+            "shuffle_options": true, "pass_mark": 50.5, "clear_pass_mark": false, "release_mode": "immediate", "status": "draft", "allow_practice": true
         }))
         .unwrap();
         assert_eq!((r.max_attempts, r.pass_mark), (Some(2), Some(50.5)));

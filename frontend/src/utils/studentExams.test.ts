@@ -52,6 +52,11 @@ eq(rowLinks(row({ ...runningRow, visible: false, best })).result, '/platform/att
 eq(runningButUnreachable(row({ ...runningRow, visible: false })), true, 'running and unreachable')
 eq(runningButUnreachable(row({ ...runningRow, visible: true })), false, 'running and reachable')
 eq(runningButUnreachable(row({ visible: false })), false, 'not running')
+// the server says whether the running attempt can be re-entered: an enrolled student gets back into a sitting whose exam was hidden meanwhile
+eq(rowLinks(row({ ...runningRow, visible: false, can_resume: true })), { start: null, resume: '/platform/assessments/e1/take', result: null }, 'hidden meanwhile but still enrolled: resume')
+eq(runningButUnreachable(row({ ...runningRow, visible: false, can_resume: true })), false, 'so it is not "unreachable"')
+eq(rowLinks(row({ ...runningRow, visible: true, can_resume: false })).resume, null, 'not enrolled any more: no resume (the server answers 404 / 403)')
+eq(runningButUnreachable(row({ ...runningRow, visible: false, can_resume: false })), true, 'running and unreachable')
 
 // --- the state chip -------------------------------------------------------------------------------------------------------
 eq(stateChip('missed', 'not_enrolled'), 'not_enrolled', 'open but not enrolled is never "missed"')

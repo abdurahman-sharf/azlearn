@@ -152,7 +152,8 @@ const headerStyle = {
 </script>
 
 <template>
-  <div class="min-h-screen flex flex-col" :style="{ backgroundColor: 'rgb(var(--md-surface))' }">
+  <!-- --shell-top: what sits above the header (the desktop title bar, or the phone's safe-area inset), so a page can stick something right under the header -->
+  <div class="min-h-screen flex flex-col" :style="{ backgroundColor: 'rgb(var(--md-surface))', '--shell-top': isDesktopTauri ? '38px' : 'env(safe-area-inset-top, 0px)' }">
     <!-- ====== Desktop TitleBar (Tauri only) ====== -->
     <TitleBar v-if="isDesktopTauri" />
 

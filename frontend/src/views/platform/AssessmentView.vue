@@ -9,11 +9,17 @@ import { getAssessment, type AssessmentDetail } from '@/api/platformExams'
 import { adminExams, type ExamAction } from '@/api/platformExamAdmin'
 import PageError from '@/components/platform/PageError.vue'
 import ConfirmDeleteDialog from '@/components/platform/ConfirmDeleteDialog.vue'
+import ConfirmDialog from '@/components/platform/ConfirmDialog.vue'
 import PageLoading from '@/components/platform/PageLoading.vue'
 import { PlatformError } from '@/lib/platformApi'
 import { enroll } from '@/api/platformLearning'
 import { countdown, openRecheck, reasonKey, stateChip } from '@/utils/studentExams'
 import { useStudentStats } from '@/lib/studentStats'
+import { examClock } from '@/utils/serverClock'
+import { setStartFlag } from '@/utils/startFlag'
+import { startPreview } from '@/utils/startPreview'
+import { practiceAccess } from '@/utils/practiceGate'
+import { fillTemplate } from '@/utils/notificationText'
 
 const pt = usePt()
 const auth = useAuthStore()
@@ -29,7 +35,12 @@ const fmt = (ms: number) => new Date(ms).toLocaleString(i18n.locale === 'ar' ? '
 
 async function load() {
   try {
-    a.value = await getAssessment(id)
+    const t0 = Date.now()
+    const d = await getAssessment(id)
+    // the page measures how far this device's clock is from the server's (round-trip corrected): the end time the start
+    // dialog shows, and later the exam timer, follow the server's clock
+    examClock.sync(d.server_now, t0, Date.now())
+    a.value = d
   } catch (e) {
     error.value = platformErrorMessage(pt, e)
   }
@@ -118,6 +129,56 @@ async function enrollHere() {
     enrolling.value = false
   }
 }
+// ── starting: a confirmation first (what the attempt will be and when it really ends), and a choice between a graded attempt
+// and a practice one when the teacher allows practice. Nothing starts from here: the take page starts (or resumes) the attempt.
+const starting = ref(false)
+const startMode = ref<'graded' | 'practice'>('graded')
+const previewNow = ref(Date.now())
+const preview = computed(() =>
+  startPreview({ now: previewNow.value, durationMin: a.value?.duration_min, closesAt: a.value?.closes_at, attemptsUsed: a.value?.attempts_used ?? 0, maxAttempts: a.value?.max_attempts ?? 1 }),
+)
+function openStart() {
+  startMode.value = 'graded'
+  previewNow.value = examClock.now()
+  starting.value = true
+}
+function confirmStart() {
+  starting.value = false
+  if (startMode.value === 'practice' && practice.value === 'available') {
+    router.push(`/platform/assessments/${id}/practice`)
+    return
+  }
+  // the take page starts a NEW attempt only while this confirmation is fresh (a link, a reload or the back button never does)
+  setStartFlag(id)
+  router.push(`/platform/assessments/${id}/take`)
+}
+/**
+ * What this student is offered about practice right now (the server decides for real): the link, a "later" hint, or nothing.
+ * Never while their graded attempt is running (the key is not for the sitting they are in), nor before the exam opens, nor
+ * while the results are withheld and not yet released.
+ */
+const practice = computed(() =>
+  a.value && isStudent.value
+    ? practiceAccess({
+        allowPractice: a.value.allow_practice,
+        reason: a.value.reason,
+        state: running.value ? 'in_progress' : a.value.state,
+        status: a.value.status,
+        opensAt: a.value.opens_at,
+        releaseMode: a.value.release_mode,
+        closesAt: a.value.closes_at,
+        now: examClock.now(),
+      })
+    : 'hidden',
+)
+// ── closing an exam is final for the attempts in progress: they are submitted from their last autosave at once and reopening
+// does not bring them back, so it is confirmed first
+const closing = ref(false)
+function confirmClose() {
+  closing.value = false
+  void act('close')
+}
+
 const now = ref(Date.now())
 let tick: ReturnType<typeof setInterval> | null = null
 const waitingToOpen = computed(() => isStudent.value && a.value?.state === 'upcoming' && !!a.value.opens_at)
@@ -202,13 +263,18 @@ onMounted(load)
       </div>
       <section v-if="a.can_start && !a.in_progress_attempt" class="card-filled p-4 mb-4 space-y-1" data-testid="exam-rules">
         <h2 class="font-bold">{{ pt('tkRulesTitle') }}</h2>
-        <ul class="list-disc ps-5 text-body-sm space-y-0.5"><li>{{ pt('tkRules1') }}</li><li>{{ pt('tkRules2') }}</li><li v-if="a.shuffle_questions || a.shuffle_options">{{ pt('tkRules3') }}</li><li>{{ pt('tkRules4') }}</li></ul>
+        <ul class="list-disc ps-5 text-body-sm space-y-0.5"><li>{{ pt('tkRules1') }}</li><li>{{ pt('tkRules2') }}</li><li v-if="a.shuffle_questions || a.shuffle_options">{{ pt('tkRules3') }}</li><li>{{ pt('tkRules4') }}</li><li data-testid="exam-rules-hard-end">{{ pt('tkRulesHardEnd') }}</li></ul>
       </section>
       <p class="text-body-sm mb-3">{{ pt('attemptsUsed') }}: <span dir="ltr" class="inline-block">{{ a.attempts_used }} / {{ a.max_attempts }}</span></p>
       <!-- the server decides (can_start also covers resuming a running attempt); the label says which -->
-      <router-link v-if="a.can_start" :to="`/platform/assessments/${a.id}/take`" class="btn-filled inline-flex mb-4" :data-testid="running ? 'exam-resume' : 'exam-start'">
-        {{ running ? pt('resumeAssessment') : pt('startAssessment') }}
-      </router-link>
+      <router-link v-if="a.can_start && running" :to="`/platform/assessments/${a.id}/take`" class="btn-filled inline-flex mb-4" data-testid="exam-resume">{{ pt('resumeAssessment') }}</router-link>
+      <button v-else-if="a.can_start" type="button" class="btn-filled inline-flex mb-4" data-testid="exam-start" @click="openStart">{{ pt('startAssessment') }}</button>
+      <!-- practice: the questions with their answers, graded by nobody (available when the exam is closed or the attempts are used up too) -->
+      <div v-if="practice !== 'hidden'" class="card-filled p-4 mb-4 flex flex-wrap items-center gap-3" data-testid="exam-practice-card">
+        <p class="text-body-sm flex-1 min-w-0">{{ pt('examPracticeHint') }}</p>
+        <router-link v-if="practice === 'available'" :to="`/platform/assessments/${a.id}/practice`" class="btn-tonal" data-testid="exam-practice">{{ pt('examPractice') }}</router-link>
+        <p v-else class="text-body-sm w-full font-semibold" data-testid="exam-practice-later">{{ pt('prcNotAvailable') }}</p>
+      </div>
       <ul class="space-y-2">
         <li v-for="t in a.attempts.filter(x => x.status !== 'in_progress')" :key="t.attempt_id">
           <router-link :to="`/platform/attempts/${t.attempt_id}`" class="card-filled block p-3">
@@ -231,7 +297,7 @@ onMounted(load)
       <router-link v-if="isOwner" to="/platform/exams" class="btn-text" data-testid="exam-open-mine">{{ pt('mexTitle') }}</router-link>
       <template v-if="isAdmin">
         <button v-if="a.status === 'published' && !hasStarted" class="btn-outlined" :disabled="busy" data-testid="exam-unpublish" @click="act('unpublish')">{{ pt('unpublish') }}</button>
-        <button v-if="a.status === 'published'" class="btn-outlined" :disabled="busy" data-testid="exam-close" @click="act('close')">{{ pt('exClose') }}</button>
+        <button v-if="a.status === 'published'" class="btn-outlined" :disabled="busy" data-testid="exam-close" @click="closing = true">{{ pt('exClose') }}</button>
         <button v-if="a.status === 'closed'" class="btn-outlined" :disabled="busy" data-testid="exam-reopen" @click="act('reopen')">{{ pt('exReopen') }}</button>
         <button v-if="a.status === 'draft' || a.status === 'closed'" class="btn-outlined" :disabled="busy" data-testid="exam-archive" @click="act('archive')">{{ pt('exArchive') }}</button>
         <button v-if="a.status === 'archived'" class="btn-outlined" :disabled="busy" data-testid="exam-restore" @click="act('restore')">{{ pt('exRestore') }}</button>
@@ -241,6 +307,48 @@ onMounted(load)
       </template>
     </div>
     <p v-if="isAdmin && hasStarted" class="text-body-sm mt-2" data-testid="exam-admin-hint" style="color: rgb(var(--md-on-surface-variant))">{{ pt('adminExamsHint') }}</p>
+    <ConfirmDialog
+      v-if="starting"
+      testid="start-confirm"
+      :title="pt('scTitle')"
+      :message="pt('scMessage')"
+      :confirm-label="startMode === 'practice' ? pt('scConfirmPractice') : pt('scConfirmGraded')"
+      @confirm="confirmStart"
+      @close="starting = false"
+    >
+      <ul v-if="startMode === 'graded'" class="list-disc ps-5 text-body-md space-y-1" data-testid="start-confirm-details">
+        <li data-testid="start-confirm-duration">
+          {{ pt('scDuration') }}:
+          <template v-if="preview.durationMin"><span dir="ltr" class="inline-block font-semibold">{{ preview.durationMin }}</span> {{ pt('minutesShort') }}</template>
+          <template v-else>{{ pt('scOpenEnded') }}</template>
+        </li>
+        <li data-testid="start-confirm-end">
+          <template v-if="preview.endsAt">{{ pt('scEnds') }}: <span class="font-semibold" dir="auto">{{ fmt(preview.endsAt) }}</span><template v-if="preview.limitedByClosing"> <span data-testid="start-confirm-limited">{{ pt('scEndsClosing') }}</span></template></template>
+          <template v-else>{{ pt('scNoEnd') }}</template>
+        </li>
+        <li data-testid="start-confirm-attempt">{{ fillTemplate(pt('scAttemptOf'), { k: preview.attemptNo, n: preview.attemptsMax }) }}</li>
+      </ul>
+      <fieldset v-if="practice === 'available'" class="space-y-2" data-testid="start-mode">
+        <legend class="font-semibold mb-1">{{ pt('scModeLegend') }}</legend>
+        <label class="flex items-start gap-3 card-filled p-3 cursor-pointer">
+          <input v-model="startMode" type="radio" name="start-mode" value="graded" class="mt-1 h-5 w-5" data-testid="start-mode-graded" />
+          <span><span class="block font-semibold">{{ pt('scModeGraded') }}</span><span class="block text-body-sm">{{ pt('scModeGradedHint') }}</span></span>
+        </label>
+        <label class="flex items-start gap-3 card-filled p-3 cursor-pointer">
+          <input v-model="startMode" type="radio" name="start-mode" value="practice" class="mt-1 h-5 w-5" data-testid="start-mode-practice" />
+          <span><span class="block font-semibold">{{ pt('scModePractice') }}</span><span class="block text-body-sm">{{ pt('scModePracticeHint') }}</span></span>
+        </label>
+      </fieldset>
+    </ConfirmDialog>
+    <ConfirmDialog
+      v-if="closing"
+      testid="close-confirm"
+      :title="pt('exCloseConfirmTitle')"
+      :message="pt('exCloseConfirmMsg')"
+      :confirm-label="pt('exCloseConfirmYes')"
+      @confirm="confirmClose"
+      @close="closing = false"
+    />
     <ConfirmDeleteDialog
       v-if="removing"
       :title="`${pt('del')}: ${a.title}`"

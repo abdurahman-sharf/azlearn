@@ -11,6 +11,7 @@ import { isHiddenFromStudents } from '@/utils/contentHub'
 import { usableSubjects } from '@/utils/teachingCards'
 import { MY_PER, MY_TABS, clampPage, filtersFromQuery, filtersToQuery, listFilter, rowActions, type MyFilters, type MyTab, type RowAction } from '@/utils/myExams'
 import ConfirmDeleteDialog from '@/components/platform/ConfirmDeleteDialog.vue'
+import ConfirmDialog from '@/components/platform/ConfirmDialog.vue'
 import HiddenWhy from '@/components/platform/HiddenWhy.vue'
 
 // "My exams": the teacher's own exams with their state, counts and lifecycle actions (publish, unpublish, close, reopen,
@@ -35,6 +36,9 @@ const teaching = ref<MyTeaching[]>([])
 const teachingKnown = ref(false)
 let seq = 0
 
+// closing is final for the attempts in progress (they are submitted from their last autosave at once, and reopening does not
+// bring them back), so it is confirmed first
+const closing = ref<ExamRow | null>(null)
 const deleting = ref<ExamRow | null>(null)
 const deleteBusy = ref(false)
 const deleteError = ref('')
@@ -157,10 +161,14 @@ const actionLabel = (a: RowAction, e: ExamRow) => `${pt(ACTION_LABEL[a])}: ${e.t
 /** Errors that mean the row is not in the state the page thought: the list is read again so the buttons match. */
 const STALE = new Set(['has_attempts', 'locked', 'archived', 'invalid_transition', 'close_first', 'invalid_time'])
 
-async function onAction(e: ExamRow, a: RowAction) {
+async function onAction(e: ExamRow, a: RowAction, confirmed = false) {
   if (a === 'delete') {
     deleteError.value = ''
     deleting.value = e
+    return
+  }
+  if (a === 'close' && !confirmed) {
+    closing.value = e
     return
   }
   if (acting.value) return
@@ -182,6 +190,12 @@ async function onAction(e: ExamRow, a: RowAction) {
   } finally {
     acting.value = ''
   }
+}
+
+function confirmClose() {
+  const e = closing.value
+  closing.value = null
+  if (e) void onAction(e, 'close', true)
 }
 
 async function confirmDelete() {
@@ -311,6 +325,16 @@ onMounted(async () => {
       <button type="button" class="btn-outlined" :disabled="filters.page + 1 >= pages || loading" data-testid="myexams-next" @click="go(1)">{{ pt('nextPage') }}</button>
     </nav>
 
+    <ConfirmDialog
+      v-if="closing"
+      testid="close-confirm"
+      :title="pt('exCloseConfirmTitle')"
+      :message="pt('exCloseConfirmMsg')"
+      :confirm-label="pt('exCloseConfirmYes')"
+      :items="[closing.title]"
+      @confirm="confirmClose"
+      @close="closing = null"
+    />
     <ConfirmDeleteDialog
       v-if="deleting"
       :title="`${pt('mexDeleteTitle')}: ${deleting.title}`"

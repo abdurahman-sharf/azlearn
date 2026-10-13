@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { usePt, platformErrorMessage, platformAdminErrorMessage, type PlatformKey } from '@/i18n/platform'
 import { useI18nStore } from '@/stores/i18n'
 import SubjectPicker from '@/components/platform/SubjectPicker.vue'
+import ConfirmDialog from '@/components/platform/ConfirmDialog.vue'
 import { deleteExam, examAction, listExams, type ExamAction, type ExamRow, type Phase } from '@/api/platformExamAdmin'
 
 const pt = usePt()
@@ -50,6 +51,15 @@ async function run(row: ExamRow, action: ExamAction) {
   } catch (e) {
     error.value = platformAdminErrorMessage(pt, e)
   }
+}
+
+// closing is final for the attempts in progress (they are submitted from their last autosave at once, and reopening does not
+// bring them back), so it is confirmed first
+const closing = ref<ExamRow | null>(null)
+function confirmClose() {
+  const row = closing.value
+  closing.value = null
+  if (row) void run(row, 'close')
 }
 
 async function remove(row: ExamRow) {
@@ -117,7 +127,7 @@ const tabs: { key: Phase | 'all' | ''; label: PlatformKey }[] = [
           <router-link v-if="e.can_edit && e.status !== 'archived'" :to="`/platform/admin/exams/${e.id}/edit`" class="btn-text" data-testid="act-edit">{{ pt('exEdit') }}</router-link>
           <button v-if="e.can_edit && e.status === 'draft'" class="btn-text" data-testid="act-publish" @click="run(e, 'publish')">{{ pt('exPublish') }}</button>
           <button v-if="e.status === 'published' && e.attempt_count === 0" class="btn-text" data-testid="act-unpublish" @click="run(e, 'unpublish')">{{ pt('exUnpublish') }}</button>
-          <button v-if="e.status === 'published'" class="btn-text" data-testid="act-close" @click="run(e, 'close')">{{ pt('exClose') }}</button>
+          <button v-if="e.status === 'published'" class="btn-text" data-testid="act-close" @click="closing = e">{{ pt('exClose') }}</button>
           <button v-if="e.status === 'closed'" class="btn-text" data-testid="act-reopen" @click="run(e, 'reopen')">{{ pt('exReopen') }}</button>
           <button class="btn-text" data-testid="act-duplicate" @click="run(e, 'duplicate')">{{ pt('exDuplicate') }}</button>
           <button v-if="e.status === 'draft' || e.status === 'closed'" class="btn-text" data-testid="act-archive" @click="run(e, 'archive')">{{ pt('exArchive') }}</button>
@@ -128,6 +138,17 @@ const tabs: { key: Phase | 'all' | ''; label: PlatformKey }[] = [
         </div>
       </li>
     </ul>
+
+    <ConfirmDialog
+      v-if="closing"
+      testid="close-confirm"
+      :title="pt('exCloseConfirmTitle')"
+      :message="pt('exCloseConfirmMsg')"
+      :confirm-label="pt('exCloseConfirmYes')"
+      :items="[closing.title]"
+      @confirm="confirmClose"
+      @close="closing = null"
+    />
 
     <nav v-if="pages > 1" class="flex items-center justify-between gap-3" :aria-label="pt('pageLabel')" data-testid="exam-pager">
       <button class="btn-outlined" :disabled="page === 0 || loading" data-testid="exam-prev" @click="page--; load()">{{ pt('prevPage') }}</button>

@@ -5,6 +5,22 @@
 export const ATTEMPT_DRAFT_PREFIX = 'exameow-attempt-'
 
 export const attemptDraftKey = (attemptId: string) => `${ATTEMPT_DRAFT_PREFIX}${attemptId}`
+/** The questions the student marked for review ("come back to this"). Starts with the draft prefix, so signing out removes it with the drafts. */
+export const attemptMarksKey = (attemptId: string) => `${ATTEMPT_DRAFT_PREFIX}${attemptId}-marks`
+
+/** The answers a stored draft holds: only string values of a plain object count; anything else (corrupt text, an array) is no draft at all. */
+export function parseDraft(raw: string | null | undefined): Record<string, string> {
+  if (!raw) return {}
+  try {
+    const v: unknown = JSON.parse(raw)
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return {}
+    const out: Record<string, string> = {}
+    for (const [k, x] of Object.entries(v)) if (typeof x === 'string') out[k] = x
+    return out
+  } catch {
+    return {}
+  }
+}
 
 type Store = Pick<Storage, 'length' | 'key' | 'removeItem'>
 

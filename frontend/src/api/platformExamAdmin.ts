@@ -51,6 +51,8 @@ export interface ExamInput {
   pass_mark?: number
   clear_pass_mark?: boolean
   release_mode?: 'immediate' | 'after_close'
+  /** practice attempts (answers shown to enrolled students); not frozen by attempts, changeable by the owner at any time */
+  allow_practice?: boolean
   /** create only */
   status?: 'draft' | 'published'
 }

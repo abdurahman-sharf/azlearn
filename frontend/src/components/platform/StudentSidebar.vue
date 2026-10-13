@@ -2,7 +2,7 @@
 import { computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
-  AcademicCapIcon, BellIcon, BookOpenIcon, BookmarkIcon, CalendarDaysIcon, ClipboardDocumentListIcon, Cog6ToothIcon, HomeIcon, MagnifyingGlassIcon,
+  AcademicCapIcon, BellIcon, BookOpenIcon, BookmarkIcon, CalendarDaysIcon, ChartBarIcon, ClipboardDocumentListIcon, Cog6ToothIcon, HomeIcon, MagnifyingGlassIcon,
   PlayCircleIcon, UserCircleIcon, UsersIcon,
 } from '@heroicons/vue/24/outline'
 import { useStudentStats } from '@/lib/studentStats'
@@ -27,6 +27,7 @@ const groups = computed<NavGroup[]>(() => [
     { to: '/platform/my-subjects', label: 'mysubjTitle', icon: BookOpenIcon, testid: 'nav-student-subjects' },
     { to: '/platform/learning', label: 'lrnTitle', icon: PlayCircleIcon, testid: 'nav-student-learning' },
     { to: '/platform/my-exams', label: 'stexTitle', icon: ClipboardDocumentListIcon, badge: examsBadge(stats.value), testid: 'nav-student-exams' },
+    { to: '/platform/progress', label: 'prgTitle', icon: ChartBarIcon, testid: 'nav-student-progress' },
     { to: '/platform/schedule', label: 'schTitle', icon: CalendarDaysIcon, testid: 'nav-student-schedule' },
   ] },
   { key: 'explore', label: 'stuGroupExplore', items: [

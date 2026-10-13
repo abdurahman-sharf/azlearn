@@ -44,7 +44,7 @@ export function setToken(token: string | null) {
   }
 }
 
-export async function platformFetch<T>(path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
+export async function platformFetch<T>(path: string, init: { method?: string; body?: unknown; keepalive?: boolean } = {}): Promise<T> {
   const token = getToken()
   let res: Response
   try {
@@ -55,6 +55,8 @@ export async function platformFetch<T>(path: string, init: { method?: string; bo
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: init.body ? JSON.stringify(init.body) : undefined,
+      // a request sent as the page is being left: the browser finishes it after the page is gone (at most 64 KiB)
+      ...(init.keepalive ? { keepalive: true } : {}),
     })
   } catch {
     throw new PlatformError('network', 0)

@@ -15,6 +15,7 @@ mod platform_content;
 mod platform_engage;
 mod platform_exams;
 mod platform_ops;
+mod platform_practice;
 mod platform_public;
 mod platform_reminders;
 mod platform_search;
@@ -22,6 +23,7 @@ mod platform_settings;
 mod platform_stats;
 mod platform_student;
 mod platform_student_learning;
+mod platform_student_stats;
 mod platform_learning;
 mod platform_teacher;
 mod relay;
@@ -276,6 +278,9 @@ async fn main() {
         // the student's learning hub, live page schedule and calendar file, and saved items (phase 4-2)
         .merge(platform_student_learning::routes())
         .merge(platform_bookmarks::routes())
+        // practice mode (ungraded, shows the answers; writes nothing) and the student's own statistics (phase 4-3)
+        .merge(platform_practice::routes())
+        .merge(platform_student_stats::routes())
         .route("/api/platform/attempts/{id}/answers", axum::routing::put(platform_exams::save_handler))
         .route("/api/platform/attempts/{id}/events", post(platform_exams::event_handler))
         .route("/api/platform/grading/pending", get(platform_grading::pending_handler))

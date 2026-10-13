@@ -67,6 +67,7 @@ fn assessments_ddl(table: &str) -> String {
   shuffle_options INTEGER NOT NULL DEFAULT 0,
   pass_mark REAL,
   release_mode TEXT NOT NULL DEFAULT 'immediate' CHECK (release_mode IN ('immediate','after_close')),
+  allow_practice INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL CHECK (status IN ('draft','published','closed','archived')),
   closed_at INTEGER,
   archived_at INTEGER,
@@ -132,6 +133,9 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     // column existed. They decide `AssessmentInfo::is_locked`.
     crate::platform::add_column_if_missing(conn, "assessments", "closed_by", "TEXT")?;
     crate::platform::add_column_if_missing(conn, "assessments", "archived_by", "TEXT")?;
+    // Practice mode (phase 4-3): whether enrolled students may run the exam as an ungraded practice run that shows the correct
+    // answers. OFF unless the owner switches it on, so every exam from before behaves as it always did.
+    crate::platform::add_column_if_missing(conn, "assessments", "allow_practice", "INTEGER NOT NULL DEFAULT 0")?;
     settle_zero_point_answers(conn)?;
     one_running_attempt_index(conn)?;
     Ok(())
@@ -224,6 +228,93 @@ pub(crate) fn norm_text(s: &str) -> String {
     s.trim().chars().filter_map(fold_char).collect::<String>().to_lowercase()
 }
 
+/// Punctuation that is stripped from the START and END of a fill-in-the-blank answer (never from inside it): the Latin and
+/// Arabic full stop / comma / semicolon / colon / exclamation / question marks, straight and curly quotes, guillemets,
+/// brackets, hyphens and dashes, the underscore. Two things are NOT stripped even though they are listed here, because they
+/// change what the answer means (see [`trim_fill_edges`]): the sign / decimal point of a number (`-5`, `.5`) and a hyphen
+/// glued to the end of a word or number (`Cl-`).
+const FILL_EDGE_PUNCT: &[char] = &[
+    '.', ',', ';', ':', '!', '?', '\u{060C}', '\u{061B}', '\u{061F}', '"', '\'', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}', '\u{00AB}', '\u{00BB}', '(', ')', '[', ']', '{', '}', '-',
+    '\u{2013}', '\u{2014}', '_',
+];
+
+/// Zero-width and bidirectional marks: U+200B-U+200F (zero-width space / non-joiner / joiner, LRM, RLM), the embedding and
+/// override controls U+202A-U+202E, the word joiner and invisible operators U+2060-U+2064, the isolates U+2066-U+2069 and
+/// the byte order mark U+FEFF. They are invisible, so they never decide whether an answer is right.
+fn is_invisible_mark(c: char) -> bool {
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
+fn is_dash(c: char) -> bool {
+    matches!(c, '-' | '\u{2013}' | '\u{2014}')
+}
+
+/// Strips whitespace and [`FILL_EDGE_PUNCT`] from both ends of `s`, repeatedly and in any mix (`( مصر ). ` -> `مصر`), except:
+/// * at the START a hyphen / dash directly followed by a digit (or by `.` and a digit) is the sign of a number, and a `.`
+///   directly followed by a digit is its decimal point: `-5` and `.5` are not `5`;
+/// * at the END a hyphen / dash directly after a letter or a digit belongs to it (`Cl-`, `NO3-`): the ion is not the atom.
+/// A dash that stands apart (`مصر -`, `- مصر`) is decoration and goes like any other punctuation.
+fn trim_fill_edges(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let strip = |c: char| c.is_whitespace() || FILL_EDGE_PUNCT.contains(&c);
+    let digit = |c: Option<&char>| c.map_or(false, |c| c.is_ascii_digit());
+    let mut a = 0;
+    while a < chars.len() && strip(chars[a]) {
+        let c = chars[a];
+        let numeric_sign = is_dash(c) && (digit(chars.get(a + 1)) || (chars.get(a + 1) == Some(&'.') && digit(chars.get(a + 2))));
+        let decimal_point = c == '.' && digit(chars.get(a + 1));
+        if numeric_sign || decimal_point {
+            break;
+        }
+        a += 1;
+    }
+    let mut b = chars.len();
+    while b > a && strip(chars[b - 1]) {
+        if is_dash(chars[b - 1]) && b - 1 > a && chars[b - 2].is_alphanumeric() {
+            break;
+        }
+        b -= 1;
+    }
+    chars[a..b].iter().collect()
+}
+
+/// **The comparison form of a fill-in-the-blank answer** (phase 4-3), used by the automatic marking ([`auto_grade`], which
+/// the key correction re-runs too) for what the student typed AND for each `a|b` alternative of the key, so the two always
+/// meet in the same form. It is [`norm_text`] (trim, no diacritics / tatweel, one alef, ى -> ي, lower case) and then:
+/// Arabic-Indic and Persian digits become 0-9 (U+0660-0669, U+06F0-06F9), the Arabic decimal and thousands separators become
+/// `.` and `,` (U+066B, U+066C), the true minus sign U+2212 becomes `-`, invisible marks are dropped, every run of
+/// whitespace (a no-break space included) is ONE space, and whitespace and the punctuation in [`FILL_EDGE_PUNCT`] are
+/// stripped from both ends ([`trim_fill_edges`]: the sign of a number and a hyphen glued to a word stay). Punctuation inside
+/// the answer stays (`3.5`), and ة / ه are deliberately NOT folded. The browser's `utils/answerCheck.ts` mirrors this and is
+/// tested against the same vectors (`packages/shared/fixtures/fill-blank-vectors.json`).
+pub(crate) fn norm_fill(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut after_space = false;
+    for c in norm_text(s).chars() {
+        let c = match c {
+            '\u{0660}'..='\u{0669}' => char::from(b'0' + (c as u32 - 0x0660) as u8),
+            '\u{06F0}'..='\u{06F9}' => char::from(b'0' + (c as u32 - 0x06F0) as u8),
+            '\u{066B}' => '.',
+            '\u{066C}' => ',',
+            '\u{2212}' => '-',
+            c => c,
+        };
+        if is_invisible_mark(c) {
+            continue;
+        }
+        if c.is_whitespace() {
+            if !after_space {
+                out.push(' ');
+            }
+            after_space = true;
+        } else {
+            out.push(c);
+            after_space = false;
+        }
+    }
+    trim_fill_edges(&out)
+}
+
 /// Maps Arabic true/false words onto the relay's A/B convention.
 fn canon_tf(s: &str) -> String {
     match norm_text(s).as_str() {
@@ -243,11 +334,17 @@ pub(crate) fn auto_grade(q: &Question, user: Option<&str>) -> Option<bool> {
             grade(&c, user.map(canon_tf).as_deref())
         }
         QuestionType::FillBlank => {
-            let u = norm_text(user?);
+            let given = user?;
+            let u = norm_fill(given);
             if u.is_empty() {
-                return Some(false);
+                // Nothing but punctuation (or nothing at all) was typed. That can only be right for a key that is nothing
+                // but punctuation too (`?`, `-`, `...`), which [`norm_fill`] cannot tell apart from an empty key - so those
+                // are compared the way they always were, with [`norm_text`], instead of becoming unanswerable.
+                let plain = norm_text(given);
+                return Some(!plain.is_empty() && q.answer.split('|').any(|alt| norm_fill(alt).is_empty() && norm_text(alt) == plain));
             }
-            Some(q.answer.split('|').any(|alt| norm_text(alt) == u))
+            // `a|b` alternatives are split first, each side brought to the same form as what the student typed
+            Some(q.answer.split('|').any(|alt| norm_fill(alt) == u))
         }
         _ => grade(q, user),
     }
@@ -540,6 +637,9 @@ pub struct AssessmentInfo {
     pub(crate) closed_at: Option<i64>,
     pub(crate) archived_at: Option<i64>,
     pub(crate) created_by: Option<String>,
+    /// Practice mode (phase 4-3): enrolled students may run the exam as an ungraded practice that shows the correct answers
+    /// (`GET /assessments/{id}/practice`). Off unless the owner switches it on; not frozen by attempts.
+    pub(crate) allow_practice: bool,
     /// Who closed / archived it (user ids; `None` = the system or a row from before they were recorded). Internal:
     /// the wire only carries the verdict, [`AssessmentInfo::is_locked`].
     #[serde(skip)]
@@ -598,7 +698,7 @@ impl AssessmentInfo {
     }
 }
 
-/// The column list `map_info` reads (26 columns), as a macro so `INFO_SELECT` can be built with `concat!` while
+/// The column list `map_info` reads (27 columns), as a macro so `INFO_SELECT` can be built with `concat!` while
 /// `INFO_COLS`/`INFO_FROM` stay available to queries that add a column of their own (e.g. the hidden reason).
 macro_rules! info_cols {
     () => {
@@ -607,7 +707,7 @@ macro_rules! info_cols {
         (SELECT count(*) FROM attempts t WHERE t.assessment_id = a.id AND t.student_id = ?1),
         (SELECT count(*) FROM attempts t WHERE t.assessment_id = a.id),
         a.shuffle_questions, a.shuffle_options, a.pass_mark, a.release_mode, a.closed_at, a.archived_at, a.created_by,
-        a.closed_by, a.archived_by"
+        a.closed_by, a.archived_by, a.allow_practice"
     };
 }
 macro_rules! info_from {
@@ -647,6 +747,7 @@ pub(crate) fn map_info(r: &rusqlite::Row) -> rusqlite::Result<AssessmentInfo> {
         created_by: r.get(23)?,
         closed_by: r.get(24)?,
         archived_by: r.get(25)?,
+        allow_practice: r.get(26)?,
     })
 }
 
@@ -659,7 +760,7 @@ pub(crate) fn get_info(conn: &Connection, viewer_id: &str, id: &str) -> Res<Asse
 
 /// Published (or closed, so students can still see it and their results), subject and institution active, teacher in
 /// good standing (an admin exam needs no teacher): [`exam_standing`].
-fn publicly_visible(conn: &Connection, id: &str) -> Res<bool> {
+pub(crate) fn publicly_visible(conn: &Connection, id: &str) -> Res<bool> {
     conn.query_row(
         &format!("SELECT EXISTS(SELECT 1 FROM assessments a LEFT JOIN users u ON u.id = a.teacher_id JOIN subjects s ON s.id = a.subject_id
           WHERE a.id = ?1 AND a.status IN ('published','closed') AND {})", exam_standing("a")),
@@ -693,6 +794,7 @@ pub struct AssessmentReq {
     questions: Option<Vec<Question>>,
     duration_min: Option<i64>,
     opens_at: Option<i64>,
+    /// A hard end: attempts still running are submitted from their autosave at this moment (see [`attempt_end`]).
     closes_at: Option<i64>,
     max_attempts: Option<i64>,
     show_answers: Option<bool>,
@@ -700,6 +802,16 @@ pub struct AssessmentReq {
     /// Set to true to clear a previously set duration/window.
     clear_duration: Option<bool>,
     clear_window: Option<bool>,
+    /// Practice mode on/off (phase 4-3). Absent = unchanged on update, off on create.
+    allow_practice: Option<bool>,
+}
+
+/// Records a real change of the practice switch (`exam_practice_changed {exam_id, from, to}`); a save that leaves it as it was
+/// writes nothing. The switch shows the correct answers to enrolled students, so who flipped it and when is worth keeping.
+pub(crate) fn audit_practice_change(conn: &Connection, actor: &str, exam_id: &str, from: bool, to: bool) {
+    if from != to {
+        audit(conn, actor, exam_id, "exam_practice_changed", &json!({ "exam_id": exam_id, "from": from, "to": to }).to_string());
+    }
 }
 
 pub(crate) fn check_duration(d: Option<i64>) -> Res<()> {
@@ -735,16 +847,18 @@ pub(crate) fn create_assessment(conn: &Connection, teacher: &User, r: &Assessmen
     }
     let total: f64 = round2(questions.iter().map(points_of).sum());
     let id = new_id();
+    let allow_practice = r.allow_practice.unwrap_or(false);
     conn.execute(
         "INSERT INTO assessments(id, teacher_id, created_by, subject_id, title, description, questions, question_count, total_points, duration_min,
-           opens_at, closes_at, max_attempts, show_answers, status, created_at, updated_at)
-         VALUES (?1,?2,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
+           opens_at, closes_at, max_attempts, show_answers, status, created_at, updated_at, allow_practice)
+         VALUES (?1,?2,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15,?16)",
         params![
             id, teacher.id, subject_id, title, description, serde_json::to_string(questions).map_err(db_err)?,
-            questions.len() as i64, total, r.duration_min, r.opens_at, r.closes_at, max_attempts, r.show_answers.unwrap_or(true), status, now
+            questions.len() as i64, total, r.duration_min, r.opens_at, r.closes_at, max_attempts, r.show_answers.unwrap_or(true), status, now, allow_practice
         ],
     )
     .map_err(db_err)?;
+    audit_practice_change(conn, &teacher.id, &id, false, allow_practice);
     if status == "published" {
         announce(conn, teacher, subject_id, &id, &title, now);
     }
@@ -808,7 +922,7 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
     }
     let only_status = r.title.is_none() && r.description.is_none() && r.questions.is_none() && r.duration_min.is_none()
         && r.opens_at.is_none() && r.closes_at.is_none() && r.max_attempts.is_none() && r.show_answers.is_none()
-        && r.clear_duration.is_none() && r.clear_window.is_none();
+        && r.clear_duration.is_none() && r.clear_window.is_none() && r.allow_practice.is_none();
     if !is_owner && !only_status {
         return Err(err(StatusCode::FORBIDDEN, "forbidden"));
     }
@@ -817,6 +931,9 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
     if is_owner && !["draft", "published"].contains(&cur.status.as_str()) {
         return Err(err(StatusCode::CONFLICT, "closed"));
     }
+    // Attempts whose end (and grace) has already gone by are settled BEFORE the closing time can move: settlement is lazy,
+    // and an extension must lengthen only the attempts that are still running, not bring back one nobody has touched yet.
+    settle_assessment(conn, id, now_ms())?;
     let title = match &r.title {
         Some(t) => text(t, 200, "invalid_title")?,
         None => cur.title.clone(),
@@ -870,11 +987,14 @@ fn update_assessment(conn: &Connection, user: &User, id: &str, r: &AssessmentReq
         )
         .map_err(db_err)?;
     }
+    // not part of the freeze: the owner may switch practice on or off at any time (only the owner reaches here with it set)
+    let allow_practice = r.allow_practice.unwrap_or(cur.allow_practice);
     conn.execute(
-        "UPDATE assessments SET title=?1, description=?2, duration_min=?3, opens_at=?4, closes_at=?5, max_attempts=?6, show_answers=?7, status=?8, updated_at=?9 WHERE id=?10",
-        params![title, description, duration, opens, closes, max_attempts, r.show_answers.unwrap_or(cur.show_answers), status, now_ms(), id],
+        "UPDATE assessments SET title=?1, description=?2, duration_min=?3, opens_at=?4, closes_at=?5, max_attempts=?6, show_answers=?7, status=?8, updated_at=?9, allow_practice=?10 WHERE id=?11",
+        params![title, description, duration, opens, closes, max_attempts, r.show_answers.unwrap_or(cur.show_answers), status, now_ms(), allow_practice, id],
     )
     .map_err(db_err)?;
+    audit_practice_change(conn, &user.id, id, cur.allow_practice, allow_practice);
     if opens != cur.opens_at {
         crate::platform_reminders::reset_opened(conn, id); // the new opening time is announced afresh (phase 4-2)
     }
@@ -951,8 +1071,15 @@ pub struct PublicQuestion {
 pub struct StartRes {
     pub(crate) attempt_id: String,
     pub(crate) started_at: i64,
-    /// Server-enforced deadline (ms epoch).
+    /// Server-enforced end of THIS attempt (ms epoch): [`attempt_end`] - the duration, the exam's closing time (a hard end)
+    /// or the moment it was closed by hand, whichever comes first. Derived on every read, so extending the closing time
+    /// lengthens a running attempt.
     pub(crate) ends_at: i64,
+    /// True when the closing time (or a manual close), not the duration, is what caps the attempt.
+    pub(crate) limited_by_closing: bool,
+    /// The server's clock when the answer was produced (ms epoch), so the browser can show the timer by the server's time
+    /// instead of trusting the device clock: `offset = server_now - (t_before + t_after) / 2`.
+    pub(crate) server_now: i64,
     /// Questions in this attempt's display order, with options already permuted when the exam shuffles them.
     pub(crate) questions: Vec<PublicQuestion>,
     pub(crate) resumed: bool,
@@ -962,8 +1089,37 @@ pub struct StartRes {
     pub(crate) saved_at: Option<i64>,
 }
 
-pub(crate) fn deadline(started_at: i64, duration_min: Option<i64>) -> i64 {
-    started_at + duration_min.map_or(OPEN_ENDED_LIMIT_MS, |m| m * 60_000)
+/// **The one rule for when an attempt ends** (phase 4-3, hard end): the earliest of
+/// * its own time, `started_at + duration` (24 hours when the exam has no duration),
+/// * the exam's closing time `closes_at`, if it has one,
+/// * the moment the exam was closed by hand `closed_at` ([`manual_close`] decides whether that counts), if it was.
+///
+/// The attempt then keeps running for [`GRACE_MS`] more (network latency of the last save / submit); after that it is
+/// settled from its autosave ([`settle_if_due`]). Every place that starts, resumes, saves, submits or settles an attempt,
+/// and every list that shows how long a running attempt has left, calls this - nothing else adds a duration to a start time.
+pub(crate) fn attempt_end(started_at: i64, duration_min: Option<i64>, closes_at: Option<i64>, closed_at: Option<i64>) -> i64 {
+    let own = started_at + duration_min.map_or(OPEN_ENDED_LIMIT_MS, |m| m * 60_000);
+    [closes_at, closed_at].into_iter().flatten().fold(own, i64::min)
+}
+
+/// `closed_at` counts as the end of running attempts only while the exam IS closed (or archived): reopening clears it, and
+/// a stale value on a live exam must never end anybody's attempt.
+pub(crate) fn manual_close(status: &str, closed_at: Option<i64>) -> Option<i64> {
+    if matches!(status, "closed" | "archived") {
+        closed_at
+    } else {
+        None
+    }
+}
+
+/// Whether the closing time (or a manual close), rather than the attempt's own duration, is what ends the attempt.
+pub(crate) fn limited_by_closing(started_at: i64, duration_min: Option<i64>, closes_at: Option<i64>, closed_at: Option<i64>) -> bool {
+    attempt_end(started_at, duration_min, closes_at, closed_at) < attempt_end(started_at, duration_min, None, None)
+}
+
+/// [`attempt_end`] for an attempt of the exam described by `info`.
+pub(crate) fn end_of(info: &AssessmentInfo, started_at: i64) -> i64 {
+    attempt_end(started_at, info.duration_min, info.closes_at, manual_close(&info.status, info.closed_at))
 }
 
 /// The effective lifecycle phase of an exam: a `published` exam whose closing time has been reached reads as
@@ -1090,77 +1246,152 @@ fn finalize_attempt(conn: &Connection, attempt_id: &str, assessment_id: &str, sh
     Ok(())
 }
 
-/// If an in-progress attempt is past its deadline (+grace): submit whatever was autosaved, or mark it
-/// expired (score 0) when nothing was ever saved. Returns whether it was due.
-fn settle_if_due(conn: &Connection, attempt_id: &str, assessment_id: &str, duration_min: Option<i64>, now: i64) -> Res<bool> {
-    let row: Option<(i64, Option<i64>, String, Option<String>)> = conn
-        .query_row("SELECT started_at, saved_at, answers, order_json FROM attempts WHERE id = ?1 AND status = 'in_progress'", params![attempt_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })
-        .optional()
-        .map_err(db_err)?;
-    let Some((started, saved_at, answers_raw, order_raw)) = row else { return Ok(false) };
-    let due = deadline(started, duration_min);
-    if now <= due + GRACE_MS {
-        return Ok(false);
+/// Runs `f` inside a savepoint: everything it writes lands, or - when it fails - none of it does. Joins the surrounding
+/// transaction when there is one (and opens its own, one commit for the whole of `f`, when there is not).
+pub(crate) fn atomically<T>(conn: &Connection, name: &str, f: impl FnOnce() -> Res<T>) -> Res<T> {
+    conn.execute_batch(&format!("SAVEPOINT {name}")).map_err(db_err)?;
+    match f() {
+        Ok(v) => {
+            conn.execute_batch(&format!("RELEASE {name}")).map_err(db_err)?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"));
+            Err(e)
+        }
     }
-    if saved_at.is_some() {
+}
+
+/// A running attempt together with the exam facts that decide when it ends.
+struct Running {
+    assessment_id: String,
+    saved_at: Option<i64>,
+    answers_raw: String,
+    order_raw: Option<String>,
+    /// [`attempt_end`] of it.
+    end: i64,
+}
+
+fn running_attempt(conn: &Connection, attempt_id: &str) -> Res<Option<Running>> {
+    conn.query_row(
+        "SELECT t.assessment_id, t.started_at, t.saved_at, t.answers, t.order_json, a.duration_min, a.closes_at, a.status, a.closed_at
+           FROM attempts t JOIN assessments a ON a.id = t.assessment_id WHERE t.id = ?1 AND t.status = 'in_progress'",
+        params![attempt_id],
+        |r| {
+            let started_at: i64 = r.get(1)?;
+            let (duration, closes_at, status, closed_at): (Option<i64>, Option<i64>, String, Option<i64>) = (r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?);
+            Ok(Running {
+                assessment_id: r.get(0)?,
+                saved_at: r.get(2)?,
+                answers_raw: r.get(3)?,
+                order_raw: r.get(4)?,
+                end: attempt_end(started_at, duration, closes_at, manual_close(&status, closed_at)),
+            })
+        },
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+/// Ends a running attempt from its autosave: whatever was saved is graded and stored as submitted at `submitted_at`, and an
+/// attempt that never saved anything is marked expired (score 0). The one place both settlements (overdue and closed by
+/// hand) finish an attempt.
+fn settle_running(conn: &Connection, attempt_id: &str, r: &Running, submitted_at: i64, now: i64) -> Res<()> {
+    if r.saved_at.is_some() {
         // the browser went away (or lost connection) before the timer ran out: the autosaved answers count
-        let shown: HashMap<String, String> = serde_json::from_str(&answers_raw).unwrap_or_default();
-        finalize_attempt(conn, attempt_id, assessment_id, &shown, order_raw, due, now)?;
+        let shown: HashMap<String, String> = serde_json::from_str(&r.answers_raw).unwrap_or_default();
+        finalize_attempt(conn, attempt_id, &r.assessment_id, &shown, r.order_raw.clone(), submitted_at, now)
     } else {
         conn.execute("UPDATE attempts SET status = 'expired' WHERE id = ?1", params![attempt_id]).map_err(db_err)?;
+        Ok(())
     }
+}
+
+/// If an in-progress attempt is past its end (+grace): submit whatever was autosaved - stamped at the END, not at the
+/// moment somebody noticed - or mark it expired when nothing was ever saved. Returns whether it was due.
+fn settle_if_due(conn: &Connection, attempt_id: &str, now: i64) -> Res<bool> {
+    let Some(r) = running_attempt(conn, attempt_id)? else { return Ok(false) };
+    if now <= r.end + GRACE_MS {
+        return Ok(false);
+    }
+    settle_running(conn, attempt_id, &r, r.end, now)?;
     Ok(true)
 }
 
-/// Settles every overdue attempt of ONE student, on every exam (the student's own lists read states from fresh data).
-/// Returns how many were settled.
-pub(crate) fn settle_student(conn: &Connection, student_id: &str, now: i64) -> Res<usize> {
-    let rows: Vec<(String, String, Option<i64>)> = conn
-        .prepare("SELECT t.id, t.assessment_id, a.duration_min FROM attempts t JOIN assessments a ON a.id = t.assessment_id WHERE t.student_id = ?1 AND t.status = 'in_progress'")
+/// A manual close (the lifecycle action of either door, or the report auto-hide) ends EVERY running attempt of the exam
+/// at once, from its autosave, stamped `now` (no grace: the exam is closed, nobody may keep writing). Call it right after
+/// the exam's status changed, inside the same transaction (see `platform_exam_admin::act`). Idempotent - a second call finds
+/// nothing running. A reopened exam does not bring them back: they are submitted or expired for good. Returns how many.
+pub(crate) fn settle_on_close(conn: &Connection, assessment_id: &str, now: i64) -> Res<usize> {
+    let ids: Vec<String> = conn
+        .prepare("SELECT id FROM attempts WHERE assessment_id = ?1 AND status = 'in_progress' ORDER BY started_at, id")
         .map_err(db_err)?
-        .query_map(params![student_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .query_map(params![assessment_id], |r| r.get(0))
         .map_err(db_err)?
         .collect::<Result<_, _>>()
         .map_err(db_err)?;
     let mut n = 0;
-    for (id, aid, dur) in rows {
-        if settle_if_due(conn, &id, &aid, dur, now)? {
+    for id in ids {
+        if let Some(r) = running_attempt(conn, &id)? {
+            // one that was overdue long before the close keeps its own end as the submission time
+            let at = if now > r.end + GRACE_MS { r.end } else { now };
+            settle_running(conn, &id, &r, at, now)?;
             n += 1;
         }
     }
     Ok(n)
 }
 
-/// Settles this student's overdue attempts on one assessment.
-fn expire_stale(conn: &Connection, assessment_id: &str, student_id: &str, duration_min: Option<i64>, now: i64) -> Res<()> {
-    let ids: Vec<String> = conn
-        .prepare("SELECT id FROM attempts WHERE assessment_id = ?1 AND student_id = ?2 AND status = 'in_progress'")
-        .map_err(db_err)?
-        .query_map(params![assessment_id, student_id], |r| r.get(0))
-        .map_err(db_err)?
-        .collect::<Result<_, _>>()
-        .map_err(db_err)?;
-    for id in ids {
-        settle_if_due(conn, &id, assessment_id, duration_min, now)?;
-    }
-    Ok(())
+fn in_progress_ids(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Res<Vec<String>> {
+    conn.prepare(sql).map_err(db_err)?.query_map(p, |r| r.get(0)).map_err(db_err)?.collect::<Result<_, _>>().map_err(db_err)
 }
 
-/// Settles every overdue attempt of an assessment (graders open its results).
-pub(crate) fn settle_assessment(conn: &Connection, assessment_id: &str, duration_min: Option<i64>, now: i64) -> Res<()> {
-    let ids: Vec<String> = conn
-        .prepare("SELECT id FROM attempts WHERE assessment_id = ?1 AND status = 'in_progress'")
-        .map_err(db_err)?
-        .query_map(params![assessment_id], |r| r.get(0))
-        .map_err(db_err)?
-        .collect::<Result<_, _>>()
-        .map_err(db_err)?;
-    for id in ids {
-        settle_if_due(conn, &id, assessment_id, duration_min, now)?;
+/// Settles the overdue ones among `ids` in ONE commit (a hard end makes every running attempt of an exam due at the same
+/// instant, and one commit per attempt - each of them held under the database lock - made a big class stall every other
+/// request for seconds). An attempt that fails to settle is rolled back on its own and the others still go through; the
+/// first error is returned afterwards, so nothing is hidden. Returns how many were settled.
+fn settle_each(conn: &Connection, ids: Vec<String>, now: i64) -> Res<usize> {
+    if ids.is_empty() {
+        return Ok(0);
     }
-    Ok(())
+    conn.execute_batch("SAVEPOINT settle_each").map_err(db_err)?;
+    let (mut n, mut first_error) = (0, None);
+    for id in ids {
+        let one = atomically(conn, "settle_one", || settle_if_due(conn, &id, now));
+        match one {
+            Ok(true) => n += 1,
+            Ok(false) => {}
+            Err(e) => first_error = first_error.or(Some(e)),
+        }
+    }
+    conn.execute_batch("RELEASE settle_each").map_err(db_err)?;
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(n),
+    }
+}
+
+/// Settles every overdue attempt of ONE student, on every exam (the student's own lists read states from fresh data).
+/// Returns how many were settled.
+pub(crate) fn settle_student(conn: &Connection, student_id: &str, now: i64) -> Res<usize> {
+    let ids = in_progress_ids(conn, "SELECT id FROM attempts WHERE student_id = ?1 AND status = 'in_progress'", params![student_id])?;
+    settle_each(conn, ids, now)
+}
+
+/// Settles this student's overdue attempts on one assessment.
+fn expire_stale(conn: &Connection, assessment_id: &str, student_id: &str, now: i64) -> Res<()> {
+    let ids = in_progress_ids(
+        conn,
+        "SELECT id FROM attempts WHERE assessment_id = ?1 AND student_id = ?2 AND status = 'in_progress'",
+        params![assessment_id, student_id],
+    )?;
+    settle_each(conn, ids, now).map(|_| ())
+}
+
+/// Settles every overdue attempt of an assessment (graders open its results; the owner changes its closing time).
+pub(crate) fn settle_assessment(conn: &Connection, assessment_id: &str, now: i64) -> Res<()> {
+    let ids = in_progress_ids(conn, "SELECT id FROM attempts WHERE assessment_id = ?1 AND status = 'in_progress'", params![assessment_id])?;
+    settle_each(conn, ids, now).map(|_| ())
 }
 
 /// Hourly task entry point: settles overdue attempts nobody came back to.
@@ -1172,20 +1403,8 @@ pub fn settle_overdue(state: &crate::platform::PlatformState) {
 
 /// Periodic sweep: settles every overdue attempt on the platform. Returns how many were settled.
 pub(crate) fn settle_all(conn: &Connection, now: i64) -> Res<usize> {
-    let rows: Vec<(String, String, Option<i64>)> = conn
-        .prepare("SELECT t.id, t.assessment_id, a.duration_min FROM attempts t JOIN assessments a ON a.id = t.assessment_id WHERE t.status = 'in_progress'")
-        .map_err(db_err)?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .map_err(db_err)?
-        .collect::<Result<_, _>>()
-        .map_err(db_err)?;
-    let mut n = 0;
-    for (id, aid, dur) in rows {
-        if settle_if_due(conn, &id, &aid, dur, now)? {
-            n += 1;
-        }
-    }
-    Ok(n)
+    let ids = in_progress_ids(conn, "SELECT id FROM attempts WHERE status = 'in_progress'", [])?;
+    settle_each(conn, ids, now)
 }
 
 pub(crate) fn start_attempt(conn: &Connection, student: &User, assessment_id: &str, now: i64) -> Res<StartRes> {
@@ -1193,15 +1412,22 @@ pub(crate) fn start_attempt(conn: &Connection, student: &User, assessment_id: &s
 }
 
 pub(crate) fn start_attempt_with(conn: &Connection, student: &User, assessment_id: &str, now: i64, rng: &mut impl rand::Rng) -> Res<StartRes> {
-    if !publicly_visible(conn, assessment_id)? {
+    let visible = publicly_visible(conn, assessment_id)?;
+    let info = get_info(conn, &student.id, assessment_id)?;
+    let enrolled = is_enrolled(conn, &student.id, &info.subject_id)?;
+    // An exam students cannot see does not exist for somebody who is not in its subject, and a visible one is refused with
+    // `not_enrolled`, as ever. An ENROLLED student whose exam became invisible while they were sitting it (the subject or
+    // institution was switched off, the teacher's assignment was withdrawn) can still get back into the attempt they are
+    // in the middle of - and only that: no NEW attempt on a hidden exam (see below).
+    if !visible && !enrolled {
         return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
-    let info = get_info(conn, &student.id, assessment_id)?;
-    if !is_enrolled(conn, &student.id, &info.subject_id)? {
+    if !enrolled {
         return Err(err(StatusCode::FORBIDDEN, "not_enrolled"));
     }
-    expire_stale(conn, assessment_id, &student.id, info.duration_min, now)?;
+    expire_stale(conn, assessment_id, &student.id, now)?;
     let questions = load_questions(conn, assessment_id)?;
+    let closed_at = manual_close(&info.status, info.closed_at);
     // Resume an in-progress attempt instead of burning another one: same order, same saved answers.
     let open: Option<(String, i64, Option<String>, String, Option<i64>)> = conn
         .query_row(
@@ -1216,12 +1442,17 @@ pub(crate) fn start_attempt_with(conn: &Connection, student: &User, assessment_i
         return Ok(StartRes {
             attempt_id: id,
             started_at: started,
-            ends_at: deadline(started, info.duration_min),
+            ends_at: end_of(&info, started),
+            limited_by_closing: limited_by_closing(started, info.duration_min, info.closes_at, closed_at),
+            server_now: now,
             questions: public_questions(&displayed(&questions, order.as_ref())),
             resumed: true,
             saved_answers: serde_json::from_str(&answers_raw).unwrap_or_default(),
             saved_at,
         });
+    }
+    if !visible {
+        return Err(err(StatusCode::NOT_FOUND, "not_found"));
     }
     if info.status != "published" {
         return Err(err(StatusCode::FORBIDDEN, "closed"));
@@ -1229,7 +1460,9 @@ pub(crate) fn start_attempt_with(conn: &Connection, student: &User, assessment_i
     if info.opens_at.map_or(false, |o| now < o) {
         return Err(err(StatusCode::FORBIDDEN, "not_open_yet"));
     }
-    if info.closes_at.map_or(false, |c| now > c) {
+    // the closing time is a hard end: an attempt cannot begin at or after it (`effective_phase` reads it as closed from
+    // the same millisecond)
+    if info.closes_at.map_or(false, |c| c <= now) {
         return Err(err(StatusCode::FORBIDDEN, "closed"));
     }
     let used: i64 = conn
@@ -1248,7 +1481,9 @@ pub(crate) fn start_attempt_with(conn: &Connection, student: &User, assessment_i
     Ok(StartRes {
         attempt_id: id,
         started_at: now,
-        ends_at: deadline(now, info.duration_min),
+        ends_at: end_of(&info, now),
+        limited_by_closing: limited_by_closing(now, info.duration_min, info.closes_at, closed_at),
+        server_now: now,
         questions: public_questions(&displayed(&questions, order.as_ref())),
         resumed: false,
         saved_answers: HashMap::new(),
@@ -1258,11 +1493,28 @@ pub(crate) fn start_attempt_with(conn: &Connection, student: &User, assessment_i
 
 // ───────── autosave & integrity events (PRD F3, F5) ─────────
 
-/// Stores the in-progress answers (displayed letters) so the attempt can resume anywhere.
-pub(crate) fn save_answers(conn: &Connection, student: &User, attempt_id: &str, raw: &HashMap<String, String>, now: i64) -> Res<i64> {
-    let (assessment_id, started, status): (String, i64, String) = conn
-        .query_row("SELECT assessment_id, started_at, status FROM attempts WHERE id = ?1 AND student_id = ?2", params![attempt_id, student.id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+/// What a save reports back: when it was stored and how many questions now hold an answer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Saved {
+    pub(crate) saved_at: i64,
+    /// Non-empty stored answers after this save.
+    pub(crate) answered: i64,
+    /// The attempt's CURRENT end ([`end_of`], derived now): a page that is already open learns here that the owner moved
+    /// the closing time, instead of submitting at the end it was handed when it started.
+    pub(crate) ends_at: i64,
+    /// Whether the closing time (not the duration) is what caps the attempt now.
+    pub(crate) limited_by_closing: bool,
+}
+
+/// Stores the in-progress answers (displayed letters) so the attempt can resume anywhere. **Merges** by default (phase 4-3):
+/// only the questions named in `raw` change, an empty string removes that question's answer, everything else stays - so two
+/// devices saving different questions never erase each other. `replace` keeps the older behaviour (the request IS the whole
+/// answer sheet) for clients that send everything every time. Either way only this attempt's own question ids are kept and
+/// every value is cut at 2000 characters.
+pub(crate) fn save_answers_with(conn: &Connection, student: &User, attempt_id: &str, raw: &HashMap<String, String>, replace: bool, now: i64) -> Res<Saved> {
+    let (assessment_id, started, status, stored): (String, i64, String, String) = conn
+        .query_row("SELECT assessment_id, started_at, status, answers FROM attempts WHERE id = ?1 AND student_id = ?2", params![attempt_id, student.id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })
         .optional()
         .map_err(db_err)?
@@ -1271,14 +1523,38 @@ pub(crate) fn save_answers(conn: &Connection, student: &User, attempt_id: &str, 
         return Err(err(StatusCode::CONFLICT, if status == "expired" { "time_expired" } else { "already_submitted" }));
     }
     let info = get_info(conn, &student.id, &assessment_id)?;
-    if now > deadline(started, info.duration_min) + GRACE_MS {
-        settle_if_due(conn, attempt_id, &assessment_id, info.duration_min, now)?;
+    if now > end_of(&info, started) + GRACE_MS {
+        settle_if_due(conn, attempt_id, now)?;
         return Err(err(StatusCode::CONFLICT, "time_expired"));
     }
     let questions = load_questions(conn, &assessment_id)?;
-    let answers = clean_answers(raw, &questions);
+    let sent = clean_answers(raw, &questions);
+    let answers = if replace {
+        sent
+    } else {
+        let mut merged = clean_answers(&serde_json::from_str::<HashMap<String, String>>(&stored).unwrap_or_default(), &questions);
+        for (k, v) in sent {
+            if v.is_empty() {
+                merged.remove(&k);
+            } else {
+                merged.insert(k, v);
+            }
+        }
+        merged
+    };
     conn.execute("UPDATE attempts SET answers = ?1, saved_at = ?2 WHERE id = ?3", params![serde_json::to_string(&answers).map_err(db_err)?, now, attempt_id]).map_err(db_err)?;
-    Ok(now)
+    Ok(Saved {
+        saved_at: now,
+        answered: answers.values().filter(|v| !v.trim().is_empty()).count() as i64,
+        ends_at: end_of(&info, started),
+        limited_by_closing: limited_by_closing(started, info.duration_min, info.closes_at, manual_close(&info.status, info.closed_at)),
+    })
+}
+
+/// [`save_answers_with`] in its default (merge) mode, returning only the time it was stored.
+#[cfg(test)]
+pub(crate) fn save_answers(conn: &Connection, student: &User, attempt_id: &str, raw: &HashMap<String, String>, now: i64) -> Res<i64> {
+    save_answers_with(conn, student, attempt_id, raw, false, now).map(|s| s.saved_at)
 }
 
 const MAX_TAB_LEAVES: i64 = 1000;
@@ -1312,11 +1588,20 @@ pub struct ItemResult {
     stem: String,
     options: Vec<String>,
     your_answer: Option<String>,
+    /// What the student answered in words (phase 4-3), so the review does not make them decode letters: for a choice
+    /// question the TEXT of the options they chose, in the original option order, joined with ` | `; for true/false the
+    /// option text (`صحيح` / `خطأ` unless the question names its own); for a fill-in or written answer the answer itself;
+    /// `None` when nothing was answered. See [`answer_text`].
+    your_answer_text: Option<String>,
     correct: Option<bool>,
     points: f64,
     max: f64,
     correct_answer: Option<String>,
     analysis: Option<String>,
+    /// The question's chapter, when the exam's author set one.
+    chapter: Option<String>,
+    /// `easy` | `medium` | `hard`, when set.
+    difficulty: Option<String>,
     /// The grader's comment on this written answer. The attempt's own student sees it once the result is released
     /// (items are not sent before), graders always.
     pub(crate) feedback: Option<String>,
@@ -1337,6 +1622,13 @@ pub struct AttemptResult {
     pending: i64,
     started_at: i64,
     submitted_at: Option<i64>,
+    /// Seconds between starting and handing in (`None` for an attempt that never was).
+    duration_sec: Option<i64>,
+    /// This student's n-th attempt of the exam, by start time (1-based).
+    attempt_no: i64,
+    /// This is the student's best attempt of the exam: the highest score among their fully graded attempts, the newest on a
+    /// tie - and only once it is released (a withheld result is never singled out).
+    is_best: bool,
     show_answers: bool,
     items: Option<Vec<ItemResult>>,
     /// False while a student must wait for the exam to close (release mode `after_close`): score and
@@ -1350,10 +1642,43 @@ pub struct AttemptResult {
     tab_leaves: Option<i64>,
 }
 
-/// Results are visible at once for `immediate` exams; for `after_close` only once the exam is closed
-/// (manually, or its closing time has passed).
+/// The letters (A-J, as option indexes) in a stored choice answer, sorted and without repeats - the same reading
+/// `relay::normalize_choice` gives the marking.
+fn choice_indexes(answer: &str) -> Vec<usize> {
+    let mut v: Vec<usize> = answer.to_uppercase().chars().filter(|c| ('A'..='J').contains(c)).map(|c| (c as u8 - b'A') as usize).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// What the student answered, in words, for the review (see [`ItemResult::your_answer_text`]). `answer` is the stored
+/// answer, which is in the ORIGINAL option letters (`to_original` has already undone any shuffling), so the options are
+/// listed in their original order whatever order the student saw them in.
+pub(crate) fn answer_text(q: &Question, answer: Option<&str>) -> Option<String> {
+    let answer = answer.filter(|a| !a.trim().is_empty())?;
+    match q.qtype {
+        QuestionType::SingleChoice | QuestionType::MultiChoice => {
+            let texts: Vec<&str> = choice_indexes(answer).into_iter().filter_map(|i| q.options.get(i).map(String::as_str)).collect();
+            (!texts.is_empty()).then(|| texts.join(" | "))
+        }
+        QuestionType::TrueFalse => {
+            // the marking reads anything that is not a "true" answer as false, so the words say the same
+            let idx = if crate::relay::is_true_answer(&canon_tf(answer)) { 0 } else { 1 };
+            let named = q.options.get(idx).map(|t| t.trim()).filter(|t| !t.is_empty());
+            Some(named.unwrap_or(["صحيح", "خطأ"][idx]).to_string())
+        }
+        QuestionType::FillBlank | QuestionType::ShortAnswer => Some(answer.to_string()),
+    }
+}
+
+/// Results and answers are visible at once for `immediate` exams. For `after_close` ones they are withheld until nobody can
+/// still hand in an attempt (phase 4-3): the exam was closed by hand (which already ended every running attempt), or its
+/// closing time - a hard end - has passed AND the grace after it has run out too (`closes_at + GRACE_MS`, the last moment
+/// an attempt that ends at the closing time can still be saved or submitted). So the first student to finish can never
+/// read the key while a classmate is still writing. **The one place this is decided**; the lists, the review, the
+/// notifications and the reminders all go through it.
 pub(crate) fn is_released(release_mode: &str, status: &str, closes_at: Option<i64>, now: i64) -> bool {
-    release_mode != "after_close" || matches!(status, "closed" | "archived") || closes_at.map_or(false, |c| c <= now)
+    release_mode != "after_close" || matches!(status, "closed" | "archived") || closes_at.map_or(false, |c| c + GRACE_MS < now)
 }
 
 pub(crate) fn passed_flag(score: f64, total: f64, pending: i64, pass_mark: Option<f64>) -> Option<bool> {
@@ -1372,12 +1697,23 @@ fn clean_answers(raw: &HashMap<String, String>, questions: &[Question]) -> HashM
         .collect()
 }
 
+/// Hands an attempt in, the way every client of the platform does: the request is MERGED over what is already saved on the
+/// server (see [`submit_attempt_with`]).
+#[cfg(test)]
 pub(crate) fn submit_attempt(conn: &Connection, student: &User, attempt_id: &str, raw: &HashMap<String, String>, now: i64) -> Res<AttemptResult> {
-    let (assessment_id, started, status, order_raw): (String, i64, String, Option<String>) = conn
+    submit_attempt_with(conn, student, attempt_id, raw, false, now)
+}
+
+/// Hands an attempt in. **The final sheet is the stored autosave with the request laid over it** (an empty string removes
+/// that question's answer), exactly like a partial save: a second device that saved other questions, or answers the page
+/// handing in never held, are not thrown away by whichever page presses Submit (or runs out of time) first. `replace`
+/// keeps the older behaviour, the request IS the whole sheet, for clients that always send everything.
+pub(crate) fn submit_attempt_with(conn: &Connection, student: &User, attempt_id: &str, raw: &HashMap<String, String>, replace: bool, now: i64) -> Res<AttemptResult> {
+    let (assessment_id, started, status, order_raw, stored): (String, i64, String, Option<String>, String) = conn
         .query_row(
-            "SELECT assessment_id, started_at, status, order_json FROM attempts WHERE id = ?1 AND student_id = ?2",
+            "SELECT assessment_id, started_at, status, order_json, answers FROM attempts WHERE id = ?1 AND student_id = ?2",
             params![attempt_id, student.id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
         .map_err(db_err)?
@@ -1386,18 +1722,54 @@ pub(crate) fn submit_attempt(conn: &Connection, student: &User, attempt_id: &str
         return Err(err(StatusCode::CONFLICT, if status == "expired" { "time_expired" } else { "already_submitted" }));
     }
     let info = get_info(conn, &student.id, &assessment_id)?;
-    if now > deadline(started, info.duration_min) + GRACE_MS {
+    if now > end_of(&info, started) + GRACE_MS {
         // too late for a manual submit; whatever was autosaved still counts
-        settle_if_due(conn, attempt_id, &assessment_id, info.duration_min, now)?;
+        settle_if_due(conn, attempt_id, now)?;
         return Err(err(StatusCode::CONFLICT, "time_expired"));
     }
-    finalize_attempt(conn, attempt_id, &assessment_id, raw, order_raw, now, now)?;
+    let sheet = if replace {
+        raw.clone()
+    } else {
+        let questions = load_questions(conn, &assessment_id)?;
+        let mut merged = clean_answers(&serde_json::from_str::<HashMap<String, String>>(&stored).unwrap_or_default(), &questions);
+        for (k, v) in clean_answers(raw, &questions) {
+            if v.is_empty() {
+                merged.remove(&k);
+            } else {
+                merged.insert(k, v);
+            }
+        }
+        merged
+    };
+    finalize_attempt(conn, attempt_id, &assessment_id, &sheet, order_raw, now, now)?;
     attempt_result(conn, student, attempt_id)
 }
 
 /// Builds the result view. Students only see per-question detail when the assessment allows it;
 /// the owner/admin always see everything.
 pub(crate) fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str) -> Res<AttemptResult> {
+    attempt_result_at(conn, viewer, attempt_id, now_ms())
+}
+
+/// The student's best attempt of an exam: the highest score among their fully graded submitted attempts, the newest on a
+/// tie (hand-in time, then id). `None` when none is fully graded yet. **The one definition of "best"** for the review's
+/// `is_best` badge and for the statistics (`platform_student_stats`).
+pub(crate) fn best_graded_attempt(conn: &Connection, student_id: &str, assessment_id: &str) -> Res<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM attempts WHERE assessment_id = ?1 AND student_id = ?2 AND status = 'submitted' AND pending = 0
+          ORDER BY score DESC, COALESCE(submitted_at, started_at) DESC, id DESC LIMIT 1",
+        params![assessment_id, student_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+/// [`attempt_result`] with the clock passed in.
+pub(crate) fn attempt_result_at(conn: &Connection, viewer: &User, attempt_id: &str, now: i64) -> Res<AttemptResult> {
+    // an attempt whose end (and grace) has gone by is settled before it is shown, so the page a student lands on when the
+    // timer ran out reads the outcome instead of "still in progress"
+    settle_if_due(conn, attempt_id, now)?;
     let row = conn
         .query_row(
             "SELECT t.assessment_id, t.student_id, t.status, t.score, t.pending, t.started_at, t.submitted_at, t.answers, t.results,
@@ -1424,7 +1796,7 @@ pub(crate) fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str)
     if status == "in_progress" {
         return Err(err(StatusCode::CONFLICT, "in_progress"));
     }
-    let released = is_owner || is_released(&release_mode, &exam_status, closes_at, now_ms());
+    let released = is_owner || is_released(&release_mode, &exam_status, closes_at, now);
     let detail = (is_owner || show) && released;
     let items = if detail && status == "submitted" {
         let questions = load_questions(conn, &assessment_id)?;
@@ -1453,11 +1825,14 @@ pub(crate) fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str)
                         stem: q.stem.clone(),
                         options: q.options.clone(),
                         your_answer: answers.get(&q.id).cloned(),
+                        your_answer_text: answer_text(q, answers.get(&q.id).map(String::as_str)),
                         correct: o.and_then(|o| o.correct),
                         points: o.map_or(0.0, |o| o.points),
                         max: points_of(q),
                         correct_answer: Some(q.answer.clone()),
                         analysis: (!q.analysis.is_empty()).then(|| q.analysis.clone()),
+                        chapter: q.chapter.clone(),
+                        difficulty: q.difficulty.as_ref().map(|d| d.to_string()),
                         feedback: o.and_then(|o| o.feedback.clone()),
                         graded_by_name: o.and_then(|o| o.graded_by.as_ref()).filter(|_| is_owner).and_then(|id| grader_names.get(id).cloned()),
                         graded_at: o.and_then(|o| o.graded_at).filter(|_| is_owner),
@@ -1468,6 +1843,14 @@ pub(crate) fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str)
     } else {
         None
     };
+    let attempt_no: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM attempts WHERE assessment_id = ?1 AND student_id = ?2 AND (started_at < ?3 OR (started_at = ?3 AND id <= ?4))",
+            params![assessment_id, student_id, started_at, attempt_id],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    let is_best = released && status == "submitted" && best_graded_attempt(conn, &student_id, &assessment_id)?.as_deref() == Some(attempt_id);
     Ok(AttemptResult {
         attempt_id: attempt_id.to_string(),
         assessment_id,
@@ -1480,6 +1863,9 @@ pub(crate) fn attempt_result(conn: &Connection, viewer: &User, attempt_id: &str)
         pending: if released { pending } else { 0 },
         started_at,
         submitted_at,
+        duration_sec: submitted_at.map(|t| (t - started_at).max(0) / 1000),
+        attempt_no,
+        is_best,
         show_answers: show,
         items,
         released,
@@ -1689,7 +2075,7 @@ pub(crate) fn results_summary(conn: &Connection, user: &User, id: &str, now: i64
     }
     let info = get_info(conn, &user.id, id)?;
     // attempts whose time ran out while the browser was away are settled before the numbers are shown
-    settle_assessment(conn, id, info.duration_min, now)?;
+    settle_assessment(conn, id, now)?;
     let total = info.total_points;
     let pass_mark = info.pass_mark;
     let attempts = conn
@@ -1757,10 +2143,10 @@ pub(crate) fn shown_state(status: &str) -> bool {
 }
 
 fn list_mine(conn: &Connection, teacher_id: &str) -> Res<Vec<MineExam>> {
-    // column 26 (after the 26 of `map_info`) is the reason; `?1` = the teacher, which is also the viewer
+    // column 27 (after the 27 of `map_info`) is the reason; `?1` = the teacher, which is also the viewer
     conn.prepare(&format!("SELECT {INFO_COLS}, ({}) {INFO_FROM} WHERE a.teacher_id = ?1 ORDER BY a.updated_at DESC LIMIT 100", exam_reason_sql("a")))
         .map_err(db_err)?
-        .query_map(params![teacher_id], |r| Ok((map_info(r)?, r.get::<_, Option<String>>(26)?)))
+        .query_map(params![teacher_id], |r| Ok((map_info(r)?, r.get::<_, Option<String>>(27)?)))
         .map_err(db_err)?
         .map(|row| {
             let (info, reason) = row.map_err(db_err)?;
@@ -1832,7 +2218,11 @@ pub struct MyAttempt {
 }
 
 fn my_attempts(conn: &Connection, student_id: &str, assessment_id: Option<&str>) -> Res<Vec<MyAttempt>> {
-    let now = now_ms();
+    my_attempts_at(conn, student_id, assessment_id, now_ms())
+}
+
+/// [`my_attempts`] with the clock passed in (the withheld-result rule is [`is_released`] at `now`).
+pub(crate) fn my_attempts_at(conn: &Connection, student_id: &str, assessment_id: Option<&str>, now: i64) -> Res<Vec<MyAttempt>> {
     conn.prepare(
         "SELECT t.id, a.id, a.title, t.status, t.score, a.total_points, t.pending, t.started_at, a.release_mode, a.status, a.closes_at, a.pass_mark FROM attempts t
          JOIN assessments a ON a.id = t.assessment_id WHERE t.student_id = ?1 AND (?2 IS NULL OR a.id = ?2) ORDER BY t.started_at DESC LIMIT 50",
@@ -1893,6 +2283,8 @@ pub struct AssessmentDetail {
     state: Option<crate::platform_student::ExamState>,
     reason: Option<crate::platform_student::Blocked>,
     phase: Option<String>,
+    /// Student callers only: the server's clock (ms epoch) when the answer was produced - see [`StartRes::server_now`].
+    server_now: Option<i64>,
 }
 
 pub async fn detail_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>) -> Res<Json<AssessmentDetail>> {
@@ -1909,7 +2301,7 @@ pub async fn detail_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(i
     let mut attempts = Vec::new();
     let (mut state, mut reason, mut phase) = (None, None, None);
     if u.role == "student" {
-        expire_stale(&conn, &id, &u.id, info.duration_min, now)?;
+        expire_stale(&conn, &id, &u.id, now)?;
         let view = crate::platform_student::exam_view(&conn, &u.id, &info, now)?;
         attempts = my_attempts(&conn, &u.id, Some(&id))?;
         open_attempt = attempts.iter().find(|a| a.status == "in_progress").map(|a| a.attempt_id.clone());
@@ -1923,27 +2315,36 @@ pub async fn detail_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(i
     if u.role == "student" {
         info.redact_for_student();
     }
-    Ok(Json(AssessmentDetail { info, locked, can_start, in_progress_attempt: open_attempt, attempts, state, reason, phase }))
+    let server_now = (u.role == "student").then(now_ms);
+    Ok(Json(AssessmentDetail { info, locked, can_start, in_progress_attempt: open_attempt, attempts, state, reason, phase, server_now }))
 }
 
 pub async fn start_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>) -> Res<Json<StartRes>> {
     let u = require_role(&s, &h, "student")?;
-    start_attempt(&*lock(&s)?, &u, &id, now_ms()).map(Json)
+    let mut res = start_attempt(&*lock(&s)?, &u, &id, now_ms())?;
+    res.server_now = now_ms(); // as late as possible: the browser measures the round trip around this
+    Ok(Json(res))
 }
 
 #[derive(Deserialize)]
 pub struct SubmitReq {
     answers: HashMap<String, String>,
+    /// `true` = the request is the whole answer sheet (what clients did before); the default lays it over the autosave.
+    #[serde(default)]
+    replace: bool,
 }
 
 pub async fn submit_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>, Json(r): Json<SubmitReq>) -> Res<Json<AttemptResult>> {
     let u = require_role(&s, &h, "student")?;
-    submit_attempt(&*lock(&s)?, &u, &id, &r.answers, now_ms()).map(Json)
+    submit_attempt_with(&*lock(&s)?, &u, &id, &r.answers, r.replace, now_ms()).map(Json)
 }
 
 #[derive(Deserialize)]
 pub struct SaveReq {
     answers: HashMap<String, String>,
+    /// `true` = the request is the whole answer sheet (what clients did before partial saves); the default merges.
+    #[serde(default)]
+    replace: bool,
 }
 
 pub async fn save_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>, Json(r): Json<SaveReq>) -> Res<Json<serde_json::Value>> {
@@ -1951,8 +2352,11 @@ pub async fn save_handler(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id)
     let conn = lock(&s)?;
     // The browser saves about every 30 s and after edits; far more than that is a runaway client.
     crate::platform::rate_limit(&conn, &format!("save:{id}"), 60_000, 30)?;
-    let at = save_answers(&conn, &u, &id, &r.answers, now_ms())?;
-    Ok(Json(json!({ "saved_at": at })))
+    let saved = save_answers_with(&conn, &u, &id, &r.answers, r.replace, now_ms())?;
+    Ok(Json(json!({
+        "saved_at": saved.saved_at, "server_now": now_ms(), "answered": saved.answered,
+        "ends_at": saved.ends_at, "limited_by_closing": saved.limited_by_closing,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -2055,7 +2459,7 @@ mod tests {
         let req = AssessmentReq {
             subject_id: Some("s1".into()), title: Some("اختبار".into()), description: None, questions: Some(questions()),
             duration_min: duration, opens_at: None, closes_at: None, max_attempts: Some(max_attempts), show_answers: Some(show),
-            status: Some("published".into()), clear_duration: None, clear_window: None,
+            status: Some("published".into()), clear_duration: None, clear_window: None, allow_practice: None,
         };
         let id = create_assessment(&conn, &teacher, &req).unwrap().id;
         W { conn, teacher, student, admin, id }
@@ -2168,7 +2572,7 @@ mod tests {
         let w = world(true, None, 1);
         let base = |qs: Vec<Question>| AssessmentReq {
             subject_id: Some("s1".into()), title: Some("x".into()), description: None, questions: Some(qs), duration_min: None, opens_at: None,
-            closes_at: None, max_attempts: None, show_answers: None, status: None, clear_duration: None, clear_window: None,
+            closes_at: None, max_attempts: None, show_answers: None, status: None, clear_duration: None, clear_window: None, allow_practice: None,
         };
         let mut dup = questions(); dup[1].id = "q1".into();
         for (label, qs) in [("empty", vec![]), ("dup ids", dup), ("choice without options", vec![q("x", QuestionType::SingleChoice, "A", &["only"], None)]),
@@ -2177,7 +2581,7 @@ mod tests {
         }
         let other = insert_test_user(&w.conn, "o@x.com", "teacher", "active");
         assert_eq!(create_assessment(&w.conn, &other, &base(questions())).unwrap_err().0, StatusCode::FORBIDDEN, "unassigned teacher");
-        let patch = |t: &str| AssessmentReq { title: Some(t.into()), subject_id: None, description: None, questions: None, duration_min: None, opens_at: None, closes_at: None, max_attempts: None, show_answers: None, status: None, clear_duration: None, clear_window: None };
+        let patch = |t: &str| AssessmentReq { title: Some(t.into()), subject_id: None, description: None, questions: None, duration_min: None, opens_at: None, closes_at: None, max_attempts: None, show_answers: None, status: None, clear_duration: None, clear_window: None, allow_practice: None };
         assert_eq!(update_assessment(&w.conn, &other, &w.id, &patch("hack")).unwrap_err().0, StatusCode::FORBIDDEN);
         assert_eq!(update_assessment(&w.conn, &w.admin, &w.id, &patch("rewrite")).unwrap_err().0, StatusCode::FORBIDDEN, "admin moderates status only");
         let unpublish = AssessmentReq { status: Some("draft".into()), ..patch("") };
@@ -2209,14 +2613,14 @@ mod tests {
     fn exam_req(status: &str) -> AssessmentReq {
         AssessmentReq {
             subject_id: Some("s1".into()), title: Some("امتحان جديد".into()), description: None, questions: Some(questions()), duration_min: None,
-            opens_at: None, closes_at: None, max_attempts: Some(1), show_answers: None, status: Some(status.into()), clear_duration: None, clear_window: None,
+            opens_at: None, closes_at: None, max_attempts: Some(1), show_answers: None, status: Some(status.into()), clear_duration: None, clear_window: None, allow_practice: None,
         }
     }
 
     fn status_patch(status: &str) -> AssessmentReq {
         AssessmentReq {
             subject_id: None, title: None, description: None, questions: None, duration_min: None, opens_at: None, closes_at: None,
-            max_attempts: None, show_answers: None, status: Some(status.into()), clear_duration: None, clear_window: None,
+            max_attempts: None, show_answers: None, status: Some(status.into()), clear_duration: None, clear_window: None, allow_practice: None,
         }
     }
 
@@ -2981,7 +3385,7 @@ mod migration_tests {
         let new = create_assessment(&c, &teacher, &AssessmentReq {
             subject_id: Some(subject), title: Some("جديد".into()), description: None,
             questions: Some(vec![q("n1", QuestionType::FillBlank, "x", &[], None)]), duration_min: None, opens_at: None, closes_at: None,
-            max_attempts: None, show_answers: None, status: Some("draft".into()), clear_duration: None, clear_window: None,
+            max_attempts: None, show_answers: None, status: Some("draft".into()), clear_duration: None, clear_window: None, allow_practice: None,
         })
         .unwrap();
         assert_eq!(c.query_row::<String, _, _>("SELECT created_by FROM assessments WHERE id = ?1", params![new.id], |r| r.get(0)).unwrap(), teacher.id);
@@ -3261,8 +3665,8 @@ mod taking_tests {
         assert_eq!(r.saved_answers.get("q1").map(String::as_str), Some("C"), "answers are given back in displayed letters");
         assert_eq!(r.saved_answers["q6"].chars().count(), 2000, "over-long text is cut like on submit");
         assert!(!r.saved_answers.contains_key("ghost"), "answers for unknown questions are dropped");
-        // latest save wins
-        save_answers(&w.conn, &w.student, &s.attempt_id, &ans(&[("q1", "A")]), NOW + 3000).unwrap();
+        // `replace` keeps the older behaviour (phase 4-3 made merging the default): the latest whole sheet wins
+        save_answers_with(&w.conn, &w.student, &s.attempt_id, &ans(&[("q1", "A")]), true, NOW + 3000).unwrap();
         assert_eq!(start_attempt_with(&w.conn, &w.student, &id, NOW + 4000, &mut StdRng::seed_from_u64(5)).unwrap().saved_answers.len(), 1);
         // not yours / already submitted / unknown
         let other = enroll(&w, "o@x.com");
@@ -3461,7 +3865,7 @@ mod grading_tests {
         AssessmentReq {
             subject_id: Some("s1".into()), title: Some("اختبار التصحيح".into()), description: None, questions: Some(questions()),
             duration_min: duration, opens_at: None, closes_at: None, max_attempts: Some(9), show_answers: Some(true),
-            status: Some("published".into()), clear_duration: None, clear_window: None,
+            status: Some("published".into()), clear_duration: None, clear_window: None, allow_practice: None,
         }
     }
 
@@ -4151,3 +4555,15 @@ mod grading_tests {
         assert_eq!(w.conn.query_row::<String, _, _>("SELECT status FROM attempts WHERE id = ?1", params![st2.attempt_id], |r| r.get(0)).unwrap(), "expired");
     }
 }
+
+// Phase 4-3 test modules. `fixtures` is the shared world; each module covers one area.
+#[cfg(test)]
+pub(crate) mod fixtures;
+#[cfg(test)]
+mod hard_end_tests;
+#[cfg(test)]
+mod practice_switch_tests;
+#[cfg(test)]
+mod review_tests;
+#[cfg(test)]
+mod http_tests;

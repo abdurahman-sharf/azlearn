@@ -48,6 +48,11 @@ export interface StudentExamRow {
   last_attempt_id: string | null
   /** false: the exam is no longer shown to students (hidden subject, archived, unenrolled); the row only leads to my own results */
   visible: boolean
+  /**
+   * a running attempt the student can still go back into: they are enrolled in the subject, even when the exam was hidden
+   * meanwhile (the server lets an enrolled student back into a sitting in the middle). Absent from an older server: `visible` then decides.
+   */
+  can_resume?: boolean
 }
 
 export type StudentExamTab = 'all' | StudentExamState
@@ -235,3 +240,25 @@ export async function downloadScheduleIcs(lang: 'ar' | 'en' = 'ar'): Promise<voi
   const blob = await platformBlob(`/my/schedule.ics?lang=${lang}`)
   saveBlob(new Blob([blob], { type: 'text/calendar;charset=utf-8' }), 'azlearn-schedule.ics')
 }
+
+// ── phase 4-3: my own statistics (private: no ranking, no other student's data) ───────────────────────────────────────────
+export interface StatsTrendPoint { attempt_id: string; exam_id: string; exam_title: string; percent: number; submitted_at: number }
+export interface WeakChapter { chapter: string; percent: number; answered: number }
+export interface SubjectStats {
+  subject_id: string
+  subject_name: string
+  exams: number
+  attempts: number
+  /** average of my best attempt per exam; null without any counted attempt */
+  average_percent: number | null
+  /** the last 8 counted attempts of this subject, oldest first */
+  trend: StatsTrendPoint[]
+  /** chapters with at least 3 answered items under 70 %, lowest first, at most 3 */
+  weakest: WeakChapter[]
+}
+export interface StudentStats {
+  overall: { attempts: number; exams: number; average_percent: number | null }
+  subjects: SubjectStats[]
+}
+/** Only my submitted, released, fully graded attempts count. */
+export const myStats = () => platformFetch<StudentStats>('/my/stats')

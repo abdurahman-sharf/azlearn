@@ -224,7 +224,7 @@ fn normalize_choice(s: &str) -> String {
     chars.into_iter().collect()
 }
 
-fn is_true_answer(a: &str) -> bool {
+pub(crate) fn is_true_answer(a: &str) -> bool {
     const ALIASES: &[&str] = &["A", "√", "对", "正确", "TRUE", "T", "是", "YES", "Y", "1"];
     const NEGATIONS: &[char] = &['不', '非', '错', '没'];
     let t = a.trim();

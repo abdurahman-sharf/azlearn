@@ -57,6 +57,8 @@ mod tests {
         for p in [
             "/api/platform/me", "/api/platform/admin/users", "/api/platform/registers", "/api/platform/register/x", "/api/platform/login/x",
             "/api/platform/publicity", "/api/platform/public", "/api/platform/admin/public/config", "/api/platform/admin/stats/institutions", "/api/platform/admin/stats/subjects", "/api/platform/files/x", "/api/platform/",
+            // phase 4-3: practice mode and the student's statistics are private like everything else
+            "/api/platform/assessments/e1/practice", "/api/platform/my/stats",
         ] {
             assert!(!is_public(p), "{p}");
         }

@@ -19,7 +19,7 @@
 
 use crate::platform::{bad, db_err, like_pattern, lock, require_role, Res, User, INSTITUTION_ACTIVE, SUBJECT_ACTIVE};
 use crate::platform_content::{exam_standing, visible};
-use crate::platform_exams::{deadline, effective_phase, is_released, passed_flag, round2, settle_student, AssessmentInfo, GRACE_MS};
+use crate::platform_exams::{attempt_end, effective_phase, is_released, manual_close, passed_flag, round2, settle_student, AssessmentInfo, GRACE_MS};
 use crate::relay::now_ms;
 use crate::routes::AppState;
 use axum::{
@@ -94,6 +94,8 @@ pub(crate) struct ExamFacts {
     pub status: String,
     pub opens_at: Option<i64>,
     pub closes_at: Option<i64>,
+    /// When the exam was closed by hand (counts only while its status is `closed`/`archived`): a hard end for running attempts.
+    pub closed_at: Option<i64>,
     pub max_attempts: i64,
     pub duration_min: Option<i64>,
     pub total_points: f64,
@@ -111,6 +113,7 @@ impl ExamFacts {
             status: info.status.clone(),
             opens_at: info.opens_at,
             closes_at: info.closes_at,
+            closed_at: info.closed_at,
             max_attempts: info.max_attempts,
             duration_min: info.duration_min,
             total_points: info.total_points,
@@ -191,7 +194,7 @@ pub(crate) fn student_view(exam: &ExamFacts, attempts: &[AttemptFact], now: i64)
     let running = attempts
         .iter()
         .filter(|t| t.status == "in_progress")
-        .map(|t| (t, deadline(t.started_at, exam.duration_min)))
+        .map(|t| (t, attempt_end(t.started_at, exam.duration_min, exam.closes_at, manual_close(&exam.status, exam.closed_at))))
         .filter(|(_, ends)| now <= ends + GRACE_MS)
         .max_by(|(a, _), (b, _)| a.started_at.cmp(&b.started_at).then_with(|| a.id.cmp(&b.id)))
         .map(|(t, ends)| RunningAttempt { attempt_id: t.id.clone(), ends_at: ends });
@@ -333,6 +336,11 @@ pub struct StudentExamRow {
     /// keeps because of their own attempts (hidden subject or institution, archived, no longer enrolled): it leads to
     /// their results, never to a start.
     pub visible: bool,
+    /// A running attempt the student can still go back into: enrolled in the subject, whether or not the exam is still shown
+    /// (`start_attempt` resumes an attempt in progress even after the exam was hidden - a student must not lose a sitting in
+    /// the middle because the subject was switched off). `false` for a row with no running attempt and for one the student
+    /// is no longer enrolled for.
+    pub can_resume: bool,
     #[serde(skip)]
     last_submitted_at: Option<i64>,
 }
@@ -351,7 +359,7 @@ pub(crate) fn student_exams(conn: &Connection, student_id: &str, subject_id: Opt
     let sql = format!(
         "SELECT a.id, a.title, a.subject_id, s.name_ar, COALESCE(u.full_name, cb.full_name, ''), a.question_count, a.total_points,
                 a.duration_min, a.opens_at, a.closes_at, a.max_attempts, a.pass_mark, a.release_mode, a.status, {shown},
-                EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?1 AND e.subject_id = a.subject_id)
+                EXISTS(SELECT 1 FROM subject_enrollments e WHERE e.student_id = ?1 AND e.subject_id = a.subject_id), a.closed_at
          FROM assessments a LEFT JOIN users u ON u.id = a.teacher_id LEFT JOIN users cb ON cb.id = a.created_by JOIN subjects s ON s.id = a.subject_id
          WHERE (a.subject_id IN (SELECT e.subject_id FROM subject_enrollments e WHERE e.student_id = ?1)
                 OR a.id IN (SELECT t.assessment_id FROM attempts t WHERE t.student_id = ?1))
@@ -377,6 +385,7 @@ pub(crate) fn student_exams(conn: &Connection, student_id: &str, subject_id: Opt
                 status: r.get(13)?,
                 shown: r.get(14)?,
                 enrolled: r.get(15)?,
+                closed_at: r.get(16)?,
             };
             let head: (String, String, String, String, String, i64) = (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?);
             Ok((head, facts))
@@ -392,6 +401,7 @@ pub(crate) fn student_exams(conn: &Connection, student_id: &str, subject_id: Opt
             let v = student_view(&facts, &mine, now);
             StudentExamRow {
                 visible: facts.shown && facts.enrolled,
+                can_resume: v.in_progress.is_some() && facts.enrolled,
                 id,
                 title,
                 subject_id,
@@ -644,11 +654,12 @@ pub(crate) fn student_overview(conn: &Connection, student: &User, now: i64) -> R
     // the same scope and states as "My exams" (rows come in list order: running ones first, then open by closing time)
     let rows = student_exams(conn, id, None, None, now)?;
     let counts = StateCounts::of(&rows);
-    // a running attempt on an exam the student can no longer open (unenrolled, hidden, archived) cannot be resumed
-    // (`start_attempt` refuses it), so it is neither offered as "resume" nor counted in `exams.in_progress`, which feeds the
-    // sidebar badge ("things to act on"); "My exams" still lists the row and its tab count includes it
-    let resumable = rows.iter().filter(|r| r.state == ExamState::InProgress && r.visible).count() as i64;
-    let resume = rows.iter().find(|r| r.state == ExamState::InProgress && r.visible).and_then(|r| {
+    // a running attempt the student can no longer re-enter (they are not enrolled in its subject any more:
+    // `start_attempt` refuses it) is neither offered as "resume" nor counted in `exams.in_progress`, which feeds the sidebar
+    // badge ("things to act on"); "My exams" still lists the row and its tab count includes it. An attempt on an exam that
+    // was hidden meanwhile CAN be resumed (the server lets an enrolled student back into it), so it is offered
+    let resumable = rows.iter().filter(|r| r.state == ExamState::InProgress && r.can_resume).count() as i64;
+    let resume = rows.iter().find(|r| r.state == ExamState::InProgress && r.can_resume).and_then(|r| {
         r.in_progress_attempt.as_ref().map(|run| ResumeCard { attempt_id: run.attempt_id.clone(), assessment_id: r.id.clone(), title: r.title.clone(), ends_at: run.ends_at })
     });
     let closing_soon = rows
@@ -778,6 +789,7 @@ mod tests {
             status: "published".into(),
             opens_at: None,
             closes_at: None,
+            closed_at: None,
             max_attempts: 1,
             duration_min: Some(30),
             total_points: 10.0,
@@ -960,8 +972,11 @@ mod tests {
             v.best,
             Some(BestAttempt { attempt_id: "d".into(), score: None, total: 10.0, percent: None, passed: None, released: false, pending: None })
         );
-        // released once the closing time is reached
-        f.closes_at = Some(NOW);
+        // the closing time is a hard end: an attempt that ends at it can still be handed in for the grace after it, so the
+        // outcome stays withheld until that has run out (phase 4-3) - and is released the next millisecond
+        f.closes_at = Some(NOW - GRACE_MS);
+        assert!(!view(&f, &a).best.unwrap().released, "closing time + grace == now: the last submission may still land");
+        f.closes_at = Some(NOW - GRACE_MS - 1);
         assert_eq!(view(&f, &a).best.unwrap().attempt_id, "c");
         // a total of 0 (every question voided) has no percentage
         let mut z = facts();
@@ -1101,7 +1116,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "attempts_used", "best", "can_start", "closes_at", "duration_min", "id", "in_progress_attempt", "last_attempt_id", "max_attempts", "opens_at", "pass_mark",
+                "attempts_used", "best", "can_resume", "can_start", "closes_at", "duration_min", "id", "in_progress_attempt", "last_attempt_id", "max_attempts", "opens_at", "pass_mark",
                 "phase", "question_count", "reason", "release_mode", "state", "subject_id", "subject_name", "teacher_name", "title", "total_points", "visible"
             ]
         );
@@ -1501,6 +1516,26 @@ mod tests {
         // another student's running attempt is never my resume card
         let o = overview(&w, &w.other);
         assert_eq!((o.resume, o.exams.in_progress), (None, 0));
+    }
+
+    /// A sitting in the middle is not lost because the exam was hidden meanwhile: while the student is still enrolled the
+    /// server lets them back in, so the overview offers "resume" and counts it; "My exams" says so with `can_resume`.
+    #[test]
+    fn a_running_attempt_on_an_exam_hidden_meanwhile_is_still_resumable_while_enrolled() {
+        let w = world();
+        exam(&w, "mine-run", "s1", "لي");
+        attempt(&w, "a-m", "mine-run", &w.me, "in_progress", NOW - MIN, None, 0.0, 0);
+        w.conn.execute("UPDATE subjects SET is_active = 0 WHERE id = 's1'", []).unwrap();
+        let r = row(&all(&w, &w.me), "mine-run").clone();
+        assert_eq!((r.state, r.visible, r.can_resume, r.can_start), (ExamState::InProgress, false, true, false));
+        let o = overview(&w, &w.me);
+        assert_eq!(o.resume.map(|c| c.attempt_id), Some("a-m".into()), "the sitting is offered");
+        assert_eq!(o.exams.in_progress, 1);
+        // leaving the subject takes the way back away
+        w.conn.execute("DELETE FROM subject_enrollments WHERE student_id = ?1 AND subject_id = 's1'", params![w.me.id]).unwrap();
+        let r = row(&all(&w, &w.me), "mine-run").clone();
+        assert_eq!((r.state, r.can_resume), (ExamState::InProgress, false));
+        assert_eq!(overview(&w, &w.me).resume, None);
     }
 
     #[test]

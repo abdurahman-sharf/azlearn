@@ -52,9 +52,9 @@ const loadFailed = ref(false)
 
 const f = reactive({
   title: '', description: '', duration: null as number | null, attempts: 1, opens: '', closes: '',
-  shuffleQ: false, shuffleO: false, passMark: null as number | null, release: 'immediate' as 'immediate' | 'after_close', showAnswers: true,
+  shuffleQ: false, shuffleO: false, passMark: null as number | null, release: 'immediate' as 'immediate' | 'after_close', showAnswers: true, allowPractice: false,
 })
-const BLANK = { title: '', description: '', duration: null, attempts: 1, opens: '', closes: '', shuffleQ: false, shuffleO: false, passMark: null, release: 'immediate', showAnswers: true } as const
+const BLANK = { title: '', description: '', duration: null, attempts: 1, opens: '', closes: '', shuffleQ: false, shuffleO: false, passMark: null, release: 'immediate', showAnswers: true, allowPractice: false } as const
 
 const isNew = computed(() => !examId.value)
 /** the exam id in the address ('' on the "new" page) */
@@ -111,7 +111,7 @@ function adopt(d: ExamDetail) {
   bumpCounter()
   Object.assign(f, {
     title: d.title, description: d.description ?? '', duration: d.duration_min, attempts: d.max_attempts, opens: toLocalInput(d.opens_at), closes: toLocalInput(d.closes_at),
-    shuffleQ: d.shuffle_questions, shuffleO: d.shuffle_options, passMark: d.pass_mark, release: d.release_mode, showAnswers: d.show_answers,
+    shuffleQ: d.shuffle_questions, shuffleO: d.shuffle_options, passMark: d.pass_mark, release: d.release_mode, showAnswers: d.show_answers, allowPractice: !!d.allow_practice,
   })
   settle()
 }
@@ -193,6 +193,8 @@ function payload(): ExamInput {
   else if (!isNew.value) p.clear_closes = true
   if (f.passMark) p.pass_mark = Number(f.passMark)
   else if (!isNew.value) p.clear_pass_mark = true
+  // practice is not frozen by attempts: the owner can switch it at any time (so it is sent before the frozen early return)
+  p.allow_practice = f.allowPractice
   if (frozen.value) return p
   p.shuffle_questions = f.shuffleQ
   p.shuffle_options = f.shuffleO
@@ -380,12 +382,16 @@ const canPublish = computed(() => st.value.canPublish)
           <label class="block"><span class="text-label-lg">{{ pt('exOpens') }}</span>
             <input v-model="f.opens" type="datetime-local" dir="ltr" class="input-outlined w-full mt-1" :disabled="locked" data-testid="f-opens" /></label>
           <label class="block"><span class="text-label-lg">{{ pt('exCloses') }}</span>
-            <input v-model="f.closes" type="datetime-local" dir="ltr" class="input-outlined w-full mt-1" :disabled="st.settingsLocked" data-testid="f-closes" /></label>
+            <input v-model="f.closes" type="datetime-local" dir="ltr" class="input-outlined w-full mt-1" :disabled="st.settingsLocked" aria-describedby="f-closes-hint" data-testid="f-closes" /></label>
         </div>
+        <p id="f-closes-hint" class="text-body-sm" style="color: rgb(var(--md-on-surface-variant))" data-testid="f-closes-hint">{{ pt('exClosesHint') }}</p>
         <div class="space-y-2">
           <label class="flex items-start gap-3"><input v-model="f.shuffleQ" type="checkbox" class="mt-1 h-5 w-5" :disabled="locked" data-testid="f-shuffle-q" /><span>{{ pt('exShuffleQ') }}</span></label>
           <label class="flex items-start gap-3"><input v-model="f.shuffleO" type="checkbox" class="mt-1 h-5 w-5" :disabled="locked" data-testid="f-shuffle-o" /><span>{{ pt('exShuffleO') }}</span></label>
           <label class="flex items-start gap-3"><input v-model="f.showAnswers" type="checkbox" class="mt-1 h-5 w-5" :disabled="st.settingsLocked" data-testid="f-show-answers" /><span>{{ pt('exShowAnswers') }}</span></label>
+          <!-- practice attempts show the correct answers to every enrolled student: the warning is always visible next to the switch -->
+          <label class="flex items-start gap-3"><input v-model="f.allowPractice" type="checkbox" class="mt-1 h-5 w-5" :disabled="st.settingsLocked" aria-describedby="ex-allow-practice-warn" data-testid="ex-allow-practice" /><span>{{ pt('exAllowPractice') }}</span></label>
+          <p id="ex-allow-practice-warn" class="text-body-sm ps-8" style="color: rgb(var(--md-on-surface-variant))" data-testid="ex-allow-practice-warn"><span aria-hidden="true">⚠</span> {{ pt('exAllowPracticeWarn') }}</p>
         </div>
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label class="block"><span class="text-label-lg">{{ pt('exPassMark') }}</span>

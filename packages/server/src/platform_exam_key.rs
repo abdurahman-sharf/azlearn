@@ -947,6 +947,29 @@ mod tests {
 
     // ───── permissions & validation ─────
 
+    /// Phase 4-3: a corrected fill-in key is marked with the same normalisation as a submit (`platform_exams::norm_fill`),
+    /// so Arabic digits, the Arabic decimal separator, edge punctuation and no-break spaces do not make a right answer wrong -
+    /// and teh marbuta / heh are still told apart.
+    #[test]
+    fn a_new_fill_key_regrades_with_the_shared_normalisation() {
+        let w = world();
+        let at = vec![
+            sit(&w, 0, &[("q4", "٣٫٥")], NOW + 1_000),        // Arabic-Indic digit, Arabic decimal separator
+            sit(&w, 1, &[("q4", " « 3.5 ». ")], NOW + 2_000), // quotes, a full stop, spaces
+            sit(&w, 2, &[("q4", "3,5")], NOW + 3_000),        // a comma is not a dot
+            sit(&w, 3, &[("q4", "مدرسه")], NOW + 4_000),
+        ];
+        assert!(at.iter().all(|a| outcome(&w, a, "q4").correct == Some(false)), "none of them matches the original key");
+        let r = fix(&w, &w.teacher, "q4", json!({"mode": "set", "answer": "3.5"})).unwrap();
+        assert_eq!((r.affected_attempts, r.up), (2, 2), "the two that mean 3.5 gain the point");
+        assert_eq!([0, 1, 2, 3].map(|i| outcome(&w, &at[i], "q4").correct), [Some(true), Some(true), Some(false), Some(false)]);
+        // teh marbuta and heh stay different words
+        fix(&w, &w.teacher, "q4", json!({"mode": "set", "answer": "مدرسة|school"})).unwrap();
+        assert_eq!(outcome(&w, &at[3], "q4").correct, Some(false), "ة and ه are deliberately not folded");
+        fix(&w, &w.teacher, "q4", json!({"mode": "set", "answer": "مدرسة|مدرسه"})).unwrap();
+        assert_eq!(outcome(&w, &at[3], "q4").correct, Some(true), "…unless the key lists both");
+    }
+
     #[test]
     fn only_the_owner_of_a_live_unlocked_exam_corrects_its_key() {
         let w = world();

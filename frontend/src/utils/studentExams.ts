@@ -73,12 +73,16 @@ export interface StudentRowLinks {
   result: string | null
 }
 
-type LinkRow = Pick<StudentExamRow, 'id' | 'state' | 'can_start' | 'visible' | 'in_progress_attempt' | 'best' | 'last_attempt_id'>
+type LinkRow = Pick<StudentExamRow, 'id' | 'state' | 'can_start' | 'visible' | 'can_resume' | 'in_progress_attempt' | 'best' | 'last_attempt_id'>
+
+/** The server says whether the running attempt can be re-entered (`can_resume`); an older server sends no such field and `visible` decides. */
+const resumable = (r: Pick<StudentExamRow, 'visible' | 'can_resume'>): boolean => r.can_resume ?? r.visible
 
 /**
  * Where a row of "My exams" can lead. Starting goes through the exam page (its rules, and from phase 4-3 a confirmation),
- * never straight into an attempt. A row that is no longer visible (unenrolled, hidden, archived) only leads to my own
- * results: the server refuses to start or resume an attempt on it (404 / 403), so no start and no resume is offered.
+ * never straight into an attempt. A row that is no longer visible (unenrolled, hidden, archived) never offers a start and only
+ * leads to my own results - except that a sitting in progress can be resumed while the student is still enrolled, even when the
+ * exam was hidden meanwhile (`can_resume`); once they are not enrolled the server refuses (404 / 403) and no resume is offered.
  */
 export function rowLinks(r: LinkRow): StudentRowLinks {
   const running = r.state === 'in_progress' && !!r.in_progress_attempt
@@ -89,14 +93,14 @@ export function rowLinks(r: LinkRow): StudentRowLinks {
       : null
   return {
     start: r.can_start && r.visible && !running ? `/platform/assessments/${r.id}` : null,
-    resume: running && r.visible ? `/platform/assessments/${r.id}/take` : null,
+    resume: running && resumable(r) ? `/platform/assessments/${r.id}/take` : null,
     result,
   }
 }
 
-/** An attempt is still running but the exam can no longer be opened: it cannot be resumed and ends by itself at its deadline. */
-export const runningButUnreachable = (r: Pick<StudentExamRow, 'state' | 'visible' | 'in_progress_attempt'>): boolean =>
-  r.state === 'in_progress' && !r.visible && !!r.in_progress_attempt
+/** An attempt is still running but the student can no longer get back into it (not enrolled any more): it ends by itself at its deadline. */
+export const runningButUnreachable = (r: Pick<StudentExamRow, 'state' | 'visible' | 'can_resume' | 'in_progress_attempt'>): boolean =>
+  r.state === 'in_progress' && !resumable(r) && !!r.in_progress_attempt
 
 export type StateChip = StudentExamState | 'not_enrolled'
 

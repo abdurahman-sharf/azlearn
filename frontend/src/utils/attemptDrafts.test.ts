@@ -1,4 +1,4 @@
-import { AUTO_SUBMIT_BACKOFF_MS, attemptDraftKey, attemptDraftKeys, autoSubmitDue, isAttemptOverCode, removeAttemptDrafts } from './attemptDrafts.ts'
+import { ATTEMPT_DRAFT_PREFIX, AUTO_SUBMIT_BACKOFF_MS, attemptDraftKey, attemptDraftKeys, attemptMarksKey, autoSubmitDue, isAttemptOverCode, parseDraft, removeAttemptDrafts } from './attemptDrafts.ts'
 
 // Plain-script style like the other tests in this folder (type-checked without Node typings).
 function eq(a: unknown, b: unknown, msg: string): void {
@@ -44,4 +44,17 @@ eq(due({ submitting: true }), false, 'already sending')
 eq(due({ over: true }), false, 'the server said it is over: no more requests')
 eq(due({ now: 100_000, lastTryAt: 100_000 - AUTO_SUBMIT_BACKOFF_MS + 1 }), false, 'the last try failed a moment ago: wait')
 eq(due({ now: 100_000, lastTryAt: 100_000 - AUTO_SUBMIT_BACKOFF_MS }), true, 'after the pause: try again')
+// --- the marks key shares the prefix, so sign-out removes it with the drafts; a stored draft is read defensively --------------------
+eq(attemptMarksKey('abc'), 'exameow-attempt-abc-marks', 'the key of the review marks')
+eq(attemptMarksKey('abc').startsWith(ATTEMPT_DRAFT_PREFIX), true, 'under the draft prefix')
+const withMarks = mem({ 'exameow-attempt-a1': '{}', 'exameow-attempt-a1-marks': '["q1"]', 'exameow-banks': '[]' })
+eq(removeAttemptDrafts(withMarks), 2, 'the draft and its marks go together')
+eq(withMarks.keys(), ['exameow-banks'], 'banks stay')
+eq(parseDraft('{"q1":"A","q2":"BC"}'), { q1: 'A', q2: 'BC' }, 'a normal draft')
+eq(parseDraft('{"q1":"A","q2":3,"q3":null,"q4":{"x":1}}'), { q1: 'A' }, 'only text values are answers')
+eq(parseDraft('[1,2]'), {}, 'an array is no draft')
+eq(parseDraft('not json'), {}, 'corrupt text')
+eq(parseDraft(''), {}, 'empty')
+eq(parseDraft(null), {}, 'nothing stored')
+eq(parseDraft('null'), {}, 'null')
 console.log('attempt drafts tests ok')

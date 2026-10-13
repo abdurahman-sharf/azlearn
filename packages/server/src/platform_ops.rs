@@ -238,8 +238,28 @@ fn auto_hide_if_needed(conn: &Connection, ttype: &str, id: &str, target: &Target
             let sat: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE assessment_id = ?1)", params![id], |r| r.get(0)).map_err(db_err)?;
             if sat {
                 let now = now_ms();
-                // `closed_by` NULL = the system: the exam stays locked for its owner until an admin reopens or unlocks it
-                conn.execute("UPDATE assessments SET status = 'closed', closed_at = ?2, closed_by = NULL, updated_at = ?2 WHERE id = ?1 AND status = 'published'", params![id, now])
+                // `closed_by` NULL = the system: the exam stays locked for its owner until an admin reopens or unlocks it.
+                // Like any close, it ends every attempt still running (from its autosave) in the same transaction.
+                conn.execute_batch("SAVEPOINT auto_hide_close").map_err(db_err)?;
+                let closed = (|| -> Res<usize> {
+                    let n = conn
+                        .execute("UPDATE assessments SET status = 'closed', closed_at = ?2, closed_by = NULL, updated_at = ?2 WHERE id = ?1 AND status = 'published'", params![id, now])
+                        .map_err(db_err)?;
+                    if n > 0 {
+                        crate::platform_exams::settle_on_close(conn, id, now)?;
+                    }
+                    Ok(n)
+                })();
+                match closed {
+                    Ok(n) => {
+                        conn.execute_batch("RELEASE auto_hide_close").map_err(db_err)?;
+                        Ok(n)
+                    }
+                    Err(e) => {
+                        let _ = conn.execute_batch("ROLLBACK TO auto_hide_close; RELEASE auto_hide_close");
+                        return Err(e);
+                    }
+                }
             } else {
                 conn.execute("UPDATE assessments SET status = 'draft' WHERE id = ?1 AND status = 'published'", params![id])
             }
@@ -958,7 +978,10 @@ mod tests {
         let (st, closed_at) = status_of_exam(&w.conn, "e-sat");
         assert_eq!(st, "closed");
         assert!(closed_at.is_some(), "closed with a closing moment, like the lifecycle action");
-        assert_eq!(n(&w.conn, "SELECT count(*) FROM attempts WHERE id = 'a1' AND status = 'in_progress'"), 1, "the sitting in progress is untouched");
+        // (phase 4-3) closing is a hard end: the sitting in progress is ended in the same transaction - nothing was autosaved here, so
+        // it is expired - while the exam itself, its other attempts and their grades stay as they are
+        assert_eq!(n(&w.conn, "SELECT count(*) FROM attempts WHERE id = 'a1' AND status = 'in_progress'"), 0, "no sitting survives the close");
+        assert_eq!(n(&w.conn, "SELECT count(*) FROM attempts WHERE id = 'a1' AND status = 'expired'"), 1);
         assert_eq!(status_of_exam(&w.conn, "e-fresh"), ("draft".to_string(), None));
         // the teacher is told about both
         let told: i64 = w.conn.query_row("SELECT count(*) FROM notifications WHERE user_id = ?1 AND kind = 'content_auto_hidden'", params![w.teacher.id], |r| r.get(0)).unwrap();
@@ -966,6 +989,35 @@ mod tests {
         // a closed exam is not hidden a second time by a fourth report
         create_report(&w.conn, &w.students[3], &rep("assessment", "e-sat")).unwrap();
         assert_eq!(n(&w.conn, "SELECT count(*) FROM audit_log WHERE action = 'auto_hidden_by_reports'"), 2);
+    }
+
+    /// Phase 4-3: the report auto-hide is a close like any other - every sitting still running is ended in the same transaction,
+    /// from its autosave, so nobody keeps writing into an exam the platform has taken down.
+    #[test]
+    fn auto_hide_ends_the_running_sittings_from_their_autosave() {
+        let w = world();
+        exam_of(&w.conn, "e-sat", Some(&w.teacher));
+        w.conn.execute("UPDATE assessments SET questions = ?1, total_points = 2 WHERE id = 'e-sat'", params![r#"[{"id":"q1","type":"single_choice","stem":"س","options":["أ","ب"],"answer":"B","score":2}]"#]).unwrap();
+        // one sitting with an autosave, one that never saved anything, one that is already finished
+        attempt_on(&w.conn, "saved", "e-sat", &w.students[3], "in_progress");
+        w.conn.execute("UPDATE attempts SET answers = '{\"q1\":\"B\"}', saved_at = 5 WHERE id = 'saved'", []).unwrap();
+        let silent = insert_test_user(&w.conn, "silent@x.com", "student", "active");
+        let done = insert_test_user(&w.conn, "done@x.com", "student", "active");
+        attempt_on(&w.conn, "silent", "e-sat", &silent, "in_progress");
+        attempt_on(&w.conn, "done", "e-sat", &done, "submitted");
+        // really running (the helper starts attempts at the epoch, which would be long overdue)
+        w.conn.execute("UPDATE attempts SET started_at = ?1 WHERE status = 'in_progress'", params![now_ms() - 5_000]).unwrap();
+        for s in &w.students[..3] {
+            create_report(&w.conn, s, &rep("assessment", "e-sat")).unwrap();
+        }
+        assert_eq!(status_of_exam(&w.conn, "e-sat").0, "closed");
+        let row = |id: &str| -> (String, f64, Option<i64>) { w.conn.query_row("SELECT status, score, submitted_at FROM attempts WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap() };
+        let (status, score, submitted_at) = row("saved");
+        assert_eq!((status.as_str(), score), ("submitted", 2.0), "the autosave was graded");
+        assert_eq!(submitted_at, status_of_exam(&w.conn, "e-sat").1, "stamped at the moment of the close");
+        assert_eq!(row("silent").0, "expired");
+        assert_eq!(row("done").0, "submitted");
+        assert_eq!(n(&w.conn, "SELECT count(*) FROM attempts WHERE status = 'in_progress'"), 0);
     }
 
     #[test]
