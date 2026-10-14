@@ -100,18 +100,24 @@ async function openGitHub() {
   }
 }
 
-const navItems = [
+// On the azlearn platform build the exam-generation tab and the GitHub button belong to the admin only (they stay in the
+// admin's header on every page); everyone else - guests, teachers, students - gets the menu without them. The Tauri and
+// Cloudflare builds of the original Exameow app have no platform and keep both: generating exams IS that app.
+const showGenerateAndGitHub = computed(() => !platformEnabled || auth.role === 'admin')
+
+const allNavItems = [
   { key: 'navPractice', path: '/practice', icon: AcademicCapIcon },
   { key: 'navGenerate', path: '/generate', icon: SparklesIcon },
   { key: 'navSearch', path: '/search', icon: MagnifyingGlassIcon },
   { key: 'navMine', path: '/mine', icon: UserCircleIcon },
 ]
+const navItems = computed(() => allNavItems.filter((item) => showGenerateAndGitHub.value || item.path !== '/generate'))
 
 function isNavActive(item: { path: string }): boolean {
   return route.path === item.path || route.path.startsWith(item.path + '/')
 }
 
-const currentNavIndex = computed(() => navItems.findIndex(item => isNavActive(item)))
+const currentNavIndex = computed(() => navItems.value.findIndex(item => isNavActive(item)))
 
 // Measure active button offset & width for dynamic desktop sliding pill
 const desktopNavButtons = ref<(HTMLElement | null)[]>([])
@@ -226,8 +232,9 @@ const headerStyle = {
             <router-link to="/auth/register" class="btn-filled !px-4 !py-2 text-sm" data-testid="header-register">{{ pt('register') }}</router-link>
           </template>
           <button
-            v-if="!landing && !hideLegacyNav"
+            v-if="!landing && !hideLegacyNav && showGenerateAndGitHub"
             class="btn-icon"
+            data-testid="header-github"
             @click="openGitHub"
             title="GitHub"
             :style="{ color: 'rgb(var(--md-on-surface-variant))' }"
